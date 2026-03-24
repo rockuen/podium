@@ -1,0 +1,177 @@
+{
+  "name": "cli-launcher-for-claude",
+  "displayName": "CLI Launcher for Claude",
+  "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
+  "version": "2.1.0",
+  "publisher": "rockuen",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rockuen/cli-launcher-for-claude"
+  },
+  "icon": "icons/icon-128.png",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claudeCodeLauncher.open",
+        "title": "Open Claude Code",
+        "icon": {
+          "light": "./icons/claude-robot.svg",
+          "dark": "./icons/claude-robot.svg"
+        },
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.renameTab",
+        "title": "Rename Claude Code Tab",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.refreshSessions",
+        "title": "세션 목록 새로고침",
+        "icon": "$(refresh)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.resumeSession",
+        "title": "세션 이어하기",
+        "category": "Claude"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claude-code-launcher",
+          "title": "Claude Code",
+          "icon": "./icons/claude-robot.svg"
+        }
+      ]
+    },
+    "views": {
+      "claude-code-launcher": [
+        {
+          "id": "claudeCodeLauncher.sessionList",
+          "name": "세션"
+        }
+      ]
+    },
+    "viewsWelcome": [
+      {
+        "view": "claudeCodeLauncher.sessionList",
+        "contents": "세션 기록이 없습니다.\n[새 세션 열기](command:claudeCodeLauncher.open)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "claudeCodeLauncher.open",
+          "group": "navigation@0"
+        }
+      ],
+      "view/title": [
+        {
+          "command": "claudeCodeLauncher.open",
+          "group": "navigation@1",
+          "when": "view == claudeCodeLauncher.sessionList"
+        },
+        {
+          "command": "claudeCodeLauncher.refreshSessions",
+          "group": "navigation@2",
+          "when": "view == claudeCodeLauncher.sessionList"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "CLI Launcher for Claude",
+      "properties": {
+        "claudeCodeLauncher.defaultTheme": {
+          "type": "string",
+          "default": "default",
+          "enum": ["default", "midnight", "ocean", "forest", "sunset", "aurora", "warm"],
+          "enumDescriptions": [
+            "IDE default theme",
+            "Midnight — deep purple (#1c1740)",
+            "Ocean — deep blue (#0c2240)",
+            "Forest — deep green (#0e2810)",
+            "Sunset — warm orange (#2a1510)",
+            "Aurora — violet (#160e2e)",
+            "Warm — warm brown (#241c10)"
+          ],
+          "description": "Default background theme for new terminals."
+        },
+        "claudeCodeLauncher.defaultFontSize": {
+          "type": "number",
+          "default": 11,
+          "minimum": 8,
+          "maximum": 22,
+          "description": "Default font size (px) for the terminal. Range: 8–22."
+        },
+        "claudeCodeLauncher.defaultFontFamily": {
+          "type": "string",
+          "default": "\"D2Coding\", \"D2Coding ligature\", Consolas, monospace",
+          "description": "Font family for the terminal. Use CSS font-family syntax."
+        },
+        "claudeCodeLauncher.soundEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable notification sound when a task completes."
+        },
+        "claudeCodeLauncher.particlesEnabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable background particle effects."
+        },
+        "claudeCodeLauncher.customSlashCommands": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "properties": {
+              "cmd": { "type": "string", "description": "Slash command (e.g. /wrap-up)" },
+              "desc": { "type": "string", "description": "Description shown in dropdown" }
+            },
+            "required": ["cmd", "desc"]
+          },
+          "description": "Custom slash commands for the autocomplete dropdown. Shareable as JSON."
+        },
+        "claudeCodeLauncher.customButtons": {
+          "type": "array",
+          "default": [],
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": { "type": "string", "description": "Button label" },
+              "command": { "type": "string", "description": "Slash command to execute (e.g. /wrap-up)" }
+            },
+            "required": ["label", "command"]
+          },
+          "description": "Custom buttons in the input panel. Each button has a label and a slash command."
+        }
+      }
+    },
+    "keybindings": [
+      {
+        "command": "claudeCodeLauncher.open",
+        "key": "ctrl+shift+;",
+        "mac": "cmd+shift+;"
+      }
+    ]
+  },
+  "dependencies": {
+    "node-pty": "^1.1.0",
+    "xterm": "^5.3.0",
+    "xterm-addon-fit": "^0.8.0",
+    "xterm-addon-search": "^0.13.0",
+    "xterm-addon-web-links": "^0.9.0"
+  }
+}

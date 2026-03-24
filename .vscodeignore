@@ -1,0 +1,8 @@
+.git/**
+.gitignore
+icons/icon-128.svg
+*.md
+!README.md
+!CHANGELOG.md
+install.sh
+260322 INSTALL.md

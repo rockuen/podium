@@ -1,0 +1,25 @@
+<svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1a1a2e"/>
+      <stop offset="100%" stop-color="#16213e"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="24" fill="url(#bg)"/>
+  <!-- Robot body -->
+  <rect x="34" y="48" width="60" height="48" rx="12" fill="#D97757"/>
+  <!-- Eyes -->
+  <rect x="46" y="60" width="14" height="12" rx="3" fill="#fff"/>
+  <rect x="68" y="60" width="14" height="12" rx="3" fill="#fff"/>
+  <!-- Mouth -->
+  <rect x="50" y="80" width="28" height="6" rx="3" fill="#fff"/>
+  <!-- Antenna -->
+  <line x1="64" y1="28" x2="64" y2="48" stroke="#D97757" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="64" cy="24" r="7" fill="#D97757"/>
+  <!-- Arms -->
+  <rect x="18" y="58" width="12" height="22" rx="6" fill="#D97757"/>
+  <rect x="98" y="58" width="12" height="22" rx="6" fill="#D97757"/>
+  <!-- Terminal cursor blink -->
+  <rect x="54" y="100" width="3" height="8" rx="1" fill="#4caf50" opacity="0.8"/>
+  <rect x="60" y="100" width="12" height="8" rx="1" fill="#4caf50" opacity="0.4"/>
+</svg>
