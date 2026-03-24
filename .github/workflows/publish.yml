@@ -26,7 +26,7 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - run: npx vsce package --target ${{ matrix.target }} --no-git-tag-version --allow-missing-repository
+      - run: npx @vscode/vsce package --target ${{ matrix.target }} --no-git-tag-version --allow-missing-repository
       - uses: actions/upload-artifact@v4
         with:
           name: vsix-${{ matrix.target }}
@@ -42,17 +42,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: npm install -g ovsx @vscode/vsce
+      - run: npm install -g ovsx
       - name: Publish to Open VSX
         run: |
           for f in *.vsix; do
             echo "Publishing $f..."
             ovsx publish "$f" -p ${{ secrets.OVSX_TOKEN }}
           done
-      - name: Publish to VS Code Marketplace
-        if: secrets.VSCE_TOKEN != ''
-        run: |
-          for f in *.vsix; do
-            vsce publish --packagePath "$f" -p ${{ secrets.VSCE_TOKEN }}
-          done
-        continue-on-error: true
