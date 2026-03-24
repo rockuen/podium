@@ -24,8 +24,8 @@ jobs:
         with:
           node-version: 20
       - run: npm install
-      - name: Rebuild node-pty for VS Code Electron
-        run: npx @electron/rebuild -m . || npm rebuild node-pty || true
+      - name: Rebuild node-pty for Electron 39.2.3
+        run: npx @electron/rebuild -v 39.2.3 -m .
       - run: npx @vscode/vsce package --target ${{ matrix.target }} --no-git-tag-version --allow-missing-repository
       - uses: actions/upload-artifact@v4
         with:
