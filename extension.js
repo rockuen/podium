@@ -651,20 +651,17 @@ function createPanel(context, extensionPath, session) {
       } catch (_) {}
     }
 
-    // Parse context/token usage from PTY output (debounced)
+    // Parse context/token usage from PTY output
     contextBuffer += data;
-    if (contextBuffer.length > 8000) contextBuffer = contextBuffer.slice(-4000);
-    if (contextParseTimer) clearTimeout(contextParseTimer);
-    contextParseTimer = setTimeout(() => {
-      const stripped = contextBuffer.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
-
-      // 1. Full context from /context command: "300k/1000k"
-      const tokenMatch = stripped.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
-      if (tokenMatch && (stripped.includes('claude') || stripped.includes('opus') || stripped.includes('sonnet') || stripped.includes('haiku') || stripped.includes('token') || stripped.includes('oken') || stripped.includes('Context Usage'))) {
-        const used = tokenMatch[1];
-        const total = tokenMatch[2];
-        const usedNum = parseFloat(used) * (used.endsWith('k') ? 1 : 0.001);
-        const totalNum = parseFloat(total) * (total.endsWith('k') ? 1 : 0.001);
+    // Immediate check: look for "Nk/Nk" pattern on each chunk (before buffer overflows)
+    const strippedNow = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+    const immediateMatch = strippedNow.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
+    if (immediateMatch) {
+      const used = immediateMatch[1];
+      const total = immediateMatch[2];
+      const usedNum = parseFloat(used) * (used.endsWith('k') ? 1 : 0.001);
+      const totalNum = parseFloat(total) * (total.endsWith('k') ? 1 : 0.001);
+      if (totalNum >= 100) {
         const pct = totalNum > 0 ? Math.round(usedNum / totalNum * 100) : 0;
         entry._ctxUsed = usedNum;
         entry._ctxTotal = totalNum;
@@ -672,15 +669,19 @@ function createPanel(context, extensionPath, session) {
           panel.webview.postMessage({ type: 'context-usage', used, total, pct });
         } catch (_) {}
         contextBuffer = '';
-        return;
       }
-
-      // 2. Per-response delta: "± 1.6k tokens" or "1.6k tokens"
-      const deltaMatch = stripped.match(/[±+]\s*(\d+(?:\.\d+)?)\s*k?\s*token/i);
+    }
+    // Debounced check: per-response delta "± 1.6k tokens"
+    if (contextBuffer.length > 4000) contextBuffer = contextBuffer.slice(-2000);
+    if (contextParseTimer) clearTimeout(contextParseTimer);
+    contextParseTimer = setTimeout(() => {
+      const stripped = contextBuffer.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+      const deltaMatch = stripped.match(/[±+]\s*(\d+(?:\.\d+)?)\s*(k)?\s*token/i);
       if (deltaMatch && entry._ctxTotal > 0) {
-        const delta = parseFloat(deltaMatch[1]);
+        const num = parseFloat(deltaMatch[1]);
+        const delta = deltaMatch[2] ? num : num / 1000; // k단위로 통일
         entry._ctxUsed = (entry._ctxUsed || 0) + delta;
-        const used = Math.round(entry._ctxUsed) + 'k';
+        const used = entry._ctxUsed >= 10 ? Math.round(entry._ctxUsed) + 'k' : entry._ctxUsed.toFixed(1) + 'k';
         const total = Math.round(entry._ctxTotal) + 'k';
         const pct = entry._ctxTotal > 0 ? Math.round(entry._ctxUsed / entry._ctxTotal * 100) : 0;
         try {
@@ -809,6 +810,16 @@ function createPanel(context, extensionPath, session) {
     }
     if (msg.type === 'open-link') {
       vscode.env.openExternal(vscode.Uri.parse(msg.url));
+    }
+    if (msg.type === 'rename-tab') {
+      vscode.window.showInputBox({ prompt: t('enterTabName'), value: entry.title }).then(newName => {
+        if (newName) {
+          entry.title = newName;
+          panel.title = newName;
+          panel.webview.postMessage({ type: 'title-updated', title: newName });
+          saveSessions(context);
+        }
+      });
     }
     if (msg.type === 'save-setting') {
       const cfg = vscode.workspace.getConfiguration('claudeCodeLauncher');
@@ -983,35 +994,33 @@ function restartPty(entry, panel, context, extensionPath) {
         panel.webview.postMessage({ type: 'output', data: data });
       } catch (_) {}
 
-      // Parse context/token usage (debounced)
+      // Parse context/token usage
       restartCtxBuffer += data;
-      if (restartCtxBuffer.length > 8000) restartCtxBuffer = restartCtxBuffer.slice(-4000);
+      const sNow = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+      const im = sNow.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
+      if (im) {
+        const uN = parseFloat(im[1]) * (im[1].endsWith('k') ? 1 : 0.001);
+        const tN = parseFloat(im[2]) * (im[2].endsWith('k') ? 1 : 0.001);
+        if (tN >= 100) {
+          const pct = tN > 0 ? Math.round(uN / tN * 100) : 0;
+          entry._ctxUsed = uN; entry._ctxTotal = tN;
+          try { panel.webview.postMessage({ type: 'context-usage', used: im[1], total: im[2], pct }); } catch (_) {}
+          restartCtxBuffer = '';
+        }
+      }
+      if (restartCtxBuffer.length > 4000) restartCtxBuffer = restartCtxBuffer.slice(-2000);
       if (restartCtxParseTimer) clearTimeout(restartCtxParseTimer);
       restartCtxParseTimer = setTimeout(() => {
         const stripped = restartCtxBuffer.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
-        const tokenMatch = stripped.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
-        if (tokenMatch && (stripped.includes('claude') || stripped.includes('opus') || stripped.includes('sonnet') || stripped.includes('haiku') || stripped.includes('token') || stripped.includes('oken') || stripped.includes('Context Usage'))) {
-          const u = tokenMatch[1], tt = tokenMatch[2];
-          const uN = parseFloat(u) * (u.endsWith('k') ? 1 : 0.001);
-          const tN = parseFloat(tt) * (tt.endsWith('k') ? 1 : 0.001);
-          const pct = tN > 0 ? Math.round(uN / tN * 100) : 0;
-          entry._ctxUsed = uN; entry._ctxTotal = tN;
-          try {
-            panel.webview.postMessage({ type: 'context-usage', used: u, total: tt, pct });
-          } catch (_) {}
-          restartCtxBuffer = '';
-          return;
-        }
-        const deltaMatch = stripped.match(/[±+]\s*(\d+(?:\.\d+)?)\s*k?\s*token/i);
+        const deltaMatch = stripped.match(/[±+]\s*(\d+(?:\.\d+)?)\s*(k)?\s*token/i);
         if (deltaMatch && entry._ctxTotal > 0) {
-          const delta = parseFloat(deltaMatch[1]);
+          const num = parseFloat(deltaMatch[1]);
+          const delta = deltaMatch[2] ? num : num / 1000;
           entry._ctxUsed = (entry._ctxUsed || 0) + delta;
-          const used = Math.round(entry._ctxUsed) + 'k';
+          const used = entry._ctxUsed >= 10 ? Math.round(entry._ctxUsed) + 'k' : entry._ctxUsed.toFixed(1) + 'k';
           const total = Math.round(entry._ctxTotal) + 'k';
           const pct = entry._ctxTotal > 0 ? Math.round(entry._ctxUsed / entry._ctxTotal * 100) : 0;
-          try {
-            panel.webview.postMessage({ type: 'context-usage', used, total, pct });
-          } catch (_) {}
+          try { panel.webview.postMessage({ type: 'context-usage', used, total, pct }); } catch (_) {}
           restartCtxBuffer = '';
         }
       }, 800);
@@ -1119,22 +1128,26 @@ function handleOpenFile(filePath, line, entry) {
   }
   absPath = absPath.replace(/\\/g, '/');
 
-  // If not found, try searching subdirectories for the filename
+  // If not found, try searching subdirectories
   if (!fs.existsSync(absPath.replace(/\//g, path.sep))) {
+    const suffix = filePath.replace(/\\/g, '/');
     const basename = path.basename(filePath);
-    const { execSync } = require('child_process');
-    try {
-      const found = execSync(
-        `find "${entry.cwd}" -name "${basename}" -type f -not -path "*/node_modules/*" -not -path "*/.git/*" 2>/dev/null | head -5`,
-        { timeout: 3000, encoding: 'utf8' }
-      ).trim().split('\n').filter(Boolean);
-      // Try matching the relative path suffix
-      const suffix = filePath.replace(/\\/g, '/');
-      const match = found.find(f => f.replace(/\\/g, '/').endsWith(suffix)) || found[0];
-      if (match) {
-        absPath = match.replace(/\\/g, '/');
-      }
-    } catch (_) {}
+    const found = [];
+    function searchDir(dir, depth) {
+      if (depth > 6 || found.length >= 5) return;
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const e of entries) {
+          if (e.name === 'node_modules' || e.name === '.git') continue;
+          const full = path.join(dir, e.name);
+          if (e.isFile() && e.name === basename) found.push(full);
+          else if (e.isDirectory()) searchDir(full, depth + 1);
+        }
+      } catch (_) {}
+    }
+    searchDir(entry.cwd, 0);
+    const match = found.find(f => f.replace(/\\/g, '/').endsWith(suffix)) || found[0];
+    if (match) absPath = match.replace(/\\/g, '/');
   }
 
   if (!fs.existsSync(absPath.replace(/\//g, path.sep))) {
@@ -1153,8 +1166,8 @@ function handleOpenFile(filePath, line, entry) {
     }
     const obsidianUri = `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(relativePath)}`;
     vscode.env.openExternal(vscode.Uri.parse(obsidianUri));
-  } else if (absPath.endsWith('.html') || absPath.endsWith('.htm')) {
-    // Open in browser
+  } else if (/\.(html?|xlsx?|csv|pptx?|docx?|pdf|png|jpe?g|gif|svg|zip|tar|gz)$/i.test(absPath)) {
+    // Open with OS default program (browser, Excel, etc.)
     const fileUri = vscode.Uri.file(absPath.replace(/\//g, path.sep));
     vscode.env.openExternal(fileUri);
   } else {
@@ -1412,7 +1425,9 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      cursor: pointer;
     }
+    #toolbar-title:hover { text-decoration: underline; }
     #toolbar-status {
       font-size: 11px;
       color: ${statusGray};
@@ -2496,6 +2511,10 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
     }
     updateMemoDisplay();
 
+    document.getElementById('toolbar-title').addEventListener('click', () => {
+      vscode.postMessage({ type: 'rename-tab' });
+    });
+
     memoEl.addEventListener('click', () => {
       vscode.postMessage({ type: 'request-edit-memo' });
     });
@@ -2669,6 +2688,9 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       }
       if (msg.type === 'notify') {
         playNotifySound();
+      }
+      if (msg.type === 'title-updated') {
+        document.getElementById('toolbar-title').textContent = msg.title;
       }
       if (msg.type === 'memo-updated') {
         currentMemo = msg.memo;
