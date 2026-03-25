@@ -17,7 +17,7 @@ Run [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) i
 
 ### Context Usage Indicator
 - **Toolbar progress bar** shows token usage at a glance
-- Click to refresh via `/context` command
+- Click `ctx` to manually check via `/context` command
 - Color changes based on usage: green → orange → red
 
 ### Input Panel

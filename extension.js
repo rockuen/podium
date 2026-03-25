@@ -669,8 +669,7 @@ function createPanel(context, extensionPath, session) {
   // PTY → Webview + activity detection
   let runningDelayTimer = null;
   let dataCount = 0;
-  let contextBuffer = '';
-  let contextParseTimer = null;
+  // context parsing uses immediate per-chunk check
   let webviewReady = false;
   const outputBuffer = [];
 
@@ -686,9 +685,9 @@ function createPanel(context, extensionPath, session) {
     }
 
     // Parse context/token usage from PTY output
-    contextBuffer += data;
-    // Immediate check: look for "Nk/Nk" pattern on each chunk (before buffer overflows)
+    // Immediate check on each PTY chunk (catches data before it's overwritten)
     const strippedNow = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
+    // 1. Full context: "300k/1000k"
     const immediateMatch = strippedNow.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
     if (immediateMatch) {
       const used = immediateMatch[1];
@@ -702,28 +701,21 @@ function createPanel(context, extensionPath, session) {
         try {
           panel.webview.postMessage({ type: 'context-usage', used, total, pct });
         } catch (_) {}
-        contextBuffer = '';
       }
     }
-    // Debounced check: per-response delta "± 1.6k tokens"
-    if (contextBuffer.length > 4000) contextBuffer = contextBuffer.slice(-2000);
-    if (contextParseTimer) clearTimeout(contextParseTimer);
-    contextParseTimer = setTimeout(() => {
-      const stripped = contextBuffer.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
-      const deltaMatch = stripped.match(/[±+]\s*(\d+(?:\.\d+)?)\s*(k)?\s*token/i);
-      if (deltaMatch && entry._ctxTotal > 0) {
-        const num = parseFloat(deltaMatch[1]);
-        const delta = (deltaMatch[2] ? num : num / 1000) * 2; // x2 보정 (누락 보상)
-        entry._ctxUsed = (entry._ctxUsed || 0) + delta;
-        const used = entry._ctxUsed >= 10 ? Math.round(entry._ctxUsed) + 'k' : entry._ctxUsed.toFixed(1) + 'k';
-        const total = Math.round(entry._ctxTotal) + 'k';
-        const pct = entry._ctxTotal > 0 ? Math.round(entry._ctxUsed / entry._ctxTotal * 100) : 0;
-        try {
-          panel.webview.postMessage({ type: 'context-usage', used, total, pct });
-        } catch (_) {}
-        contextBuffer = '';
-      }
-    }, 800);
+    // 2. Delta during response: "± 1.6k tokens" (immediate, before CLI overwrites it)
+    const deltaMatch = strippedNow.match(/[±+]\s*(\d+(?:\.\d+)?)\s*(k)?\s*token/i);
+    if (deltaMatch && entry._ctxTotal > 0) {
+      const num = parseFloat(deltaMatch[1]);
+      const delta = (deltaMatch[2] ? num : num / 1000) * 2; // x2 보정 (누락 보상)
+      entry._ctxUsed = (entry._ctxUsed || 0) + delta;
+      const used = entry._ctxUsed >= 10 ? Math.round(entry._ctxUsed) + 'k' : entry._ctxUsed.toFixed(1) + 'k';
+      const total = Math.round(entry._ctxTotal) + 'k';
+      const pct = entry._ctxTotal > 0 ? Math.round(entry._ctxUsed / entry._ctxTotal * 100) : 0;
+      try {
+        panel.webview.postMessage({ type: 'context-usage', used, total, pct });
+      } catch (_) {}
+    }
 
     // Only transition to 'running' if output persists for 3s+
     if (entry.state !== 'running' && entry.state !== 'done' && entry.state !== 'error') {
@@ -1036,15 +1028,13 @@ function restartPty(entry, panel, context, extensionPath) {
     updateStatusBar();
 
     // Re-attach PTY events
-    let restartCtxBuffer = '';
-    let restartCtxParseTimer = null;
+    // context parsing uses immediate per-chunk check (no buffer needed)
     ptyProcess.onData(data => {
       try {
         panel.webview.postMessage({ type: 'output', data: data });
       } catch (_) {}
 
-      // Parse context/token usage
-      restartCtxBuffer += data;
+      // Parse context/token usage (immediate on each chunk)
       const sNow = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
       const im = sNow.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
       if (im) {
@@ -1054,25 +1044,18 @@ function restartPty(entry, panel, context, extensionPath) {
           const pct = tN > 0 ? Math.round(uN / tN * 100) : 0;
           entry._ctxUsed = uN; entry._ctxTotal = tN;
           try { panel.webview.postMessage({ type: 'context-usage', used: im[1], total: im[2], pct }); } catch (_) {}
-          restartCtxBuffer = '';
         }
       }
-      if (restartCtxBuffer.length > 4000) restartCtxBuffer = restartCtxBuffer.slice(-2000);
-      if (restartCtxParseTimer) clearTimeout(restartCtxParseTimer);
-      restartCtxParseTimer = setTimeout(() => {
-        const stripped = restartCtxBuffer.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
-        const deltaMatch = stripped.match(/[±+]\s*(\d+(?:\.\d+)?)\s*(k)?\s*token/i);
-        if (deltaMatch && entry._ctxTotal > 0) {
-          const num = parseFloat(deltaMatch[1]);
-          const delta = (deltaMatch[2] ? num : num / 1000) * 2; // x2 보정 (누락 보상)
-          entry._ctxUsed = (entry._ctxUsed || 0) + delta;
-          const used = entry._ctxUsed >= 10 ? Math.round(entry._ctxUsed) + 'k' : entry._ctxUsed.toFixed(1) + 'k';
-          const total = Math.round(entry._ctxTotal) + 'k';
-          const pct = entry._ctxTotal > 0 ? Math.round(entry._ctxUsed / entry._ctxTotal * 100) : 0;
-          try { panel.webview.postMessage({ type: 'context-usage', used, total, pct }); } catch (_) {}
-          restartCtxBuffer = '';
-        }
-      }, 800);
+      const dm = sNow.match(/[±+]\s*(\d+(?:\.\d+)?)\s*(k)?\s*token/i);
+      if (dm && entry._ctxTotal > 0) {
+        const num = parseFloat(dm[1]);
+        const delta = (dm[2] ? num : num / 1000) * 2; // x2 보정 (누락 보상)
+        entry._ctxUsed = (entry._ctxUsed || 0) + delta;
+        const used = entry._ctxUsed >= 10 ? Math.round(entry._ctxUsed) + 'k' : entry._ctxUsed.toFixed(1) + 'k';
+        const total = Math.round(entry._ctxTotal) + 'k';
+        const pct = entry._ctxTotal > 0 ? Math.round(entry._ctxUsed / entry._ctxTotal * 100) : 0;
+        try { panel.webview.postMessage({ type: 'context-usage', used, total, pct }); } catch (_) {}
+      }
 
       if (entry.state !== 'running' && entry.state !== 'done' && entry.state !== 'error') {
         entry.state = 'running';
@@ -1827,19 +1810,18 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       border-top: 1px solid ${isDark ? '#D97757' : '#C96442'};
       background: ${isDark ? '#2a2220' : '#faf5f0'};
       position: relative;
-      overflow: hidden;
     }
     #editor-textarea {
       display: block;
       width: 100%;
-      height: 36px !important;
+      height: 36px;
+      min-height: 36px;
+      max-height: 200px;
       padding: 8px 12px;
       border: 1px solid transparent;
       outline: none;
       resize: none;
-      overflow: hidden !important;
-      white-space: nowrap;
-      text-overflow: ellipsis;
+      overflow: hidden;
       background: ${isDark ? '#1e1a18' : '#ffffff'};
       color: ${fg};
       font-size: 12px;
@@ -3333,17 +3315,10 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
     });
 
     function autoResizeTextarea() {
-      const hasMultiline = editorTextarea.value.includes('\\n');
-      if (hasMultiline) {
-        editorTextarea.style.whiteSpace = 'pre-wrap';
-        editorTextarea.style.height = 'auto';
-        editorTextarea.style.height = Math.min(editorTextarea.scrollHeight, 200) + 'px';
-        editorTextarea.style.overflowY = editorTextarea.scrollHeight > 200 ? 'auto' : 'hidden';
-      } else {
-        editorTextarea.style.whiteSpace = 'nowrap';
-        editorTextarea.style.height = '36px';
-        editorTextarea.style.overflowY = 'hidden';
-      }
+      editorTextarea.style.height = 'auto';
+      const h = Math.max(36, Math.min(editorTextarea.scrollHeight, 200));
+      editorTextarea.style.height = h + 'px';
+      editorTextarea.style.overflowY = editorTextarea.scrollHeight > 200 ? 'auto' : 'hidden';
     }
 
     // Typing effects
