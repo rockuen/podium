@@ -1827,16 +1827,19 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       border-top: 1px solid ${isDark ? '#D97757' : '#C96442'};
       background: ${isDark ? '#2a2220' : '#faf5f0'};
       position: relative;
+      overflow: hidden;
     }
     #editor-textarea {
+      display: block;
       width: 100%;
-      min-height: 28px;
-      max-height: 200px;
+      height: 36px !important;
       padding: 8px 12px;
       border: 1px solid transparent;
       outline: none;
       resize: none;
-      overflow-y: hidden;
+      overflow: hidden !important;
+      white-space: nowrap;
+      text-overflow: ellipsis;
       background: ${isDark ? '#1e1a18' : '#ffffff'};
       color: ${fg};
       font-size: 12px;
@@ -1888,11 +1891,18 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       align-items: center;
       justify-content: space-between;
       padding: 4px 10px;
+      height: 32px !important;
+      flex-shrink: 0;
+      flex-wrap: nowrap;
+      overflow: hidden;
     }
     #input-panel-footer .input-hint {
       font-size: 10px;
       color: ${isDark ? '#8a7060' : '#b8a090'};
       font-family: -apple-system, "Segoe UI", sans-serif;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
     }
     /* Slash command dropdown */
     #slash-menu {
@@ -3323,9 +3333,17 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
     });
 
     function autoResizeTextarea() {
-      editorTextarea.style.height = 'auto';
-      editorTextarea.style.height = Math.min(editorTextarea.scrollHeight, 200) + 'px';
-      editorTextarea.style.overflowY = editorTextarea.scrollHeight > 200 ? 'auto' : 'hidden';
+      const hasMultiline = editorTextarea.value.includes('\\n');
+      if (hasMultiline) {
+        editorTextarea.style.whiteSpace = 'pre-wrap';
+        editorTextarea.style.height = 'auto';
+        editorTextarea.style.height = Math.min(editorTextarea.scrollHeight, 200) + 'px';
+        editorTextarea.style.overflowY = editorTextarea.scrollHeight > 200 ? 'auto' : 'hidden';
+      } else {
+        editorTextarea.style.whiteSpace = 'nowrap';
+        editorTextarea.style.height = '36px';
+        editorTextarea.style.overflowY = 'hidden';
+      }
     }
 
     // Typing effects
