@@ -685,27 +685,44 @@ function createPanel(context, extensionPath, session) {
     }
 
     // Parse context/token usage from PTY output
-    // Immediate check on each PTY chunk (catches data before it's overwritten)
+    // Immediate check on each PTY chunk
     const strippedNow = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
-    // 1. Full context: "300k/1000k"
-    const immediateMatch = strippedNow.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
-    if (immediateMatch) {
-      const used = immediateMatch[1];
-      const total = immediateMatch[2];
-      const usedNum = parseFloat(used) * (used.endsWith('k') ? 1 : 0.001);
-      const totalNum = parseFloat(total) * (total.endsWith('k') ? 1 : 0.001);
-      if (totalNum >= 100) {
-        const pct = totalNum > 0 ? Math.round(usedNum / totalNum * 100) : 0;
-        entry._ctxUsed = usedNum;
-        entry._ctxTotal = totalNum;
-        try {
-          panel.webview.postMessage({ type: 'context-usage', used, total, pct });
-        } catch (_) {}
+    // 1. Prompt status line: "ctx:52%" (most reliable, appears after every response)
+    const ctxPctMatch = strippedNow.match(/ctx:(\d+)%/);
+    if (ctxPctMatch) {
+      const pct = parseInt(ctxPctMatch[1]);
+      // Extract total from context model info (e.g., "1M context")
+      const modelMatch = strippedNow.match(/(\d+(?:\.\d+)?)(M|k)\s*context/i);
+      let totalK = entry._ctxTotal || 1000;
+      if (modelMatch) totalK = modelMatch[2].toUpperCase() === 'M' ? parseFloat(modelMatch[1]) * 1000 : parseFloat(modelMatch[1]);
+      const usedK = Math.round(totalK * pct / 100);
+      entry._ctxUsed = usedK;
+      entry._ctxTotal = totalK;
+      try {
+        panel.webview.postMessage({ type: 'context-usage', used: usedK + 'k', total: totalK + 'k', pct });
+      } catch (_) {}
+    }
+    // 2. Full context from /context command: "300k/1000k"
+    if (!ctxPctMatch) {
+      const immediateMatch = strippedNow.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
+      if (immediateMatch) {
+        const used = immediateMatch[1];
+        const total = immediateMatch[2];
+        const usedNum = parseFloat(used) * (used.endsWith('k') ? 1 : 0.001);
+        const totalNum = parseFloat(total) * (total.endsWith('k') ? 1 : 0.001);
+        if (totalNum >= 100) {
+          const pct = totalNum > 0 ? Math.round(usedNum / totalNum * 100) : 0;
+          entry._ctxUsed = usedNum;
+          entry._ctxTotal = totalNum;
+          try {
+            panel.webview.postMessage({ type: 'context-usage', used, total, pct });
+          } catch (_) {}
+        }
       }
     }
-    // 2. Delta during response: "± 1.6k tokens" (immediate, before CLI overwrites it)
+    // 3. Delta during response: "± 1.6k tokens" (fallback)
     const deltaMatch = strippedNow.match(/[±+]\s*(\d+(?:\.\d+)?)\s*(k)?\s*token/i);
-    if (deltaMatch && entry._ctxTotal > 0) {
+    if (deltaMatch && entry._ctxTotal > 0 && !ctxPctMatch) {
       const num = parseFloat(deltaMatch[1]);
       const delta = (deltaMatch[2] ? num : num / 1000) * 2; // x2 보정 (누락 보상)
       entry._ctxUsed = (entry._ctxUsed || 0) + delta;
@@ -1036,25 +1053,29 @@ function restartPty(entry, panel, context, extensionPath) {
 
       // Parse context/token usage (immediate on each chunk)
       const sNow = data.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '').replace(/\x1b\][^\x07]*\x07/g, '');
-      const im = sNow.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
-      if (im) {
-        const uN = parseFloat(im[1]) * (im[1].endsWith('k') ? 1 : 0.001);
-        const tN = parseFloat(im[2]) * (im[2].endsWith('k') ? 1 : 0.001);
-        if (tN >= 100) {
-          const pct = tN > 0 ? Math.round(uN / tN * 100) : 0;
-          entry._ctxUsed = uN; entry._ctxTotal = tN;
-          try { panel.webview.postMessage({ type: 'context-usage', used: im[1], total: im[2], pct }); } catch (_) {}
-        }
+      // 1. Prompt status line: "ctx:52%"
+      const cp = sNow.match(/ctx:(\d+)%/);
+      if (cp) {
+        const pct = parseInt(cp[1]);
+        const mm = sNow.match(/(\d+(?:\.\d+)?)(M|k)\s*context/i);
+        let tK = entry._ctxTotal || 1000;
+        if (mm) tK = mm[2].toUpperCase() === 'M' ? parseFloat(mm[1]) * 1000 : parseFloat(mm[1]);
+        const uK = Math.round(tK * pct / 100);
+        entry._ctxUsed = uK; entry._ctxTotal = tK;
+        try { panel.webview.postMessage({ type: 'context-usage', used: uK + 'k', total: tK + 'k', pct }); } catch (_) {}
       }
-      const dm = sNow.match(/[±+]\s*(\d+(?:\.\d+)?)\s*(k)?\s*token/i);
-      if (dm && entry._ctxTotal > 0) {
-        const num = parseFloat(dm[1]);
-        const delta = (dm[2] ? num : num / 1000) * 2; // x2 보정 (누락 보상)
-        entry._ctxUsed = (entry._ctxUsed || 0) + delta;
-        const used = entry._ctxUsed >= 10 ? Math.round(entry._ctxUsed) + 'k' : entry._ctxUsed.toFixed(1) + 'k';
-        const total = Math.round(entry._ctxTotal) + 'k';
-        const pct = entry._ctxTotal > 0 ? Math.round(entry._ctxUsed / entry._ctxTotal * 100) : 0;
-        try { panel.webview.postMessage({ type: 'context-usage', used, total, pct }); } catch (_) {}
+      // 2. Full context: "300k/1000k"
+      if (!cp) {
+        const im = sNow.match(/(\d+(?:\.\d+)?k?)\/(\d+(?:\.\d+)?k)/);
+        if (im) {
+          const uN = parseFloat(im[1]) * (im[1].endsWith('k') ? 1 : 0.001);
+          const tN = parseFloat(im[2]) * (im[2].endsWith('k') ? 1 : 0.001);
+          if (tN >= 100) {
+            const pct = tN > 0 ? Math.round(uN / tN * 100) : 0;
+            entry._ctxUsed = uN; entry._ctxTotal = tN;
+            try { panel.webview.postMessage({ type: 'context-usage', used: im[1], total: im[2], pct }); } catch (_) {}
+          }
+        }
       }
 
       if (entry.state !== 'running' && entry.state !== 'done' && entry.state !== 'error') {

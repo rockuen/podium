@@ -17,8 +17,15 @@ Run [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) i
 
 ### Context Usage Indicator
 - **Toolbar progress bar** shows token usage at a glance
-- Click `ctx` to manually check via `/context` command
+- **Auto-updates** from Claude Code's status line (`ctx:52%` in prompt)
+- Click `ctx` to manually refresh via `/context` command
 - Color changes based on usage: green → orange → red
+
+> **Tip:** Enable the status line in Claude Code for automatic context tracking:
+> ```bash
+> claude config set -g preferredNotifChannel terminal
+> ```
+> This shows `ctx:XX%` in the prompt after each response, which the launcher reads automatically.
 
 ### Input Panel
 - **Rich input area** with Enter to send, Shift+Enter for newlines
