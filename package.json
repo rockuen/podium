@@ -2,7 +2,7 @@
   "name": "cli-launcher-for-claude",
   "displayName": "CLI Launcher for Claude",
   "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
-  "version": "2.2.1",
+  "version": "2.3.0",
   "publisher": "rockuen",
   "license": "MIT",
   "repository": {
@@ -38,13 +38,42 @@
       },
       {
         "command": "claudeCodeLauncher.refreshSessions",
-        "title": "세션 목록 새로고침",
+        "title": "%refreshSessions%",
         "icon": "$(refresh)",
         "category": "Claude"
       },
       {
         "command": "claudeCodeLauncher.resumeSession",
-        "title": "세션 이어하기",
+        "title": "%resumeSession%",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.moveToGroup",
+        "title": "Move to Group...",
+        "icon": "$(folder)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.deleteGroup",
+        "title": "Delete Group",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.trashSession",
+        "title": "Delete",
+        "icon": "$(trash)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.restoreSession",
+        "title": "Restore",
+        "icon": "$(history)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.emptyTrash",
+        "title": "Empty Trash",
+        "icon": "$(close-all)",
         "category": "Claude"
       }
     ],
@@ -61,14 +90,14 @@
       "claude-code-launcher": [
         {
           "id": "claudeCodeLauncher.sessionList",
-          "name": "세션"
+          "name": "%sessions%"
         }
       ]
     },
     "viewsWelcome": [
       {
         "view": "claudeCodeLauncher.sessionList",
-        "contents": "세션 기록이 없습니다.\n[새 세션 열기](command:claudeCodeLauncher.open)"
+        "contents": "%noSessions%"
       }
     ],
     "menus": {
@@ -76,6 +105,23 @@
         {
           "command": "claudeCodeLauncher.open",
           "group": "navigation@0"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claudeCodeLauncher.moveToGroup",
+          "when": "view == claudeCodeLauncher.sessionList && viewItem != trashed",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeCodeLauncher.trashSession",
+          "when": "view == claudeCodeLauncher.sessionList && viewItem != trashed",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeCodeLauncher.restoreSession",
+          "when": "view == claudeCodeLauncher.sessionList && viewItem == trashed",
+          "group": "inline@1"
         }
       ],
       "view/title": [

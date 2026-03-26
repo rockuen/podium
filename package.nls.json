@@ -1,0 +1,6 @@
+{
+  "refreshSessions": "Refresh Session List",
+  "resumeSession": "Resume Session",
+  "sessions": "Sessions",
+  "noSessions": "No session history.\n[Open New Session](command:claudeCodeLauncher.open)"
+}

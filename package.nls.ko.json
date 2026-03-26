@@ -1,0 +1,6 @@
+{
+  "refreshSessions": "세션 목록 새로고침",
+  "resumeSession": "세션 이어하기",
+  "sessions": "세션",
+  "noSessions": "세션 기록이 없습니다.\n[새 세션 열기](command:claudeCodeLauncher.open)"
+}

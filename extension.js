@@ -249,6 +249,14 @@ function activate(context) {
   });
   context.subscriptions.push(treeView);
 
+  // Track expanded groups
+  treeView.onDidExpandElement(e => {
+    if (e.element.label) sessionTreeProvider._expandedGroups.add(String(e.element.label).replace(/\s*\(\d+\)$/, ''));
+  });
+  treeView.onDidCollapseElement(e => {
+    if (e.element.label) sessionTreeProvider._expandedGroups.delete(String(e.element.label).replace(/\s*\(\d+\)$/, ''));
+  });
+
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.refreshSessions', () => {
       sessionTreeProvider.refresh();
@@ -269,6 +277,114 @@ function activate(context) {
     })
   );
 
+  context.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.moveToGroup', async (item) => {
+      const sessionId = item?._sessionId;
+      if (!sessionId) return;
+      const groups = context.workspaceState.get('claudeSessionGroups', {});
+      const groupNames = Object.keys(groups);
+      const picks = [...groupNames, '$(add) New Group...', '$(close) Remove from Group'];
+      const choice = await vscode.window.showQuickPick(picks, { placeHolder: 'Move session to group...' });
+      if (!choice) return;
+      // Remove from all existing groups first
+      for (const g of Object.keys(groups)) {
+        groups[g] = groups[g].filter(id => id !== sessionId);
+        if (groups[g].length === 0) delete groups[g];
+      }
+      // Also remove from legacy saved/archived
+      const saved = context.workspaceState.get('claudeSavedSessions', []);
+      context.workspaceState.update('claudeSavedSessions', saved.filter(s => s.sessionId !== sessionId));
+      const archived = context.workspaceState.get('claudeArchivedSessions', []);
+      context.workspaceState.update('claudeArchivedSessions', archived.filter(s => s.sessionId !== sessionId));
+      if (choice === '$(close) Remove from Group') {
+        // Just remove, already done above
+      } else if (choice === '$(add) New Group...') {
+        const name = await vscode.window.showInputBox({ prompt: 'Group name' });
+        if (name) {
+          if (!groups[name]) groups[name] = [];
+          groups[name].push(sessionId);
+        }
+      } else {
+        if (!groups[choice]) groups[choice] = [];
+        groups[choice].push(sessionId);
+      }
+      context.workspaceState.update('claudeSessionGroups', groups);
+      if (sessionTreeProvider) sessionTreeProvider.refresh();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.deleteGroup', async () => {
+      const groups = context.workspaceState.get('claudeSessionGroups', {});
+      const groupNames = Object.keys(groups);
+      if (groupNames.length === 0) return;
+      const choice = await vscode.window.showQuickPick(groupNames, { placeHolder: 'Delete group (sessions return to Recent)' });
+      if (!choice) return;
+      delete groups[choice];
+      context.workspaceState.update('claudeSessionGroups', groups);
+      if (sessionTreeProvider) sessionTreeProvider.refresh();
+    })
+  );
+
+  // Trash: delete session (move .jsonl to trash/)
+  context.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.trashSession', async (item) => {
+      const sessionId = item?._sessionId;
+      if (!sessionId) return;
+      const projDir = sessionTreeProvider._getProjectDir();
+      if (!projDir) return;
+      const src = path.join(projDir, sessionId + '.jsonl');
+      if (!fs.existsSync(src)) return;
+      const trashDir = path.join(projDir, 'trash');
+      if (!fs.existsSync(trashDir)) fs.mkdirSync(trashDir, { recursive: true });
+      fs.renameSync(src, path.join(trashDir, sessionId + '.jsonl'));
+      // Remove from all groups
+      const groups = context.workspaceState.get('claudeSessionGroups', {});
+      for (const g of Object.keys(groups)) {
+        groups[g] = groups[g].filter(id => id !== sessionId);
+        if (groups[g].length === 0) delete groups[g];
+      }
+      context.workspaceState.update('claudeSessionGroups', groups);
+      const saved = context.workspaceState.get('claudeSavedSessions', []);
+      context.workspaceState.update('claudeSavedSessions', saved.filter(s => s.sessionId !== sessionId));
+      if (sessionTreeProvider) sessionTreeProvider.refresh();
+    })
+  );
+
+  // Trash: restore session
+  context.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.restoreSession', async (item) => {
+      const sessionId = item?._sessionId;
+      if (!sessionId) return;
+      const projDir = sessionTreeProvider._getProjectDir();
+      if (!projDir) return;
+      const trashDir = path.join(projDir, 'trash');
+      const src = path.join(trashDir, sessionId + '.jsonl');
+      if (!fs.existsSync(src)) return;
+      fs.renameSync(src, path.join(projDir, sessionId + '.jsonl'));
+      if (sessionTreeProvider) sessionTreeProvider.refresh();
+    })
+  );
+
+  // Trash: empty all
+  context.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.emptyTrash', async () => {
+      const projDir = sessionTreeProvider._getProjectDir();
+      if (!projDir) return;
+      const trashDir = path.join(projDir, 'trash');
+      if (!fs.existsSync(trashDir)) return;
+      const files = fs.readdirSync(trashDir).filter(f => f.endsWith('.jsonl'));
+      if (files.length === 0) return;
+      const confirm = await vscode.window.showWarningMessage(
+        `Delete ${files.length} session(s) permanently?`, { modal: true }, 'Delete'
+      );
+      if (confirm === 'Delete') {
+        for (const f of files) fs.unlinkSync(path.join(trashDir, f));
+        if (sessionTreeProvider) sessionTreeProvider.refresh();
+      }
+    })
+  );
+
   // Restore previous sessions
   restoreSessions(context, extensionPath);
 }
@@ -281,6 +397,7 @@ class SessionTreeDataProvider {
     this._onDidChangeTreeData = new vscode.EventEmitter();
     this.onDidChangeTreeData = this._onDidChangeTreeData.event;
     this._cache = null;
+    this._expandedGroups = new Set([t('resumeLaterGroup')]);
   }
 
   refresh() {
@@ -329,42 +446,95 @@ class SessionTreeDataProvider {
   _buildGroups() {
     const projDir = this._getProjectDir();
     console.log('[Session] _getProjectDir:', projDir);
+    const customGroups = this._context.workspaceState.get('claudeSessionGroups', {});
+    // Also support legacy saved sessions
     const savedSessions = this._context.workspaceState.get('claudeSavedSessions', []);
-    const savedSet = new Set(savedSessions.map(s => s.sessionId));
     const allItems = this._loadSessions();
-    console.log('[Session] _loadSessions count:', allItems.length);
 
-    const savedItems = [];
-    const recentItems = [];
-
-    for (const item of allItems) {
-      if (savedSet.has(item._sessionId)) {
-        savedItems.push(item);
-      } else {
-        recentItems.push(item);
-      }
+    // Build set of all grouped session IDs
+    const groupedSet = new Set();
+    for (const ids of Object.values(customGroups)) {
+      for (const id of ids) groupedSet.add(id);
     }
+    for (const s of savedSessions) groupedSet.add(s.sessionId);
+
+    // Map sessionId → item
+    const itemMap = new Map();
+    for (const item of allItems) itemMap.set(item._sessionId, item);
 
     const groups = [];
 
+    const exp = this._expandedGroups;
+    const state = (name) => exp.has(name) ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed;
+
+    // Legacy "Resume Later" group (from close-resume)
+    const rlName = t('resumeLaterGroup');
+    const savedItems = savedSessions.map(s => itemMap.get(s.sessionId)).filter(Boolean);
     if (savedItems.length > 0) {
-      const savedGroup = new vscode.TreeItem(
-        `${t('resumeLaterGroup')} (${savedItems.length})`,
-        vscode.TreeItemCollapsibleState.Expanded
-      );
+      const savedGroup = new vscode.TreeItem(`${rlName} (${savedItems.length})`, state(rlName));
       savedGroup.iconPath = new vscode.ThemeIcon('pin');
       savedGroup._children = savedItems;
       groups.push(savedGroup);
     }
 
+    // Custom groups
+    for (const [name, ids] of Object.entries(customGroups)) {
+      const items = ids.map(id => itemMap.get(id)).filter(Boolean);
+      if (items.length === 0) continue;
+      for (const item of items) {
+        item.iconPath = new vscode.ThemeIcon('folder');
+      }
+      const group = new vscode.TreeItem(`${name} (${items.length})`, state(name));
+      group.iconPath = new vscode.ThemeIcon('folder');
+      group._children = items;
+      groups.push(group);
+    }
+
+    // Recent Sessions (ungrouped)
+    const rsName = t('recentSessionsGroup');
+    const recentItems = allItems.filter(item => !groupedSet.has(item._sessionId));
     if (recentItems.length > 0) {
-      const recentGroup = new vscode.TreeItem(
-        `${t('recentSessionsGroup')} (${recentItems.length})`,
-        vscode.TreeItemCollapsibleState.Collapsed
-      );
+      const recentGroup = new vscode.TreeItem(`${rsName} (${recentItems.length})`, state(rsName));
       recentGroup.iconPath = new vscode.ThemeIcon('history');
       recentGroup._children = recentItems;
       groups.push(recentGroup);
+    }
+
+    // Trash group
+    if (projDir) {
+      const trashDir = path.join(projDir, 'trash');
+      if (fs.existsSync(trashDir)) {
+        const trashFiles = fs.readdirSync(trashDir).filter(f => f.endsWith('.jsonl'));
+        if (trashFiles.length > 0) {
+          const titleMap = this._context.workspaceState.get('claudeSessionTitles', {});
+          const trashItems = [];
+          for (const f of trashFiles) {
+            const sid = f.replace('.jsonl', '');
+            const fullPath = path.join(trashDir, f);
+            const mtime = fs.statSync(fullPath).mtimeMs;
+            const date = new Date(mtime);
+            const dateStr = `${String(date.getMonth() + 1).padStart(2, '0')}/${String(date.getDate()).padStart(2, '0')} ${String(date.getHours()).padStart(2, '0')}:${String(date.getMinutes()).padStart(2, '0')}`;
+            const savedTitle = titleMap[sid];
+            const firstMsg = this._extractFirstUserMessage(fullPath);
+            if (!savedTitle && !firstMsg) continue;
+            const displayText = savedTitle || firstMsg;
+            const label = displayText.length > 40 ? displayText.substring(0, 40) + '...' : displayText;
+            const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
+            item.description = dateStr;
+            item.iconPath = new vscode.ThemeIcon('trash');
+            item.contextValue = 'trashed';
+            item._sessionId = sid;
+            item.command = { command: 'claudeCodeLauncher.resumeSession', title: 'Resume', arguments: [sid] };
+            trashItems.push(item);
+          }
+          if (trashItems.length > 0) {
+            const trashGroup = new vscode.TreeItem(`Trash (${trashItems.length})`, state('Trash'));
+            trashGroup.iconPath = new vscode.ThemeIcon('trash');
+            trashGroup._children = trashItems;
+            groups.push(trashGroup);
+          }
+        }
+      }
     }
 
     return groups;
