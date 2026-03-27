@@ -13,6 +13,65 @@ let isDeactivating = false;
 
 const IDLE_DELAY_MS = 3000;
 
+// ── Session Store (JSON file in workspace for cross-device sync) ──
+const SESSION_STORE_DIR = '.claude-launcher';
+const SESSION_STORE_FILE = 'sessions.json';
+
+function getSessionStorePath() {
+  const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath;
+  if (!wsFolder) return null;
+  return path.join(wsFolder, SESSION_STORE_DIR, SESSION_STORE_FILE);
+}
+
+function sessionStoreGet(key, defaultValue) {
+  const filePath = getSessionStorePath();
+  if (!filePath || !fs.existsSync(filePath)) return defaultValue;
+  try {
+    const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    return data[key] !== undefined ? data[key] : defaultValue;
+  } catch (_) {
+    return defaultValue;
+  }
+}
+
+function sessionStoreUpdate(key, value) {
+  const filePath = getSessionStorePath();
+  if (!filePath) return;
+  const dir = path.dirname(filePath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  let data = {};
+  if (fs.existsSync(filePath)) {
+    try { data = JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (_) {}
+  }
+  data[key] = value;
+  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+}
+
+// ── Migrate from workspaceState to JSON file ──
+function migrateFromWorkspaceState(context) {
+  const filePath = getSessionStorePath();
+  if (!filePath) return;
+  // Skip if already migrated
+  let existing = {};
+  if (fs.existsSync(filePath)) {
+    try { existing = JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (_) {}
+    if (existing._migrated) return;
+  }
+  const keys = ['claudeSessions', 'claudeSessionTitles', 'claudeSavedSessions', 'claudeSessionGroups', 'claudeArchivedSessions'];
+  let migrated = false;
+  for (const key of keys) {
+    const val = context.workspaceState.get(key);
+    if (val !== undefined && existing[key] === undefined) {
+      sessionStoreUpdate(key, val);
+      migrated = true;
+    }
+  }
+  if (migrated) {
+    sessionStoreUpdate('_migrated', true);
+    console.log('[Claude Launcher] Migrated workspaceState to sessions.json');
+  }
+}
+
 // ── i18n ──
 const LOCALES = {
   en: {
@@ -208,6 +267,9 @@ function activate(context) {
   isDeactivating = false;
   const extensionPath = context.extensionPath;
 
+  // Migrate legacy workspaceState data to JSON file
+  migrateFromWorkspaceState(context);
+
   statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBar.command = 'claudeCodeLauncher.open';
   setStatusBar('idle');
@@ -265,13 +327,13 @@ function activate(context) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.resumeSession', (sessionId) => {
-      const titleMap = context.workspaceState.get('claudeSessionTitles', {});
+      const titleMap = sessionStoreGet('claudeSessionTitles', {});
       const title = titleMap[sessionId] || undefined;
       // Remove from saved sessions list when resuming
-      const saved = context.workspaceState.get('claudeSavedSessions', []);
+      const saved = sessionStoreGet('claudeSavedSessions', []);
       const filtered = saved.filter(s => s.sessionId !== sessionId);
       if (filtered.length !== saved.length) {
-        context.workspaceState.update('claudeSavedSessions', filtered);
+        sessionStoreUpdate('claudeSavedSessions', filtered);
       }
       createPanel(context, extensionPath, { sessionId, title });
     })
@@ -281,7 +343,7 @@ function activate(context) {
     vscode.commands.registerCommand('claudeCodeLauncher.moveToGroup', async (item) => {
       const sessionId = item?._sessionId;
       if (!sessionId) return;
-      const groups = context.workspaceState.get('claudeSessionGroups', {});
+      const groups = sessionStoreGet('claudeSessionGroups', {});
       const groupNames = Object.keys(groups);
       const picks = [...groupNames, '$(add) New Group...', '$(close) Remove from Group'];
       const choice = await vscode.window.showQuickPick(picks, { placeHolder: 'Move session to group...' });
@@ -292,10 +354,10 @@ function activate(context) {
         if (groups[g].length === 0) delete groups[g];
       }
       // Also remove from legacy saved/archived
-      const saved = context.workspaceState.get('claudeSavedSessions', []);
-      context.workspaceState.update('claudeSavedSessions', saved.filter(s => s.sessionId !== sessionId));
-      const archived = context.workspaceState.get('claudeArchivedSessions', []);
-      context.workspaceState.update('claudeArchivedSessions', archived.filter(s => s.sessionId !== sessionId));
+      const saved = sessionStoreGet('claudeSavedSessions', []);
+      sessionStoreUpdate('claudeSavedSessions', saved.filter(s => s.sessionId !== sessionId));
+      const archived = sessionStoreGet('claudeArchivedSessions', []);
+      sessionStoreUpdate('claudeArchivedSessions', archived.filter(s => s.sessionId !== sessionId));
       if (choice === '$(close) Remove from Group') {
         // Just remove, already done above
       } else if (choice === '$(add) New Group...') {
@@ -308,18 +370,37 @@ function activate(context) {
         if (!groups[choice]) groups[choice] = [];
         groups[choice].push(sessionId);
       }
-      context.workspaceState.update('claudeSessionGroups', groups);
+      sessionStoreUpdate('claudeSessionGroups', groups);
       if (sessionTreeProvider) sessionTreeProvider.refresh();
     })
   );
 
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.deleteGroup', async (item) => {
-      const groups = context.workspaceState.get('claudeSessionGroups', {});
+      const groups = sessionStoreGet('claudeSessionGroups', {});
       const choice = item?._groupName;
       if (!choice || !groups[choice]) return;
       delete groups[choice];
-      context.workspaceState.update('claudeSessionGroups', groups);
+      sessionStoreUpdate('claudeSessionGroups', groups);
+      if (sessionTreeProvider) sessionTreeProvider.refresh();
+    })
+  );
+
+  context.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.renameGroup', async (item) => {
+      const groups = sessionStoreGet('claudeSessionGroups', {});
+      const choice = item?._groupName;
+      if (!choice || !groups[choice]) return;
+      const newName = await vscode.window.showInputBox({ prompt: 'New group name', value: choice });
+      if (!newName || newName === choice) return;
+      groups[newName] = groups[choice];
+      delete groups[choice];
+      // Update expanded state
+      if (sessionTreeProvider._expandedGroups.has(choice)) {
+        sessionTreeProvider._expandedGroups.delete(choice);
+        sessionTreeProvider._expandedGroups.add(newName);
+      }
+      sessionStoreUpdate('claudeSessionGroups', groups);
       if (sessionTreeProvider) sessionTreeProvider.refresh();
     })
   );
@@ -356,14 +437,14 @@ function activate(context) {
       if (!fs.existsSync(trashDir)) fs.mkdirSync(trashDir, { recursive: true });
       fs.renameSync(src, path.join(trashDir, sessionId + '.jsonl'));
       // Remove from all groups
-      const groups = context.workspaceState.get('claudeSessionGroups', {});
+      const groups = sessionStoreGet('claudeSessionGroups', {});
       for (const g of Object.keys(groups)) {
         groups[g] = groups[g].filter(id => id !== sessionId);
         if (groups[g].length === 0) delete groups[g];
       }
-      context.workspaceState.update('claudeSessionGroups', groups);
-      const saved = context.workspaceState.get('claudeSavedSessions', []);
-      context.workspaceState.update('claudeSavedSessions', saved.filter(s => s.sessionId !== sessionId));
+      sessionStoreUpdate('claudeSessionGroups', groups);
+      const saved = sessionStoreGet('claudeSavedSessions', []);
+      sessionStoreUpdate('claudeSavedSessions', saved.filter(s => s.sessionId !== sessionId));
       if (sessionTreeProvider) sessionTreeProvider.refresh();
     })
   );
@@ -463,9 +544,9 @@ class SessionTreeDataProvider {
   _buildGroups() {
     const projDir = this._getProjectDir();
     console.log('[Session] _getProjectDir:', projDir);
-    const customGroups = this._context.workspaceState.get('claudeSessionGroups', {});
+    const customGroups = sessionStoreGet('claudeSessionGroups', {});
     // Also support legacy saved sessions
-    const savedSessions = this._context.workspaceState.get('claudeSavedSessions', []);
+    const savedSessions = sessionStoreGet('claudeSavedSessions', []);
     const allItems = this._loadSessions();
 
     // Build set of all grouped session IDs
@@ -525,7 +606,7 @@ class SessionTreeDataProvider {
       if (fs.existsSync(trashDir)) {
         const trashFiles = fs.readdirSync(trashDir).filter(f => f.endsWith('.jsonl'));
         if (trashFiles.length > 0) {
-          const titleMap = this._context.workspaceState.get('claudeSessionTitles', {});
+          const titleMap = sessionStoreGet('claudeSessionTitles', {});
           const trashItems = [];
           for (const f of trashFiles) {
             const sid = f.replace('.jsonl', '');
@@ -578,7 +659,7 @@ class SessionTreeDataProvider {
       return [];
     }
 
-    const titleMap = this._context.workspaceState.get('claudeSessionTitles', {});
+    const titleMap = sessionStoreGet('claudeSessionTitles', {});
 
     const items = [];
     for (const file of files) {
@@ -660,10 +741,10 @@ function saveSessions(context) {
       });
     }
   }
-  context.workspaceState.update('claudeSessions', sessions);
+  sessionStoreUpdate('claudeSessions', sessions);
 
   // sessionId → title 매핑 저장 (사이드바 세션 목록용)
-  const titleMap = context.workspaceState.get('claudeSessionTitles', {});
+  const titleMap = sessionStoreGet('claudeSessionTitles', {});
   for (const s of sessions) {
     if (s.sessionId && s.title) {
       // 기본 탭 이름(Claude Code, Claude Code (N))이면 저장하지 않음
@@ -674,16 +755,16 @@ function saveSessions(context) {
       titleMap[s.sessionId] = s.title;
     }
   }
-  context.workspaceState.update('claudeSessionTitles', titleMap);
+  sessionStoreUpdate('claudeSessionTitles', titleMap);
   if (sessionTreeProvider) sessionTreeProvider.refresh();
 }
 
 function restoreSessions(context, extensionPath) {
-  const sessions = context.workspaceState.get('claudeSessions', []);
+  const sessions = sessionStoreGet('claudeSessions', []);
   if (sessions.length === 0) return;
 
   // Clear saved sessions immediately to avoid double-restore
-  context.workspaceState.update('claudeSessions', []);
+  sessionStoreUpdate('claudeSessions', []);
 
   // Restore in saved order with delay between panels for proper column placement
   const sorted = [...sessions].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
@@ -1161,17 +1242,17 @@ function createPanel(context, extensionPath, session) {
     }
     if (msg.type === 'close-resume') {
       // Save session title mapping before closing
-      const titleMap = context.workspaceState.get('claudeSessionTitles', {});
+      const titleMap = sessionStoreGet('claudeSessionTitles', {});
       if (entry.sessionId && entry.title && !/^Claude Code( \(\d+\))?$/.test(entry.title)) {
         titleMap[entry.sessionId] = entry.title;
       }
-      context.workspaceState.update('claudeSessionTitles', titleMap);
+      sessionStoreUpdate('claudeSessionTitles', titleMap);
       // Add to saved sessions list (for sidebar grouping)
       if (entry.sessionId) {
-        const saved = context.workspaceState.get('claudeSavedSessions', []);
+        const saved = sessionStoreGet('claudeSavedSessions', []);
         if (!saved.some(s => s.sessionId === entry.sessionId)) {
           saved.unshift({ sessionId: entry.sessionId, title: entry.title, savedAt: Date.now() });
-          context.workspaceState.update('claudeSavedSessions', saved);
+          sessionStoreUpdate('claudeSavedSessions', saved);
         }
       }
       // Close the panel — session remains resumable from sidebar
@@ -2666,6 +2747,8 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
     // Input with history
     const inputHistory = [];
     let historyIndex = -1;
+    let editorHistoryIdx = -1;
+    let editorHistoryDraft = '';
     let currentLine = '';
     let lineBuffer = '';
 
@@ -3459,9 +3542,13 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       vscode.postMessage({ type: 'input', data: '\\r' });
       // Add to input history
       if (text.trim().length > 0) {
-        inputHistory.push(text.trim());
-        if (inputHistory.length > 100) inputHistory.shift();
+        if (inputHistory.length === 0 || inputHistory[inputHistory.length - 1] !== text.trim()) {
+          inputHistory.push(text.trim());
+          if (inputHistory.length > 100) inputHistory.shift();
+        }
         historyIndex = -1;
+        editorHistoryIdx = -1;
+        editorHistoryDraft = '';
       }
       editorTextarea.value = '';
       autoResizeTextarea();
@@ -3724,6 +3811,31 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
         }
       }
 
+      // ArrowUp/Down: editor input history (only when textarea is single-line)
+      if (e.key === 'ArrowUp' && !e.shiftKey && !editorTextarea.value.includes('\\n')) {
+        if (inputHistory.length === 0) return;
+        e.preventDefault();
+        if (editorHistoryIdx === -1) editorHistoryDraft = editorTextarea.value;
+        if (editorHistoryIdx < inputHistory.length - 1) {
+          editorHistoryIdx++;
+          editorTextarea.value = inputHistory[inputHistory.length - 1 - editorHistoryIdx];
+          autoResizeTextarea();
+        }
+        return;
+      }
+      if (e.key === 'ArrowDown' && !e.shiftKey && !editorTextarea.value.includes('\\n')) {
+        if (editorHistoryIdx < 0) return;
+        e.preventDefault();
+        editorHistoryIdx--;
+        if (editorHistoryIdx < 0) {
+          editorTextarea.value = editorHistoryDraft || '';
+        } else {
+          editorTextarea.value = inputHistory[inputHistory.length - 1 - editorHistoryIdx];
+        }
+        autoResizeTextarea();
+        return;
+      }
+
       // Enter: send, Shift+Enter: newline
       // e.isComposing: IME 조합 중(한글 등) Enter는 무시
       if (e.key === 'Enter' && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.isComposing) {
@@ -3897,7 +4009,7 @@ function deactivate() {
         viewColumn: entry.panel.viewColumn || 1
       });
     }
-    _context.workspaceState.update('claudeSessions', sessions);
+    _sessionStoreUpdate('claudeSessions', sessions);
   }
 
   for (const [, entry] of panels) {
