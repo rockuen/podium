@@ -128,7 +128,7 @@ const LOCALES = {
     scEditorToggle: 'Toggle input panel', scHelp: 'This help',
     scContextMenu: 'Context menu', scContextActions: 'Copy / Paste / Export / Memo / Sound',
     scClose: 'Press ESC or click anywhere to close',
-    ctxCopy: 'Copy', ctxOpenFile: 'Open File', ctxSelectedText: 'Selection',
+    ctxCopy: 'Copy', ctxOpenFile: 'Open File', ctxOpenFolder: 'Open Folder', ctxSelectedText: 'Selection',
     ctxPaste: 'Paste', ctxPasteImage: 'Paste Image',
     ctxSearch: 'Search', ctxClear: 'Clear Screen', ctxExport: 'Export Conversation',
     ctxZoomIn: 'Zoom In', ctxZoomOut: 'Zoom Out', ctxZoomReset: 'Reset Zoom',
@@ -216,7 +216,7 @@ const LOCALES = {
     scEditorToggle: '입력 패널 토글', scHelp: '이 도움말',
     scContextMenu: '우클릭 메뉴', scContextActions: '복사 / 붙여넣기 / 내보내기 / 메모 / 알림음',
     scClose: 'ESC 또는 아무 곳 클릭하여 닫기',
-    ctxCopy: '복사', ctxOpenFile: '파일 열기', ctxSelectedText: '선택 텍스트',
+    ctxCopy: '복사', ctxOpenFile: '파일 열기', ctxOpenFolder: '폴더 열기', ctxSelectedText: '선택 텍스트',
     ctxPaste: '붙여넣기', ctxPasteImage: '이미지 붙여넣기',
     ctxSearch: '검색', ctxClear: '화면 지우기', ctxExport: '대화 내보내기',
     ctxZoomIn: '글자 확대', ctxZoomOut: '글자 축소', ctxZoomReset: '글자 초기화',
@@ -1263,6 +1263,9 @@ function createPanel(context, extensionPath, session) {
     if (msg.type === 'open-file') {
       handleOpenFile(msg.filePath, msg.line, entry);
     }
+    if (msg.type === 'open-folder') {
+      handleOpenFolder(msg.filePath, entry);
+    }
     if (msg.type === 'export-conversation') {
       handleExportConversation(msg.text, entry, panel);
     }
@@ -1601,6 +1604,47 @@ function handleOpenFile(filePath, line, entry) {
     const fileUri = vscode.Uri.file(absPath.replace(/\//g, path.sep));
     const options = line ? { selection: new vscode.Range(line - 1, 0, line - 1, 0) } : {};
     vscode.window.showTextDocument(fileUri, options);
+  }
+}
+
+// Open containing folder in OS file explorer (Finder / Explorer)
+function handleOpenFolder(filePath, entry) {
+  const { exec } = require('child_process');
+  let absPath = filePath;
+  if (!path.isAbsolute(filePath)) {
+    absPath = path.join(entry.cwd, filePath);
+  }
+  absPath = absPath.replace(/\\/g, '/');
+
+  const nativePath = absPath.replace(/\//g, path.sep);
+  // If it's a file, use parent directory; if directory, use it directly
+  let folderPath;
+  try {
+    const stat = fs.statSync(nativePath);
+    folderPath = stat.isDirectory() ? nativePath : path.dirname(nativePath);
+  } catch (_) {
+    folderPath = path.dirname(nativePath);
+  }
+
+  // Walk up until we find an existing directory
+  while (folderPath && !fs.existsSync(folderPath)) {
+    const parent = path.dirname(folderPath);
+    if (parent === folderPath) break;
+    folderPath = parent;
+  }
+
+  if (!fs.existsSync(folderPath)) {
+    vscode.window.showWarningMessage(t('fileNotFound') + filePath);
+    return;
+  }
+
+  // Open in OS file explorer
+  if (process.platform === 'darwin') {
+    exec(`open "${folderPath}"`);
+  } else if (process.platform === 'win32') {
+    exec(`explorer "${folderPath.replace(/\//g, '\\\\')}"`);
+  } else {
+    exec(`xdg-open "${folderPath}"`);
   }
 }
 
@@ -2604,6 +2648,7 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
     <div id="context-menu">
       <div class="ctx-item" data-action="copy">${T.ctxCopy}<span class="shortcut">Ctrl+C</span></div>
       <div class="ctx-item" data-action="open-file">${T.ctxOpenFile}<span class="shortcut">${T.ctxSelectedText}</span></div>
+      <div class="ctx-item" data-action="open-folder">${T.ctxOpenFolder}<span class="shortcut">${T.ctxSelectedText}</span></div>
       <div class="ctx-item" data-action="paste">${T.ctxPaste}<span class="shortcut">Ctrl+V</span></div>
       <div class="ctx-item" data-action="paste-image">${T.ctxPasteImage}<span class="shortcut">&#x1F4CE;</span></div>
       <div class="ctx-sep"></div>
@@ -2681,6 +2726,16 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       const filePath = lineNum ? cleaned.replace(/:([0-9]+)$/, '') : cleaned;
       vscode.postMessage({ type: 'open-file', filePath: filePath, line: lineNum });
       showToast(T.openFileToast + filePath);
+    }
+
+    function openSelectedAsFolder() {
+      const sel = term.getSelection().trim();
+      if (!sel) {
+        showToast(T.selectTextFirst);
+        return;
+      }
+      const cleaned = sel.replace(/^['"\\\`]+|['"\\\`]+$/g, '').replace(/[,;)]+$/, '');
+      vscode.postMessage({ type: 'open-folder', filePath: cleaned });
     }
 
     // Context usage indicator
@@ -3415,6 +3470,9 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
           break;
         case 'open-file':
           openSelectedAsFile();
+          break;
+        case 'open-folder':
+          openSelectedAsFolder();
           break;
         case 'paste':
           navigator.clipboard.readText().then(text => {
