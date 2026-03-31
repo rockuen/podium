@@ -844,9 +844,10 @@ function createPanel(context, extensionPath, session) {
   const initialMemo = session?.memo || '';
   const customButtons = config.get('customButtons', []);
   const customSlashCommands = config.get('customSlashCommands', []);
+  const fileAssociations = config.get('fileAssociations', {});
   const locale = getLocale();
   const T = LOCALES[locale] || LOCALES.en;
-  const settings = { fontFamily, defaultTheme, soundEnabled, particlesEnabled };
+  const settings = { fontFamily, defaultTheme, soundEnabled, particlesEnabled, fileAssociations };
   panel.webview.html = getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUri, searchAddonUri, isDark, fontSize, tabTitle, initialMemo, customButtons, T, settings, customSlashCommands);
 
   // Spawn claude CLI
@@ -1567,8 +1568,14 @@ function handleOpenFile(filePath, line, entry) {
     return;
   }
 
-  if (absPath.endsWith('.md')) {
-    // Open in Obsidian via URI scheme — detect vault from workspace
+  const { exec } = require('child_process');
+  const config = vscode.workspace.getConfiguration('claudeCodeLauncher');
+  const fileAssoc = config.get('fileAssociations', {});
+  const ext = path.extname(absPath).toLowerCase();
+  const method = fileAssoc[ext] || 'auto';
+  const nativePath = absPath.replace(/\//g, path.sep);
+
+  if (method === 'obsidian' || (method === 'auto' && ext === '.md')) {
     const wsFolder = vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath?.replace(/\\/g, '/');
     const vaultRoot = wsFolder ? wsFolder + '/' : '';
     const vaultName = wsFolder ? path.basename(wsFolder) : '';
@@ -1578,15 +1585,51 @@ function handleOpenFile(filePath, line, entry) {
     }
     const obsidianUri = `obsidian://open?vault=${encodeURIComponent(vaultName)}&file=${encodeURIComponent(relativePath)}`;
     vscode.env.openExternal(vscode.Uri.parse(obsidianUri));
-  } else if (/\.(html?|xlsx?|csv|pptx?|docx?|pdf|png|jpe?g|gif|svg|zip|tar|gz)$/i.test(absPath)) {
-    // Open with OS default program (browser, Excel, etc.)
-    const fileUri = vscode.Uri.file(absPath.replace(/\//g, path.sep));
-    vscode.env.openExternal(fileUri);
-  } else {
-    // Open in IDE editor
-    const fileUri = vscode.Uri.file(absPath.replace(/\//g, path.sep));
+  } else if (method === 'excel') {
+    if (process.platform === 'darwin') {
+      exec(`open -a "Microsoft Excel" "${nativePath}"`);
+    } else if (process.platform === 'win32') {
+      exec(`start "" "excel" "${nativePath}"`, { shell: 'cmd.exe' });
+    } else {
+      exec(`libreoffice --calc "${nativePath}"`);
+    }
+  } else if (method === 'browser') {
+    if (process.platform === 'darwin') {
+      exec(`open -a "Safari" "${nativePath}" || open "${nativePath}"`);
+    } else if (process.platform === 'win32') {
+      exec(`start "" "${nativePath}"`, { shell: 'cmd.exe' });
+    } else {
+      exec(`xdg-open "${nativePath}"`);
+    }
+  } else if (method === 'system') {
+    if (process.platform === 'darwin') {
+      exec(`open "${nativePath}"`);
+    } else if (process.platform === 'win32') {
+      exec(`start "" "${nativePath}"`, { shell: 'cmd.exe' });
+    } else {
+      exec(`xdg-open "${nativePath}"`);
+    }
+  } else if (method === 'editor') {
+    const fileUri = vscode.Uri.file(nativePath);
     const options = line ? { selection: new vscode.Range(line - 1, 0, line - 1, 0) } : {};
     vscode.window.showTextDocument(fileUri, options);
+  } else if (method !== 'auto') {
+    // Custom app path (e.g. "/Applications/Numbers.app" or "notepad.exe")
+    if (process.platform === 'darwin') {
+      exec(`open -a "${method}" "${nativePath}"`);
+    } else {
+      exec(`"${method}" "${nativePath}"`);
+    }
+  } else {
+    // auto: OS default for known types, IDE editor for others
+    if (/\.(html?|xlsx?|csv|pptx?|docx?|pdf|png|jpe?g|gif|svg|zip|tar|gz)$/i.test(ext)) {
+      const fileUri = vscode.Uri.file(nativePath);
+      vscode.env.openExternal(fileUri);
+    } else {
+      const fileUri = vscode.Uri.file(nativePath);
+      const options = line ? { selection: new vscode.Range(line - 1, 0, line - 1, 0) } : {};
+      vscode.window.showTextDocument(fileUri, options);
+    }
   }
 }
 
@@ -2584,6 +2627,22 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
           <button class="settings-close-btn" id="set-slash-add" style="width:28px;margin:0;height:28px;font-size:14px;padding:0;">+</button>
         </div>
       </details>
+      <details>
+        <summary style="font-size:12px;cursor:pointer;margin-bottom:8px;">File Associations</summary>
+        <div id="set-fileassoc-list" style="margin-bottom:6px;max-height:180px;overflow-y:auto;"></div>
+        <div style="display:flex;gap:4px;">
+          <input type="text" class="settings-input" id="set-fa-ext" placeholder=".csv" style="width:50px;font-size:10px;">
+          <select class="settings-select" id="set-fa-method" style="flex:1;font-size:10px;height:28px;">
+            <option value="excel">Excel</option>
+            <option value="system">System Default</option>
+            <option value="browser">Browser</option>
+            <option value="obsidian">Obsidian</option>
+            <option value="editor">IDE Editor</option>
+            <option value="auto">Auto</option>
+          </select>
+          <button class="settings-close-btn" id="set-fa-add" style="width:28px;margin:0;height:28px;font-size:14px;padding:0;">+</button>
+        </div>
+      </details>
       <div style="display:flex;gap:6px;margin-top:10px;">
         <button class="settings-close-btn" id="settings-export" style="flex:1;border-color:#4caf50;color:#4caf50;">Export</button>
         <button class="settings-close-btn" id="settings-import" style="flex:1;border-color:#2196F3;color:#2196F3;">Import</button>
@@ -2958,6 +3017,39 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       document.getElementById('set-slash-desc').value = '';
       renderSlashList();
       vscode.postMessage({ type: 'save-setting', key: 'customSlashCommands', value: localSlash });
+    });
+
+    // File Associations management
+    let localFileAssoc = Object.assign({}, SETTINGS.fileAssociations || {});
+    const faListEl = document.getElementById('set-fileassoc-list');
+    const FA_LABELS = { excel: 'Excel', system: 'System Default', browser: 'Browser', obsidian: 'Obsidian', editor: 'IDE Editor', auto: 'Auto' };
+
+    function renderFaList() {
+      const entries = Object.entries(localFileAssoc).sort((a, b) => a[0].localeCompare(b[0]));
+      faListEl.innerHTML = entries.map(([ext, method]) =>
+        '<div class="set-item"><span style="font-weight:600;">' + ext + '</span><span style="color:${statusGray};">' + (FA_LABELS[method] || method) + '</span><span class="set-item-del" data-faext="' + ext + '">&#x2715;</span></div>'
+      ).join('');
+    }
+    renderFaList();
+
+    faListEl.addEventListener('click', (e) => {
+      const del = e.target.closest('.set-item-del');
+      if (del) {
+        delete localFileAssoc[del.dataset.faext];
+        renderFaList();
+        vscode.postMessage({ type: 'save-setting', key: 'fileAssociations', value: localFileAssoc });
+      }
+    });
+
+    document.getElementById('set-fa-add').addEventListener('click', () => {
+      let ext = document.getElementById('set-fa-ext').value.trim().toLowerCase();
+      const method = document.getElementById('set-fa-method').value;
+      if (!ext) return;
+      if (!ext.startsWith('.')) ext = '.' + ext;
+      localFileAssoc[ext] = method;
+      document.getElementById('set-fa-ext').value = '';
+      renderFaList();
+      vscode.postMessage({ type: 'save-setting', key: 'fileAssociations', value: localFileAssoc });
     });
 
     document.getElementById('settings-export').addEventListener('click', () => {
@@ -3855,8 +3947,8 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
         }
       }
 
-      // ArrowUp/Down: editor input history (only when textarea is single-line)
-      if (e.key === 'ArrowUp' && !e.shiftKey && !editorTextarea.value.includes('\\n')) {
+      // Ctrl+ArrowUp/Down: editor input history
+      if (e.key === 'ArrowUp' && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
         if (inputHistory.length === 0) return;
         e.preventDefault();
         if (editorHistoryIdx === -1) editorHistoryDraft = editorTextarea.value;
@@ -3867,7 +3959,7 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
         }
         return;
       }
-      if (e.key === 'ArrowDown' && !e.shiftKey && !editorTextarea.value.includes('\\n')) {
+      if (e.key === 'ArrowDown' && (e.ctrlKey || e.metaKey) && !e.shiftKey) {
         if (editorHistoryIdx < 0) return;
         e.preventDefault();
         editorHistoryIdx--;

@@ -2,7 +2,7 @@
   "name": "cli-launcher-for-claude",
   "displayName": "CLI Launcher for Claude",
   "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
-  "version": "2.3.4",
+  "version": "2.3.5",
   "publisher": "rockuen",
   "license": "MIT",
   "repository": {
@@ -224,6 +224,25 @@
             "required": ["label", "command"]
           },
           "description": "Custom buttons in the input panel. Each button has a label and a slash command."
+        },
+        "claudeCodeLauncher.fileAssociations": {
+          "type": "object",
+          "default": {
+            ".csv": "excel",
+            ".xlsx": "excel",
+            ".xls": "excel",
+            ".pptx": "excel",
+            ".docx": "system",
+            ".pdf": "system",
+            ".html": "browser",
+            ".htm": "browser",
+            ".md": "obsidian",
+            ".png": "system",
+            ".jpg": "system",
+            ".gif": "system",
+            ".svg": "system"
+          },
+          "description": "File extension → open method. Values: 'editor' (IDE), 'system' (OS default), 'obsidian', 'browser', 'excel', or full app path."
         }
       }
     },
