@@ -2754,9 +2754,16 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       }, 100);
     }
 
+    // Trim trailing whitespace from each line of terminal selection
+    function getCleanSelection() {
+      const sel = term.getSelection();
+      if (!sel) return '';
+      return sel.split('\\n').map(line => line.replace(/\\s+$/, '')).join('\\n');
+    }
+
     // Open selected text as file path
     function openSelectedAsFile() {
-      const sel = term.getSelection().trim();
+      const sel = getCleanSelection().trim();
       if (!sel) {
         showToast(T.selectTextFirst);
         return;
@@ -2771,7 +2778,7 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
     }
 
     function openSelectedAsFolder() {
-      const sel = term.getSelection().trim();
+      const sel = getCleanSelection().trim();
       if (!sel) {
         showToast(T.selectTextFirst);
         return;
@@ -3454,7 +3461,7 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
 
       // Ctrl+C: copy selected text (if selection exists), otherwise send ^C
       if (mod && event.key === 'c') {
-        const sel = term.getSelection();
+        const sel = getCleanSelection();
         if (sel) {
           event.preventDefault();
           navigator.clipboard.writeText(sel);
@@ -3543,7 +3550,7 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
 
       switch (action) {
         case 'copy':
-          const sel = term.getSelection();
+          const sel = getCleanSelection();
           if (sel) navigator.clipboard.writeText(sel);
           break;
         case 'open-file':

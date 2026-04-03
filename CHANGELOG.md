@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.3.6] - 2026-04-03
+
+### Fixed
+- **Clean copy (trim trailing whitespace)** — `getCleanSelection()` trims trailing spaces from each line when copying terminal text. Applied to Ctrl+C, context menu Copy, Open File, and Open Folder.
+
 ## [2.3.1] - 2026-03-26
 
 ### Fixed
