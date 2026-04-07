@@ -1049,11 +1049,12 @@ function createPanel(context, extensionPath, session) {
     if (entry.state !== 'running' && entry.state !== 'done' && entry.state !== 'error') {
       if (!runningDelayTimer) {
         runningDelayTimer = setTimeout(() => {
+          if (entry._disposed) { runningDelayTimer = null; return; }
           if (entry.state !== 'running' && entry.state !== 'done' && entry.state !== 'error') {
             entry.state = 'running';
             entry.runningStartedAt = Date.now();
             setTabIcon(panel, 'running', extensionPath);
-            panel.webview.postMessage({ type: 'state', state: 'running' });
+            try { panel.webview.postMessage({ type: 'state', state: 'running' }); } catch (_) {}
             updateStatusBar();
           }
           runningDelayTimer = null;
@@ -1072,21 +1073,22 @@ function createPanel(context, extensionPath, session) {
       // Check how long running lasted
       const runningDuration = Date.now() - entry.runningStartedAt;
 
+      if (entry._disposed) return;
       if (runningDuration >= 7000) {
         // 10s+ total (3s delay + 7s running) → 완료 표시
         entry.state = 'needs-attention';
         setTabIcon(panel, 'done', extensionPath);
-        panel.webview.postMessage({ type: 'state', state: 'needs-attention' });
+        try { panel.webview.postMessage({ type: 'state', state: 'needs-attention' }); } catch (_) {}
         // Windows native toast notification
         showDesktopNotification(entry.title);
         if (!panel.active) {
-          panel.webview.postMessage({ type: 'notify' });
+          try { panel.webview.postMessage({ type: 'notify' }); } catch (_) {}
         }
       } else {
         // 3~10s → 대기로 복귀
         entry.state = 'waiting';
         setTabIcon(panel, 'idle', extensionPath);
-        panel.webview.postMessage({ type: 'state', state: 'waiting' });
+        try { panel.webview.postMessage({ type: 'state', state: 'waiting' }); } catch (_) {}
       }
       updateStatusBar();
       // Refresh session list (picks up newly created .jsonl files)
@@ -1097,10 +1099,11 @@ function createPanel(context, extensionPath, session) {
   // Tab focus → acknowledge + save viewColumn on move
   let lastViewColumn = panel.viewColumn;
   panel.onDidChangeViewState(e => {
+    if (entry._disposed) return;
     if (e.webviewPanel.active && entry.state === 'needs-attention') {
       entry.state = 'waiting';
       setTabIcon(panel, 'idle', extensionPath);
-      panel.webview.postMessage({ type: 'state', state: 'waiting' });
+      try { panel.webview.postMessage({ type: 'state', state: 'waiting' }); } catch (_) {}
       updateStatusBar();
     }
     // Save when panel moves to different column
@@ -1118,21 +1121,26 @@ function createPanel(context, extensionPath, session) {
 
     if (isSuccess) {
       entry.state = 'done';
-      setTabIcon(panel, 'done', extensionPath);
-      panel.title = entry.title + t('suffixDone');
-      panel.webview.postMessage({ type: 'state', state: 'done' });
     } else {
       entry.state = 'error';
-      setTabIcon(panel, 'error', extensionPath);
-      panel.title = entry.title + t('suffixError').replace('{0}', exitCode);
-      panel.webview.postMessage({ type: 'state', state: 'error' });
     }
 
     entry.pty = null;
     saveSessions(context);
     updateStatusBar();
-    // Offer restart
-    panel.webview.postMessage({ type: 'process-exited', exitCode: exitCode, canResume: !!entry.sessionId });
+
+    if (!entry._disposed) {
+      if (isSuccess) {
+        setTabIcon(panel, 'done', extensionPath);
+        panel.title = entry.title + t('suffixDone');
+        try { panel.webview.postMessage({ type: 'state', state: 'done' }); } catch (_) {}
+      } else {
+        setTabIcon(panel, 'error', extensionPath);
+        panel.title = entry.title + t('suffixError').replace('{0}', exitCode);
+        try { panel.webview.postMessage({ type: 'state', state: 'error' }); } catch (_) {}
+      }
+      try { panel.webview.postMessage({ type: 'process-exited', exitCode: exitCode, canResume: !!entry.sessionId }); } catch (_) {}
+    }
   });
 
   // Webview → Extension
@@ -1276,7 +1284,9 @@ function createPanel(context, extensionPath, session) {
 
   // Panel closed
   panel.onDidDispose(() => {
+    entry._disposed = true;
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
+    if (runningDelayTimer) { clearTimeout(runningDelayTimer); runningDelayTimer = null; }
     killPtyProcess(entry.pty);
     panels.delete(tabId);
     if (!isDeactivating) {
@@ -1354,7 +1364,7 @@ function restartPty(entry, panel, context, extensionPath) {
     entry.state = 'running';
     setTabIcon(panel, 'running', extensionPath);
     panel.title = entry.title;
-    panel.webview.postMessage({ type: 'state', state: 'running' });
+    try { panel.webview.postMessage({ type: 'state', state: 'running' }); } catch (_) {}
     saveSessions(context);
     updateStatusBar();
 
@@ -1440,22 +1450,23 @@ function restartPty(entry, panel, context, extensionPath) {
       if (entry.state !== 'running' && entry.state !== 'done' && entry.state !== 'error') {
         entry.state = 'running';
         setTabIcon(panel, 'running', extensionPath);
-        panel.webview.postMessage({ type: 'state', state: 'running' });
+        try { panel.webview.postMessage({ type: 'state', state: 'running' }); } catch (_) {}
         updateStatusBar();
       }
 
       if (entry.idleTimer) clearTimeout(entry.idleTimer);
       entry.idleTimer = setTimeout(() => {
+        if (entry._disposed) return;
         if (!entry.pty || entry.state === 'done' || entry.state === 'error') return;
         if (panel.active) {
           entry.state = 'waiting';
           setTabIcon(panel, 'idle', extensionPath);
-          panel.webview.postMessage({ type: 'state', state: 'waiting' });
+          try { panel.webview.postMessage({ type: 'state', state: 'waiting' }); } catch (_) {}
         } else {
           entry.state = 'needs-attention';
           setTabIcon(panel, 'done', extensionPath);
-          panel.webview.postMessage({ type: 'state', state: 'needs-attention' });
-          panel.webview.postMessage({ type: 'notify' });
+          try { panel.webview.postMessage({ type: 'state', state: 'needs-attention' }); } catch (_) {}
+          try { panel.webview.postMessage({ type: 'notify' }); } catch (_) {}
         }
         updateStatusBar();
         if (sessionTreeProvider) sessionTreeProvider.refresh();
@@ -1465,21 +1476,23 @@ function restartPty(entry, panel, context, extensionPath) {
     ptyProcess.onExit(({ exitCode }) => {
       if (entry.idleTimer) clearTimeout(entry.idleTimer);
       const isSuccess = exitCode === 0 || exitCode === null || exitCode === undefined;
-      if (isSuccess) {
-        entry.state = 'done';
-        setTabIcon(panel, 'done', extensionPath);
-        panel.title = entry.title + t('suffixDone');
-        panel.webview.postMessage({ type: 'state', state: 'done' });
-      } else {
-        entry.state = 'error';
-        setTabIcon(panel, 'error', extensionPath);
-        panel.title = entry.title + t('suffixError').replace('{0}', exitCode);
-        panel.webview.postMessage({ type: 'state', state: 'error' });
-      }
+      entry.state = isSuccess ? 'done' : 'error';
       entry.pty = null;
       saveSessions(context);
       updateStatusBar();
-      panel.webview.postMessage({ type: 'process-exited', exitCode, canResume: !!entry.sessionId });
+
+      if (!entry._disposed) {
+        if (isSuccess) {
+          setTabIcon(panel, 'done', extensionPath);
+          panel.title = entry.title + t('suffixDone');
+          try { panel.webview.postMessage({ type: 'state', state: 'done' }); } catch (_) {}
+        } else {
+          setTabIcon(panel, 'error', extensionPath);
+          panel.title = entry.title + t('suffixError').replace('{0}', exitCode);
+          try { panel.webview.postMessage({ type: 'state', state: 'error' }); } catch (_) {}
+        }
+        try { panel.webview.postMessage({ type: 'process-exited', exitCode, canResume: !!entry.sessionId }); } catch (_) {}
+      }
     });
 
   } catch (e) {
@@ -1724,8 +1737,9 @@ function readClipboardImageFromSystem(entry, panel) {
   }
 
   exec(command, { timeout: 5000 }, (err, stdout) => {
+    if (entry._disposed) return;
     if (err) {
-      panel.webview.postMessage({ type: 'image-paste-result', success: false, reason: 'clipboard-no-image' });
+      try { panel.webview.postMessage({ type: 'image-paste-result', success: false, reason: 'clipboard-no-image' }); } catch (_) {}
       return;
     }
 
@@ -1733,9 +1747,9 @@ function readClipboardImageFromSystem(entry, panel) {
     if (result === 'OK' && fs.existsSync(filepath)) {
       const normalized = filepath.replace(/\\/g, '/');
       if (entry.pty) entry.pty.write(normalized + ' ');
-      panel.webview.postMessage({ type: 'image-paste-result', success: true, filename });
+      try { panel.webview.postMessage({ type: 'image-paste-result', success: true, filename }); } catch (_) {}
     } else {
-      panel.webview.postMessage({ type: 'image-paste-result', success: false, reason: 'clipboard-no-image' });
+      try { panel.webview.postMessage({ type: 'image-paste-result', success: false, reason: 'clipboard-no-image' }); } catch (_) {}
     }
   });
 }

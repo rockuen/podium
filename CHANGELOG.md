@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.3.7] - 2026-04-07
+
+### Fixed
+- **"Webview is disposed" errors** — Added `_disposed` guard flag and `try/catch` protection to all async `postMessage` calls (PTY `onExit`, `setTimeout` callbacks, clipboard `exec`). Cleared `runningDelayTimer` in `onDidDispose` to prevent stale timer firing.
+
 ## [2.3.6] - 2026-04-03
 
 ### Fixed
