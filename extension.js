@@ -1155,7 +1155,7 @@ function createPanel(context, extensionPath, session) {
       return;
     }
     if (msg.type === 'input' && entry.pty) {
-      entry.pty.write(msg.data);
+      writePtyChunked(entry.pty, msg.data);
     }
     if (msg.type === 'resize' && entry.pty) {
       try { entry.pty.resize(msg.cols, msg.rows); } catch (_) {}
@@ -1294,6 +1294,30 @@ function createPanel(context, extensionPath, session) {
     }
     updateStatusBar();
   }, undefined, context.subscriptions);
+}
+
+// ── Chunked PTY write (prevents ConPTY buffer overflow on large pastes) ──
+
+const PTY_CHUNK_SIZE = 1024;
+const PTY_CHUNK_DELAY = 10;
+
+function writePtyChunked(pty, data) {
+  if (!pty) return;
+  if (data.length <= PTY_CHUNK_SIZE) {
+    pty.write(data);
+    return;
+  }
+  let offset = 0;
+  function writeNext() {
+    if (!pty || offset >= data.length) return;
+    const chunk = data.slice(offset, offset + PTY_CHUNK_SIZE);
+    pty.write(chunk);
+    offset += PTY_CHUNK_SIZE;
+    if (offset < data.length) {
+      setTimeout(writeNext, PTY_CHUNK_DELAY);
+    }
+  }
+  writeNext();
 }
 
 // ── Kill PTY process tree (Windows-safe) ──

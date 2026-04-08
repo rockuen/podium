@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.3.8] - 2026-04-08
+
+### Fixed
+- **Long text paste truncation** — Added `writePtyChunked()` to split large inputs into 1024-byte chunks with 10ms intervals, preventing ConPTY buffer overflow on Windows.
+
 ## [2.3.7] - 2026-04-07
 
 ### Fixed
