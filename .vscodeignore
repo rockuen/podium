@@ -6,3 +6,6 @@ icons/icon-128.svg
 !CHANGELOG.md
 install.sh
 260322 INSTALL.md
+**/.gitkeep
+*.vsix
+build.sh
