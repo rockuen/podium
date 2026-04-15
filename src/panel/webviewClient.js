@@ -14,22 +14,26 @@ function getClientScript(ctx) {
       return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
     }
 
-    // v2.5.5: Detect a tab-separated table (Excel selection) and render as
+    // v2.5.5/6: Detect a tab-separated table (Excel selection) and render as
     // Markdown. Strict detector: ≥2 rows, every row has the same number of
-    // tab-separated columns (≥2). Returns original text when not a table.
+    // tab-separated columns (≥2). Returns { markdown, rows, cols } or null.
     function tryConvertTsvToMarkdown(text) {
       const stripped = text.replace(/\\r?\\n+$/, '');
       const lines = stripped.split(/\\r?\\n/);
-      if (lines.length < 2) return text;
+      if (lines.length < 2) return null;
       const cols = lines[0].split('\\t').length;
-      if (cols < 2) return text;
+      if (cols < 2) return null;
       for (const l of lines) {
-        if (l.split('\\t').length !== cols) return text;
+        if (l.split('\\t').length !== cols) return null;
       }
       const rows = lines.map(l => l.split('\\t').map(c => c.replace(/\\|/g, '\\\\|').trim()));
       const fmt = r => '| ' + r.join(' | ') + ' |';
       const sep = fmt(rows[0].map(() => '---'));
-      return [fmt(rows[0]), sep, ...rows.slice(1).map(fmt)].join('\\n');
+      return {
+        markdown: [fmt(rows[0]), sep, ...rows.slice(1).map(fmt)].join('\\n'),
+        rows: rows.length,
+        cols: cols
+      };
     }
     const fitAddon = new FitAddon.FitAddon();
     const dot = document.getElementById('status-dot');
@@ -540,18 +544,54 @@ function getClientScript(ctx) {
       toggleSearch(false);
     });
 
-    // Toast notification
+    // Toast notification.
+    // v2.5.6: opts.image — prepend a small thumbnail (for image paste preview).
+    //         opts.action = { label, onClick } — append ONE clickable "[label]" link.
+    // v2.5.7: opts.actions = [{ label, onClick }, ...] — append multiple links.
+    //         The toast root has pointer-events:none in CSS so it doesn't block
+    //         terminal clicks; we re-enable pointer-events on the links only.
     let toastTimer = null;
-    function showToast(message) {
+    function showToast(message, opts) {
       const toast = document.getElementById('paste-toast');
-      toast.textContent = message;
+      toast.innerHTML = '';
+      if (opts && opts.image) {
+        const thumb = document.createElement('img');
+        thumb.src = opts.image;
+        thumb.style.cssText = 'max-width:96px;max-height:64px;margin-right:8px;vertical-align:middle;border-radius:4px;border:1px solid rgba(255,255,255,0.2);';
+        toast.appendChild(thumb);
+      }
+      toast.appendChild(document.createTextNode(message));
+      const actionList = (opts && opts.actions) || (opts && opts.action ? [opts.action] : []);
+      for (const a of actionList) {
+        if (typeof a.onClick !== 'function') continue;
+        const link = document.createElement('span');
+        link.textContent = ' [' + (a.label || 'action') + ']';
+        link.style.cssText = 'color:' + (a.color || '#4aa3ff') + ';cursor:pointer;text-decoration:underline;margin-left:6px;pointer-events:auto;';
+        link.addEventListener('click', (e) => {
+          e.stopPropagation();
+          a.onClick();
+          toast.style.opacity = '0';
+          setTimeout(() => { toast.style.display = 'none'; }, 300);
+          if (toastTimer) { clearTimeout(toastTimer); toastTimer = null; }
+        });
+        toast.appendChild(link);
+      }
       toast.style.display = 'block';
       toast.style.opacity = '1';
       if (toastTimer) clearTimeout(toastTimer);
       toastTimer = setTimeout(() => {
         toast.style.opacity = '0';
         setTimeout(() => { toast.style.display = 'none'; }, 300);
-      }, 2500);
+      }, 4000);
+    }
+
+    // v2.5.7: send N DELs to undo a just-injected attachment path in the PTY.
+    // Ink/readline TUIs treat 0x7f (DEL) as backspace. Works only if the user
+    // hasn't typed further characters after the injection; if they did, those
+    // trailing chars get erased first — a reasonable trade for simplicity.
+    function sendBackspaces(count) {
+      if (count <= 0) return;
+      vscode.postMessage({ type: 'input', data: '\\x7f'.repeat(count) });
     }
 
     // Notification sound
@@ -612,14 +652,57 @@ function getClientScript(ctx) {
           const injection = '@' + msg.cliPath + ' ';
           vscode.postMessage({ type: 'input', data: injection });
           const kb = Math.round(msg.size / 1024 * 10) / 10;
-          showToast('\\uD83D\\uDCCE ' + msg.fileName + ' (' + kb + 'KB) \\uCCA8\\uBD80\\uB428');
+          const fsPath = msg.fullPath || msg.cliPath;
+          const injectedLen = injection.length;
+          showToast(
+            '\\uD83D\\uDCCE ' + msg.fileName + ' (' + kb + 'KB) \\uCCA8\\uBD80\\uB428',
+            {
+              actions: [
+                {
+                  label: '\\uC5F4\\uAE30',
+                  onClick: () => vscode.postMessage({ type: 'open-paste-file', path: fsPath })
+                },
+                {
+                  label: '\\uCDE8\\uC18C',
+                  color: '#ff7b7b',
+                  onClick: () => {
+                    sendBackspaces(injectedLen);
+                    vscode.postMessage({ type: 'cancel-paste-file', path: fsPath });
+                  }
+                }
+              ]
+            }
+          );
         }
       }
       if (msg.type === 'image-paste-result') {
         if (msg.success) {
-          showToast(T.imageDone + msg.filename);
+          const opts = { image: lastImageDataUrl };
+          if (msg.fullPath) {
+            // Image handler PTY-writes "<forward-slash path> " so backspace
+            // count = path.length + 1 (space). char count is the same either
+            // way because backslash/forward-slash is 1-char-per-sep.
+            const injectedLen = msg.fullPath.length + 1;
+            opts.actions = [
+              {
+                label: '\\uC5F4\\uAE30',
+                onClick: () => vscode.postMessage({ type: 'open-paste-file', path: msg.fullPath })
+              },
+              {
+                label: '\\uCDE8\\uC18C',
+                color: '#ff7b7b',
+                onClick: () => {
+                  sendBackspaces(injectedLen);
+                  vscode.postMessage({ type: 'cancel-paste-file', path: msg.fullPath });
+                }
+              }
+            ];
+          }
+          showToast(T.imageDone + msg.filename, opts);
+          lastImageDataUrl = null;
         } else if (msg.reason && msg.reason !== 'clipboard-no-image') {
           showToast(T.imageFailToast + msg.reason);
+          lastImageDataUrl = null;
         }
       }
       if (msg.type === 'context-usage') {
@@ -726,8 +809,9 @@ function getClientScript(ctx) {
 
       if (rawText) {
         const tableOn = SETTINGS.pasteTableAsMarkdown !== false;
-        const text = tableOn ? tryConvertTsvToMarkdown(rawText) : rawText;
-        const converted = text !== rawText;
+        const conv = tableOn ? tryConvertTsvToMarkdown(rawText) : null;
+        const text = conv ? conv.markdown : rawText;
+        const converted = !!conv;
 
         const thresholdRaw = SETTINGS.pasteToFileThreshold;
         const threshold = (thresholdRaw === undefined || thresholdRaw === null) ? 2000 : thresholdRaw;
@@ -750,7 +834,7 @@ function getClientScript(ctx) {
           e.stopPropagation();
           lastWebviewPasteTime = Date.now();
           term.paste(text);
-          showToast('\\uD83D\\uDCCA TSV \\u2192 Markdown \\uD45C \\uBCC0\\uD658');
+          showToast('\\uD83D\\uDCCA TSV \\u2192 Markdown: ' + conv.rows + '\\uD589 \\u00D7 ' + conv.cols + '\\uC5F4');
           return;
         }
 
@@ -768,11 +852,15 @@ function getClientScript(ctx) {
           lastWebviewPasteTime = Date.now();
           const blob = item.getAsFile();
           if (!blob) return;
-          showToast(T.imagePasting);
           const reader = new FileReader();
           reader.onload = () => {
-            const base64 = reader.result.split(',')[1];
+            const dataUrl = reader.result;
+            const base64 = dataUrl.split(',')[1];
             if (base64) {
+              // v2.5.6: preview the pasted image as a thumbnail in the toast
+              // so the user can spot a wrong clipboard immediately.
+              lastImageDataUrl = dataUrl;
+              showToast(T.imagePasting, { image: dataUrl });
               vscode.postMessage({ type: 'paste-image', data: base64 });
             }
           };
@@ -781,6 +869,10 @@ function getClientScript(ctx) {
         }
       }
     }, true); // <-- capture phase
+
+    // v2.5.6: retained between paste-dispatch and the image-paste-result echo
+    // so the "done" toast can reuse the same thumbnail without re-encoding.
+    let lastImageDataUrl = null;
 
     // Fallback: on Ctrl+V, ask extension to check system clipboard via PowerShell
     // Handles cases where webview paste event doesn't include image data
@@ -1408,8 +1500,15 @@ function getClientScript(ctx) {
       }
     };
 
-    // Poll scroll position (xterm doesn't expose scroll events reliably)
-    setInterval(checkScroll, 1000);
+    // v2.5.6 (B4): replaced 1s polling with direct scroll listener on xterm's
+    // viewport element. The viewport is created by xterm after open(), so we
+    // attach once it appears (short retry). No work while the tab is idle.
+    (function attachViewportScroll() {
+      const viewport = document.querySelector('.xterm-viewport');
+      if (!viewport) { setTimeout(attachViewportScroll, 200); return; }
+      viewport.addEventListener('scroll', checkScroll, { passive: true });
+      checkScroll();
+    })();
 
     scrollFab.addEventListener('click', () => {
       term.scrollToBottom();

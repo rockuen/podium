@@ -61,6 +61,7 @@ function handlePasteLargeText(msg, entry, panel) {
     panel.webview.postMessage({
       type: 'paste-file-ready',
       cliPath,
+      fullPath,
       fileName,
       size: Buffer.byteLength(text, 'utf8')
     });

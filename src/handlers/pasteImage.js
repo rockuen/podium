@@ -20,7 +20,7 @@ function handlePasteImage(base64Data, entry, panel) {
 
     const normalized = filepath.replace(/\\/g, '/');
     if (entry.pty) entry.pty.write(normalized + ' ');
-    try { panel.webview.postMessage({ type: 'image-paste-result', success: true, filename }); } catch (_) {}
+    try { panel.webview.postMessage({ type: 'image-paste-result', success: true, filename, fullPath: filepath }); } catch (_) {}
   } catch (e) {
     vscode.window.showErrorMessage(t('imageSaveFail') + e.message);
     try { panel.webview.postMessage({ type: 'image-paste-result', success: false, reason: e.message }); } catch (_) {}
@@ -60,7 +60,7 @@ function readClipboardImageFromSystem(entry, panel) {
     if (result === 'OK' && fs.existsSync(filepath)) {
       const normalized = filepath.replace(/\\/g, '/');
       if (entry.pty) entry.pty.write(normalized + ' ');
-      try { panel.webview.postMessage({ type: 'image-paste-result', success: true, filename }); } catch (_) {}
+      try { panel.webview.postMessage({ type: 'image-paste-result', success: true, filename, fullPath: filepath }); } catch (_) {}
     } else {
       try { panel.webview.postMessage({ type: 'image-paste-result', success: false, reason: 'clipboard-no-image' }); } catch (_) {}
     }

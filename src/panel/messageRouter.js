@@ -163,6 +163,21 @@ function routeWebviewMessage(msg, ctx) {
       handlePasteLargeText(msg, entry, panel);
       return;
 
+    case 'open-paste-file':
+      if (msg.path) {
+        vscode.commands.executeCommand('vscode.open', vscode.Uri.file(msg.path));
+      }
+      return;
+
+    case 'cancel-paste-file':
+      // v2.5.7: user clicked [취소] on a paste/image attachment toast. PTY
+      // backspaces are sent client-side via an 'input' message; here we just
+      // remove the temp file so it doesn't linger past its purpose.
+      if (msg.path) {
+        try { fs.unlinkSync(msg.path); } catch (_) {}
+      }
+      return;
+
     case 'restart-session':
       restartPty(entry, panel, context, extensionPath);
       return;
