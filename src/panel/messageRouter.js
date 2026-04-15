@@ -155,7 +155,7 @@ function routeWebviewMessage(msg, ctx) {
       return;
 
     case 'export-conversation':
-      handleExportConversation(msg.text, entry, panel);
+      handleExportConversation(entry, panel);
       return;
 
     case 'restart-session':

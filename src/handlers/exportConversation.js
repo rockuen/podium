@@ -1,11 +1,14 @@
 // @module handlers/exportConversation — saves PTY transcript as Markdown.
+// v2.5.2+: reads entry.rawOutput (captured bytes from pty.onData) instead of
+// xterm's render buffer. See pty/rawBuffer.js for the capture/sanitize pair.
 
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
 const { t } = require('../i18n');
+const { sanitizeForExport } = require('../pty/rawBuffer');
 
-async function handleExportConversation(text, entry, panel) {
+async function handleExportConversation(entry, panel) {
   try {
     const now = new Date();
     const pad = (n) => String(n).padStart(2, '0');
@@ -21,6 +24,7 @@ async function handleExportConversation(text, entry, panel) {
 
     if (!uri) return;
 
+    const text = sanitizeForExport(entry.rawOutput || '');
     const header = `# ${entry.title}\n\n- ${t('exportLabel')}: ${dateStr} ${pad(now.getHours())}:${pad(now.getMinutes())}\n- ${t('sessionLabel')}: ${entry.sessionId || 'N/A'}\n\n---\n\n`;
     const content = header + '```\n' + text + '\n```\n';
 

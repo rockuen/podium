@@ -448,16 +448,10 @@ function getClientScript(ctx) {
     });
 
     function exportConversation() {
-      const buf = term.buffer.active;
-      const lines = [];
-      for (let i = 0; i <= buf.length - 1; i++) {
-        const line = buf.getLine(i);
-        if (line) lines.push(line.translateToString(true));
-      }
-      // Trim trailing empty lines
-      while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
-      const text = lines.join('\\n');
-      vscode.postMessage({ type: 'export-conversation', text: text });
+      // v2.5.2+: extension uses entry.rawOutput (captured from pty.onData)
+      // instead of scraping xterm's render buffer. This sidesteps soft-wrap
+      // splits + ConPTY reflow merges that previously corrupted transcripts.
+      vscode.postMessage({ type: 'export-conversation' });
       showToast(T.exportingToast);
     }
 

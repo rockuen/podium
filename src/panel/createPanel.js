@@ -19,6 +19,7 @@ const { saveSessions } = require('../store/sessionManager');
 const { resolveClaudeCli } = require('../pty/resolveCli');
 const { killPtyProcess } = require('../pty/kill');
 const { createContextParser } = require('../pty/contextParser');
+const { appendRaw } = require('../pty/rawBuffer');
 const { getWebviewContent } = require('./webviewContent');
 const { showDesktopNotification } = require('../handlers/desktopNotification');
 const { setTabIcon, setStatusBar, updateStatusBar } = require('./statusIndicator');
@@ -156,7 +157,8 @@ function createPanel(context, extensionPath, session) {
     cwd: cwd,
     sessionId: sessionId,
     state: 'running',
-    idleTimer: null
+    idleTimer: null,
+    rawOutput: ''
   };
   state.panels.set(tabId, entry);
   saveSessions();
@@ -171,6 +173,7 @@ function createPanel(context, extensionPath, session) {
 
   ptyProcess.onData(data => {
     if (entry.pty !== initialPty) return; // stale handler guard
+    appendRaw(entry, data);
     dataCount++;
     if (dataCount <= 3) console.log('[Claude Launcher] PTY data #' + dataCount + ' (' + data.length + ' bytes):', data.substring(0, 100));
     if (!webviewReady) {

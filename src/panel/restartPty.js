@@ -7,6 +7,7 @@ const { t } = require('../i18n');
 const { resolveClaudeCli } = require('../pty/resolveCli');
 const { killPtyProcess } = require('../pty/kill');
 const { createContextParser } = require('../pty/contextParser');
+const { appendRaw, resetRaw } = require('../pty/rawBuffer');
 const { saveSessions } = require('../store/sessionManager');
 const { setTabIcon, updateStatusBar } = require('./statusIndicator');
 
@@ -41,6 +42,7 @@ function restartPty(entry, panel, context, extensionPath) {
   }
   if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = null; }
   entry._disposed = false;
+  resetRaw(entry);
 
   try {
     const ptyProcess = pty.spawn(shell, args, {
@@ -65,6 +67,7 @@ function restartPty(entry, panel, context, extensionPath) {
     const contextParser = createContextParser();
     ptyProcess.onData(data => {
       if (entry.pty !== thisPty) return; // stale handler guard
+      appendRaw(entry, data);
       try {
         panel.webview.postMessage({ type: 'output', data: data });
       } catch (_) {}
