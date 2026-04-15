@@ -380,6 +380,7 @@ function getClientScript(ctx) {
       setParticles.classList.toggle('on', particlesEnabled);
       document.getElementById('ctx-particles').innerHTML = (particlesEnabled ? T.ctxParticlesOff : T.ctxParticlesOn) + '<span class="shortcut">&#x2728;</span>';
       vscode.postMessage({ type: 'save-setting', key: 'particlesEnabled', value: particlesEnabled });
+      if (particlesEnabled) animateParticles();
     });
 
     // Tab memo
@@ -905,6 +906,7 @@ function getClientScript(ctx) {
           pCanvas.style.display = particlesEnabled ? 'block' : 'none';
           document.getElementById('ctx-particles').innerHTML = (particlesEnabled ? T.ctxParticlesOff : T.ctxParticlesOn) + '<span class="shortcut">&#x2728;</span>';
           showToast(particlesEnabled ? T.particlesOnToast : T.particlesOffToast);
+          if (particlesEnabled) animateParticles();
           break;
         case 'change-theme':
           showThemePicker();
@@ -1400,7 +1402,7 @@ function getClientScript(ctx) {
     for (let i = 0; i < PARTICLE_COUNT; i++) particles.push(createParticle());
 
     function animateParticles() {
-      if (!particlesEnabled) { requestAnimationFrame(animateParticles); return; }
+      if (!particlesEnabled) return;
       pCtx.clearRect(0, 0, pCanvas.width, pCanvas.height);
       const isRunning = particleState === 'running';
       const speed = isRunning ? 3 : 1;

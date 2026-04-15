@@ -2,11 +2,10 @@
 // ctx carries: { entry, panel, context, extensionPath, createPanel, onWebviewReady }.
 // createPanel is injected (callback) to avoid circular import with createPanel.js.
 //
-// Message protocol (19 webview→ext):
+// Message protocol (18 webview→ext):
 //   webview-ready, input, resize, toolbar, paste-image, check-clipboard-image,
 //   drop-files, open-link, rename-tab, save-setting, export-settings, import-settings,
 //   close-resume, open-file, open-folder, export-conversation, restart-session,
-//   set-memo (DEAD: no webview sender exists — TODO remove in v2.6),
 //   request-edit-memo
 
 const vscode = require('vscode');
@@ -161,12 +160,6 @@ function routeWebviewMessage(msg, ctx) {
 
     case 'restart-session':
       restartPty(entry, panel, context, extensionPath);
-      return;
-
-    case 'set-memo':
-      // DEAD code: no webview sender. Kept for backward compatibility through v2.5.
-      entry.memo = msg.memo;
-      saveSessions();
       return;
 
     case 'request-edit-memo':

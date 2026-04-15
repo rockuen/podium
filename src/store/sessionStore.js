@@ -26,6 +26,9 @@ function sessionStoreGet(key, defaultValue) {
   }
 }
 
+// Atomic write: write to .tmp.<pid>.<ts>, fsync, then rename over the target.
+// Prevents partial-file corruption / cross-window race when multiple windows
+// (or the same window racing with a previous flush) update the same key.
 function sessionStoreUpdate(key, value) {
   const filePath = getSessionStorePath();
   if (!filePath) return;
@@ -36,7 +39,21 @@ function sessionStoreUpdate(key, value) {
     try { data = JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (_) {}
   }
   data[key] = value;
-  fs.writeFileSync(filePath, JSON.stringify(data, null, 2), 'utf8');
+  const json = JSON.stringify(data, null, 2);
+  const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+  let fd;
+  try {
+    fd = fs.openSync(tmpPath, 'w');
+    fs.writeSync(fd, json, 0, 'utf8');
+    try { fs.fsyncSync(fd); } catch (_) {}
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmpPath, filePath);
+  } catch (e) {
+    if (fd !== undefined) { try { fs.closeSync(fd); } catch (_) {} }
+    try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (_) {}
+    throw e;
+  }
 }
 
 // One-time migration from legacy workspaceState storage to sessions.json.
