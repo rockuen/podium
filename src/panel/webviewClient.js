@@ -61,6 +61,85 @@ function getClientScript(ctx) {
     term.open(document.getElementById('terminal'));
     fitAddon.fit();
 
+    // ── Fullscreen mode detection + mouse mode suppression (v2.5.7) ──
+    // Claude CLI's fullscreen mode uses alternate screen buffer + mouse
+    // reporting. Mouse reporting makes xterm.js forward mouse events to the
+    // PTY instead of handling selection locally, which breaks drag-select,
+    // copy, context-menu, and other launcher features.
+    //
+    // Strategy: strip mouse-mode escape sequences from the PTY output BEFORE
+    // they reach term.write(), so xterm.js never enters mouse mode. We still
+    // detect them for the UI indicator. Alternate screen is left intact since
+    // the TUI needs it for rendering.
+    let isAlternateScreen = false;
+    let isMouseMode = false;
+    let fsHintShown = false;
+    const fsIndicator = document.getElementById('fs-indicator');
+
+    // Detect mouse tracking from raw PTY data (for UI indicator only).
+    function checkMouseMode(data) {
+      if (/\\x1b\\[\\?100[0-6]h/.test(data) || /\\x1b\\[\\?1015h/.test(data)) {
+        if (!isMouseMode) { isMouseMode = true; updateFullscreenUI(); }
+      }
+      if (/\\x1b\\[\\?100[0-6]l/.test(data) || /\\x1b\\[\\?1015l/.test(data)) {
+        if (isMouseMode) { isMouseMode = false; updateFullscreenUI(); }
+      }
+    }
+
+    // Strip mouse-mode sequences so xterm.js never enters mouse reporting.
+    // Covers: 1000-1006 (tracking modes), 1015 (urxvt extended).
+    // This preserves normal drag-select, Ctrl+C copy, and context menu.
+    function stripMouseMode(data) {
+      return data.replace(/\\x1b\\[\\?(?:100[0-6]|1015)[hl]/g, '');
+    }
+
+    // Alternate screen buffer detection via xterm.js API.
+    term.buffer.onBufferChange((buf) => {
+      const alt = buf.type === 'alternate';
+      if (alt !== isAlternateScreen) {
+        isAlternateScreen = alt;
+        updateFullscreenUI();
+      }
+    });
+
+    function updateFullscreenUI() {
+      const active = isAlternateScreen || isMouseMode;
+      fsIndicator.style.display = active ? 'inline-flex' : 'none';
+      if (active && !fsHintShown) {
+        fsHintShown = true;
+        showToast(T.fsHintToast);
+      }
+      if (isAlternateScreen) {
+        scrollFab.style.display = 'none';
+      }
+    }
+
+    // Forward mouse wheel to PTY as SGR mouse reports when fullscreen.
+    // Without mouse-mode sequences xterm.js converts wheel→arrow keys in
+    // alternate screen, causing input-history cycling instead of scrolling.
+    // We intercept wheel in capture phase, construct the SGR report, and
+    // send it to the PTY directly. Button 64=up, 65=down per SGR spec.
+    (function attachWheelForward() {
+      const screen = document.querySelector('.xterm-screen');
+      if (!screen) { setTimeout(attachWheelForward, 200); return; }
+      screen.addEventListener('wheel', (e) => {
+        if (!isMouseMode) return; // normal mode: let xterm.js handle
+        e.preventDefault();
+        e.stopPropagation();
+        const rect = screen.getBoundingClientRect();
+        const cellW = rect.width / term.cols;
+        const cellH = rect.height / term.rows;
+        const x = Math.max(1, Math.min(term.cols, Math.floor((e.clientX - rect.left) / cellW) + 1));
+        const y = Math.max(1, Math.min(term.rows, Math.floor((e.clientY - rect.top) / cellH) + 1));
+        const btn = e.deltaY < 0 ? 64 : 65;
+        const lines = Math.max(1, Math.min(5, Math.ceil(Math.abs(e.deltaY) / 50)));
+        const seq = '\\x1b[<' + btn + ';' + x + ';' + y + 'M';
+        for (let i = 0; i < lines; i++) {
+          vscode.postMessage({ type: 'input', data: seq });
+        }
+      }, { passive: false, capture: true });
+    })();
+
     // Apply default theme from settings
     if (SETTINGS.defaultTheme && SETTINGS.defaultTheme !== 'default') {
       setTimeout(() => {
@@ -76,14 +155,22 @@ function getClientScript(ctx) {
       return sel.split('\\n').map(line => line.replace(/\\s+$/, '')).join('\\n');
     }
 
-    // Cache of selection captured at contextmenu time — some environments
-    // (Mac Electron / xterm canvas mousedown) can clear selection before
-    // the menu-item click handler fires, causing "Select text first" toasts.
+    // v2.5.7: Persistent selection cache. In fullscreen/mouse-reporting mode,
+    // xterm.js clears the selection on mousedown BEFORE contextmenu fires.
+    // We cache every non-empty selection as it happens via onSelectionChange,
+    // so right-click → Open File / Copy still works even after the selection
+    // is cleared by the mouse event.
     let ctxSelectionCache = '';
+    let lastSelectionCache = '';
+    term.onSelectionChange(() => {
+      const sel = getCleanSelection().trim();
+      if (sel) lastSelectionCache = sel;
+    });
     function readSelection() {
       const live = getCleanSelection().trim();
       if (live) return live;
-      return (ctxSelectionCache || '').trim();
+      if (ctxSelectionCache) return ctxSelectionCache;
+      return lastSelectionCache;
     }
 
     // Open selected text as file path
@@ -475,13 +562,20 @@ function getClientScript(ctx) {
       // v2.5.2 did). xterm.js already runs a full virtual-terminal state
       // machine — let it do the work, then export the resulting text.
       // term.getSelection() merges isWrapped logical lines correctly.
+      //
+      // v2.5.7: In alternate screen (fullscreen mode), selectAll only captures
+      // the current viewport — scroll history lives in the normal buffer which
+      // is not accessible. Warn the user so they know the export is partial.
+      if (isAlternateScreen) {
+        showToast(T.fsExportWarn);
+      }
       term.selectAll();
       const all = term.getSelection();
       term.clearSelection();
       let text = all.split('\\n').map(l => l.replace(/\\s+$/, '')).join('\\n');
       text = text.replace(/\\n+$/, '');
       vscode.postMessage({ type: 'export-conversation', text: text });
-      showToast(T.exportingToast);
+      if (!isAlternateScreen) showToast(T.exportingToast);
     }
 
     document.getElementById('btn-zoom-in').addEventListener('click', () => {
@@ -618,8 +712,10 @@ function getClientScript(ctx) {
     window.addEventListener('message', event => {
       const msg = event.data;
       if (msg.type === 'output') {
+        checkMouseMode(msg.data);
+        const cleaned = stripMouseMode(msg.data);
         const wasAtBottom = term.buffer.active.viewportY >= term.buffer.active.baseY;
-        term.write(msg.data, () => {
+        term.write(cleaned, () => {
           if (wasAtBottom) term.scrollToBottom();
         });
       }
@@ -934,12 +1030,14 @@ function getClientScript(ctx) {
       }
 
       // Ctrl+C: copy selected text (if selection exists), otherwise send ^C
+      // v2.5.7: fall back to lastSelectionCache for mouse-mode resilience
       if (mod && event.key === 'c') {
-        const sel = getCleanSelection();
+        const sel = getCleanSelection() || lastSelectionCache;
         if (sel) {
           event.preventDefault();
           navigator.clipboard.writeText(sel);
           showToast(T.copied);
+          lastSelectionCache = '';
           return false;
         }
         // No selection: let ^C pass through to PTY
@@ -1001,12 +1099,14 @@ function getClientScript(ctx) {
       ctxMenu.style.display = 'none';
     }
 
+    // v2.5.7: capture phase so contextmenu fires even when xterm.js mouse
+    // reporting intercepts and stopPropagation's the event in bubble phase.
     document.addEventListener('contextmenu', (e) => {
       e.preventDefault();
       // Snapshot selection before the menu click (mousedown/click may clear xterm selection)
       ctxSelectionCache = getCleanSelection().trim();
       showContextMenu(e.clientX, e.clientY);
-    });
+    }, true);
 
     document.addEventListener('click', (e) => {
       if (!ctxMenu.contains(e.target)) hideContextMenu();
@@ -1026,8 +1126,8 @@ function getClientScript(ctx) {
 
       switch (action) {
         case 'copy':
-          const sel = getCleanSelection() || ctxSelectionCache;
-          if (sel) navigator.clipboard.writeText(sel);
+          const sel = getCleanSelection() || ctxSelectionCache || lastSelectionCache;
+          if (sel) { navigator.clipboard.writeText(sel); lastSelectionCache = ''; }
           break;
         case 'open-file':
           openSelectedAsFile();
@@ -1490,7 +1590,9 @@ function getClientScript(ctx) {
     let isAtBottom = true;
 
     // xterm viewport scroll detection
+    // v2.5.7: suppress in alternate screen — TUI manages own scrolling
     const checkScroll = () => {
+      if (isAlternateScreen) { scrollFab.style.display = 'none'; return; }
       const viewport = document.querySelector('.xterm-viewport');
       if (!viewport) return;
       const atBottom = viewport.scrollTop + viewport.clientHeight >= viewport.scrollHeight - 10;

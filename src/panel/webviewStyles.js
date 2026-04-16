@@ -697,6 +697,28 @@ function getStyles(ctx) {
       margin-top: 10px;
     }
 
+    /* Fullscreen mode indicator */
+    #fs-indicator {
+      display: none;
+      align-items: center;
+      gap: 4px;
+      font-size: 10px;
+      font-family: -apple-system, "Segoe UI", sans-serif;
+      color: #e8a317;
+      border: 1px solid rgba(232,163,23,0.4);
+      border-radius: 4px;
+      padding: 2px 7px;
+      height: 22px;
+      background: ${isDark ? 'rgba(232,163,23,0.1)' : 'rgba(232,163,23,0.08)'};
+      cursor: help;
+      flex-shrink: 0;
+      animation: fs-pulse 2s ease-in-out infinite;
+    }
+    @keyframes fs-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.7; }
+    }
+
     /* Toast notification */
     #paste-toast {
       display: none;

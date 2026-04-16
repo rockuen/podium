@@ -82,6 +82,10 @@ module.exports = {
   imagePasting: '이미지 붙여넣는 중...', copied: '복사됨',
   clipboardChecking: '클립보드에서 이미지 확인 중...',
   particlesOnToast: '입자 효과 켜짐', particlesOffToast: '입자 효과 꺼짐',
+  // fullscreen mode
+  fsTip: 'Fullscreen 모드 — 드래그/복사/우클릭 정상 동작',
+  fsExportWarn: '⚠ Fullscreen 모드: 현재 화면만 내보냅니다 (전체 대화 아님)',
+  fsHintToast: 'Fullscreen 모드 감지 — 마우스 캡처 비활성화됨',
   // slash commands
   slashCompact: '대화 컨텍스트 압축', slashClear: '대화 초기화',
   slashModel: '모델 변경', slashCost: '비용 확인', slashHelp: '도움말 보기',

@@ -83,6 +83,10 @@ module.exports = {
   imagePasting: 'Pasting image...', copied: 'Copied',
   clipboardChecking: 'Checking clipboard for image...',
   particlesOnToast: 'Particles on', particlesOffToast: 'Particles off',
+  // fullscreen mode
+  fsTip: 'Fullscreen mode — drag/copy/right-click work normally',
+  fsExportWarn: '⚠ Fullscreen mode: only current screen will be exported',
+  fsHintToast: 'Fullscreen mode detected — mouse capture disabled',
   // slash commands
   slashCompact: 'Compress conversation context', slashClear: 'Clear conversation',
   slashModel: 'Change model', slashCost: 'Check cost', slashHelp: 'Show help',
