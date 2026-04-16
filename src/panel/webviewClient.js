@@ -235,9 +235,13 @@ function getClientScript(ctx) {
       }
     }
 
+    // v2.6.1: clicking the context indicator now triggers /compact directly.
+    // Previously it ran /context to re-query usage, but the bar already
+    // auto-updates from output — so clicking was most often used when the
+    // bar hit the danger zone (80%+) and the user wanted to compact anyway.
     ctxIndicator.addEventListener('click', () => {
-      vscode.postMessage({ type: 'input', data: '/context' + String.fromCharCode(13) });
-      showToast(T.ctxQuerying);
+      vscode.postMessage({ type: 'input', data: '/compact' + String.fromCharCode(13) });
+      showToast(T.ctxCompacting);
       term.focus();
     });
 
@@ -982,6 +986,25 @@ function getClientScript(ctx) {
     // so the "done" toast can reuse the same thumbnail without re-encoding.
     let lastImageDataUrl = null;
 
+    // v2.6.1: Ctrl+C copy at document level (capture phase).
+    // xterm's attachCustomKeyEventHandler only fires when xterm's internal
+    // textarea has focus. Drag-to-select in fullscreen/alternate-screen can
+    // leave focus on the viewport div instead, so the xterm handler misses
+    // the Ctrl+C. Document capture catches it everywhere. We skip real
+    // input/textarea targets so native text-input copy still works.
+    document.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.key !== 'c') return;
+      const tag = (e.target && e.target.tagName) || '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      const sel = getCleanSelection() || lastSelectionCache;
+      if (!sel) return; // no selection → let ^C pass through to xterm → PTY
+      e.preventDefault();
+      e.stopPropagation();
+      navigator.clipboard.writeText(sel).catch(() => {});
+      showToast(T.copied);
+      lastSelectionCache = '';
+    }, true);
+
     // Fallback: on Ctrl+V, ask extension to check system clipboard via PowerShell
     // Handles cases where webview paste event doesn't include image data
     term.attachCustomKeyEventHandler((event) => {
@@ -1041,20 +1064,10 @@ function getClientScript(ctx) {
         return false;
       }
 
-      // Ctrl+C: copy selected text (if selection exists), otherwise send ^C
-      // v2.5.7: fall back to lastSelectionCache for mouse-mode resilience
-      if (mod && event.key === 'c') {
-        const sel = getCleanSelection() || lastSelectionCache;
-        if (sel) {
-          event.preventDefault();
-          navigator.clipboard.writeText(sel);
-          showToast(T.copied);
-          lastSelectionCache = '';
-          return false;
-        }
-        // No selection: let ^C pass through to PTY
-        return true;
-      }
+      // Ctrl+C: no handling here. Moved to document-level capture below so
+      // it works regardless of which element has focus (xterm textarea vs
+      // viewport vs canvas). xterm's default is to send ^C to PTY when no
+      // selection, which we want preserved.
 
       // Ctrl+F: toggle search bar
       if (mod && event.key === 'f') {

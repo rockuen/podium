@@ -27,7 +27,7 @@ module.exports = {
   // webview
   starting: '시작 중...',
   memoEditTip: '클릭하여 메모 편집',
-  ctxUsageTip: '컨텍스트 사용량 (클릭하여 새로고침)',
+  ctxUsageTip: '컨텍스트 사용량 (클릭하여 대화 압축 /compact)',
   pasteImageTip: '클립보드 이미지 붙여넣기',
   zoomOutTip: '글자 축소 (Ctrl+-)',
   zoomInTip: '글자 확대 (Ctrl+=)',
@@ -67,6 +67,7 @@ module.exports = {
   openFolderToast: '폴더 열기: ',
   invalidFolderPath: '폴더를 열 수 없습니다 (유효하지 않거나 부분 경로): ',
   ctxQuerying: '컨텍스트 사용량 조회 중...',
+  ctxCompacting: '대화 압축 실행 중... (/compact)',
   soundOnToast: '알림음 켜짐', soundOffToast: '알림음 꺼짐',
   addMemo: '+ 메모', themeApplied: '테마 적용: ',
   exportingToast: '대화 내보내기 중...', exportDone: '대화 내보내기 완료', exportFailToast: '내보내기 실패',

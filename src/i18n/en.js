@@ -28,7 +28,7 @@ module.exports = {
   // webview
   starting: 'Starting...',
   memoEditTip: 'Click to edit memo',
-  ctxUsageTip: 'Context usage (click to refresh)',
+  ctxUsageTip: 'Context usage (click to compact /compact)',
   pasteImageTip: 'Paste clipboard image',
   zoomOutTip: 'Zoom out (Ctrl+-)',
   zoomInTip: 'Zoom in (Ctrl+=)',
@@ -68,6 +68,7 @@ module.exports = {
   openFolderToast: 'Open folder: ',
   invalidFolderPath: 'Cannot open folder (invalid or partial path): ',
   ctxQuerying: 'Querying context usage...',
+  ctxCompacting: 'Compacting conversation... (/compact)',
   soundOnToast: 'Sound on', soundOffToast: 'Sound off',
   addMemo: '+ Memo', themeApplied: 'Theme: ',
   exportingToast: 'Exporting conversation...', exportDone: 'Export complete', exportFailToast: 'Export failed',
