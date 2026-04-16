@@ -986,20 +986,37 @@ function getClientScript(ctx) {
     // so the "done" toast can reuse the same thumbnail without re-encoding.
     let lastImageDataUrl = null;
 
-    // v2.6.1: Ctrl+C copy at document level (capture phase).
+    // v2.6.2: Ctrl+C copy at document level (capture phase).
     // xterm's attachCustomKeyEventHandler only fires when xterm's internal
     // textarea has focus. Drag-to-select in fullscreen/alternate-screen can
     // leave focus on the viewport div instead, so the xterm handler misses
-    // the Ctrl+C. Document capture catches it everywhere. We skip real
-    // input/textarea targets so native text-input copy still works.
+    // the Ctrl+C. Document capture catches it everywhere.
+    //
+    // IMPORTANT: xterm.js uses a hidden <textarea class="xterm-helper-textarea">
+    // to capture keyboard input, so a naive "skip INPUT/TEXTAREA" guard would
+    // silently skip xterm's own textarea and let ^C leak through to the PTY
+    // (Claude CLI then starts its "press Ctrl+C again to exit" countdown even
+    // after a successful clipboard copy). Instead we check whether the target
+    // is inside our xterm container (#terminal). If yes → it's xterm's helper
+    // textarea, proceed with copy. If no and target is a real user-facing
+    // input → bail so native Ctrl+C (browser-level copy) still works in the
+    // search/editor/settings inputs.
+    //
+    // We also stopImmediatePropagation to make sure no bubble-phase listener
+    // (including xterm's own internal hooks) fires ^C forwarding.
+    const termContainer = document.getElementById('terminal');
     document.addEventListener('keydown', (e) => {
       if (!(e.ctrlKey || e.metaKey) || e.key !== 'c') return;
-      const tag = (e.target && e.target.tagName) || '';
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
+      const inTerm = termContainer && e.target && termContainer.contains(e.target);
+      if (!inTerm) {
+        const tag = (e.target && e.target.tagName) || '';
+        if (tag === 'INPUT' || tag === 'TEXTAREA') return; // real user input
+      }
       const sel = getCleanSelection() || lastSelectionCache;
       if (!sel) return; // no selection → let ^C pass through to xterm → PTY
       e.preventDefault();
       e.stopPropagation();
+      e.stopImmediatePropagation();
       navigator.clipboard.writeText(sel).catch(() => {});
       showToast(T.copied);
       lastSelectionCache = '';
@@ -1064,10 +1081,20 @@ function getClientScript(ctx) {
         return false;
       }
 
-      // Ctrl+C: no handling here. Moved to document-level capture below so
-      // it works regardless of which element has focus (xterm textarea vs
-      // viewport vs canvas). xterm's default is to send ^C to PTY when no
-      // selection, which we want preserved.
+      // Ctrl+C: document-level capture does the copy, but keep a belt-and-
+      // suspenders guard here: if a selection exists, tell xterm NOT to
+      // process the event (return false). This blocks xterm from sending
+      // ^C to the PTY if the document capture somehow missed it (e.g. the
+      // capture phase didn't stop propagation early enough on some hosts).
+      // When no selection exists, return true so xterm sends ^C normally —
+      // that's the Claude CLI "Ctrl+C twice to exit" prep behavior the user
+      // actually wants.
+      if (mod && event.key === 'c') {
+        if (getCleanSelection() || lastSelectionCache) {
+          return false;
+        }
+        return true;
+      }
 
       // Ctrl+F: toggle search bar
       if (mod && event.key === 'f') {

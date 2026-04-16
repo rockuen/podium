@@ -19,7 +19,33 @@ function handleOpenFolder(filePath, entry) {
     raw = path.join(os.homedir(), raw.slice(1));
   }
 
-  const resolved = resolvePathFragment(raw, entry.cwd);
+  let resolved = resolvePathFragment(raw, entry.cwd);
+
+  // v2.6.2: mirror openFile.js basename-search fallback so partial paths
+  // like "slack-manifests/01-demand-forecast.yaml" resolve to the containing
+  // folder even when cwd isn't a direct ancestor. Walks up to depth 6,
+  // matches by basename, then prefers a full-suffix match.
+  if (!resolved) {
+    const suffix = raw.replace(/\\/g, '/');
+    const basename = path.basename(raw);
+    const found = [];
+    function searchDir(dir, depth) {
+      if (depth > 6 || found.length >= 5) return;
+      try {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const e of entries) {
+          if (e.name === 'node_modules' || e.name === '.git') continue;
+          const full = path.join(dir, e.name);
+          if ((e.isFile() || e.isDirectory()) && e.name === basename) found.push(full);
+          else if (e.isDirectory()) searchDir(full, depth + 1);
+        }
+      } catch (_) {}
+    }
+    if (entry.cwd) searchDir(entry.cwd, 0);
+    const match = found.find(f => f.replace(/\\/g, '/').endsWith(suffix)) || found[0];
+    if (match) resolved = match;
+  }
+
   if (!resolved) {
     vscode.window.showWarningMessage(t('invalidFolderPath') + filePath);
     return;
