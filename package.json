@@ -405,7 +405,9 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run build",
-    "build": "tsc -p ./",
+    "build": "tsc -p ./ && node esbuild.webview.config.mjs",
+    "build:ts": "tsc -p ./",
+    "build:webview": "node esbuild.webview.config.mjs",
     "watch": "tsc -watch -p ./",
     "package": "vsce package",
     "probe:pty": "node scripts/probe/pty-smoke.js",
