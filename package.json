@@ -364,6 +364,27 @@
             ".svg": "system"
           },
           "description": "File extension → open method. Values: 'editor' (IDE), 'system' (OS default), 'obsidian', 'browser', 'excel', or full app path."
+        },
+        "claudeCodeLauncher.orchestration.sessionPrefix": {
+          "type": "string",
+          "default": "omc-team-",
+          "description": "Prefix used to identify OMC team sessions in tmux/psmux."
+        },
+        "claudeCodeLauncher.orchestration.claudeCommand": {
+          "type": "string",
+          "default": "",
+          "description": "Override path to the `claude` CLI for orchestration. Empty = auto-detect."
+        },
+        "claudeCodeLauncher.orchestration.backend": {
+          "type": "string",
+          "default": "auto",
+          "enum": ["auto", "tmux", "psmux"],
+          "description": "Multiplexer backend for orchestration (auto: psmux on win32, tmux elsewhere)."
+        },
+        "claudeCodeLauncher.orchestration.sessionFilter": {
+          "type": "string",
+          "default": "",
+          "description": "Substring filter for orchestration session names (empty = no filter)."
         }
       }
     },
