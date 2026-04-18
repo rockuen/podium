@@ -51,6 +51,10 @@ function getClientScript(ctx) {
         // '#ddd' (border color) which is invisible on a white background.
         selectionBackground: '${isDark ? "rgba(100, 150, 220, 0.4)" : "rgba(30, 100, 200, 0.25)"}'
       },
+      // v2.6.5: smooth wheel scroll in normal mode (scrollback view).
+      // Only affects xterm.js's native scroll API path — has no effect in
+      // alternate-screen/TUI mode where Claude CLI drives partial redraws.
+      smoothScrollDuration: 120,
       allowProposedApi: true
     });
 
@@ -76,6 +80,7 @@ function getClientScript(ctx) {
     // the TUI needs it for rendering.
     let isAlternateScreen = false;
     let isMouseMode = false;
+    let forceNormalMode = false; // v2.6.3: user override — force normal mode
     let fsHintShown = false;
     const fsIndicator = document.getElementById('fs-indicator');
 
@@ -97,25 +102,99 @@ function getClientScript(ctx) {
     }
 
     // Alternate screen buffer detection via xterm.js API.
+    // v2.6.3: when returning to normal buffer, force-clear any stuck mouse-mode
+    // flag. Claude CLI sometimes fails to emit the disable sequence on exit,
+    // or chunks split the sequence across writes so our regex misses it. The
+    // alternate-screen flag is authoritative via xterm's buffer API, so use it
+    // to gate mouse-mode as well.
     term.buffer.onBufferChange((buf) => {
       const alt = buf.type === 'alternate';
       if (alt !== isAlternateScreen) {
         isAlternateScreen = alt;
+        if (!alt) {
+          isMouseMode = false;
+          forceNormalMode = false;
+        }
         updateFullscreenUI();
       }
     });
 
+    // v2.6.3: single source of truth for "is the TUI actively capturing mouse?"
+    // Requires BOTH alt-screen AND mouse-mode, and user can override via click.
+    function isTuiMouseActive() {
+      if (forceNormalMode) return false;
+      return isAlternateScreen && isMouseMode;
+    }
+
+    // v2.6.4: redraw button is only meaningful while a TUI owns the screen.
+    const btnRedraw = document.getElementById('btn-redraw');
+
     function updateFullscreenUI() {
-      const active = isAlternateScreen || isMouseMode;
-      fsIndicator.style.display = active ? 'inline-flex' : 'none';
-      if (active && !fsHintShown) {
+      const detected = isAlternateScreen || isMouseMode;
+      if (detected) {
+        fsIndicator.style.display = 'inline-flex';
+        if (forceNormalMode) {
+          fsIndicator.textContent = 'FS\u00d7';
+          fsIndicator.title = T.fsOverrideTip;
+          fsIndicator.classList.add('fs-overridden');
+        } else {
+          fsIndicator.textContent = 'FS';
+          fsIndicator.title = T.fsTip;
+          fsIndicator.classList.remove('fs-overridden');
+        }
+      } else {
+        fsIndicator.style.display = 'none';
+        fsIndicator.classList.remove('fs-overridden');
+      }
+      if (btnRedraw) btnRedraw.style.display = isAlternateScreen ? 'inline-flex' : 'none';
+      if (isTuiMouseActive() && !fsHintShown) {
         fsHintShown = true;
         showToast(T.fsHintToast);
       }
-      if (isAlternateScreen) {
+      if (isAlternateScreen && !forceNormalMode) {
         scrollFab.style.display = 'none';
       }
     }
+
+    // v2.6.3: clicking the FS indicator toggles a user override that forces
+    // normal-mode behavior even when detection says fullscreen. Escape hatch
+    // for cases where Claude leaves the flag stuck or the user simply wants
+    // local wheel scroll instead of forwarding to the TUI.
+    fsIndicator.addEventListener('click', () => {
+      const detected = isAlternateScreen || isMouseMode;
+      if (!detected) return;
+      forceNormalMode = !forceNormalMode;
+      updateFullscreenUI();
+      showToast(forceNormalMode ? T.fsOverrideOn : T.fsOverrideOff);
+      term.focus();
+    });
+
+    // v2.6.4: force a full TUI redraw without touching session, scrollback,
+    // or conversation history. Useful when fullscreen rendering gets
+    // corrupted (overlapping text, ghost lines) after wheel scrolling.
+    // Client side repaints xterm; extension side toggles the PTY size so
+    // Claude CLI receives two SIGWINCH signals and redraws from scratch.
+    function redrawScreen() {
+      try { term.refresh(0, term.rows - 1); } catch (_) {}
+      vscode.postMessage({ type: 'redraw-screen' });
+      showToast(T.redrawToast);
+    }
+    if (btnRedraw) {
+      btnRedraw.addEventListener('click', () => {
+        redrawScreen();
+        term.focus();
+      });
+    }
+    // Ctrl+Shift+R — browser-style "hard reload" semantics, applied here to
+    // the TUI only. Capture-phase listener so it beats xterm's own handler.
+    document.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey) || !e.shiftKey) return;
+      if (e.key !== 'R' && e.key !== 'r') return;
+      if (!isAlternateScreen) return; // no TUI, let xterm/browser default win
+      e.preventDefault();
+      e.stopPropagation();
+      redrawScreen();
+    }, true);
 
     // Forward mouse wheel to PTY as SGR mouse reports when fullscreen.
     // Without mouse-mode sequences xterm.js converts wheel→arrow keys in
@@ -126,15 +205,16 @@ function getClientScript(ctx) {
     // v2.6.0: removed the 1-5x magnitude multiplier. Browsers and trackpads
     // already fire many wheel events per physical gesture (10-20+). The old
     // multiplier could produce 50-100 SGR reports per second, overwhelming
-    // the TUI's partial-redraw pipeline and leaving ghost-text artifacts
-    // from incomplete frame clears. One report per wheel event matches how
-    // xterm.js natively behaves with mouse reporting, and scrolling still
-    // feels responsive because the browser supplies plenty of events.
+    // the TUI's partial-redraw pipeline and leaving ghost-text artifacts.
+    //
+    // v2.6.3: require alt-screen + mouse-mode + !forceNormalMode. A stuck
+    // mouse-mode flag alone (e.g. leftover from a prior fullscreen session)
+    // no longer hijacks wheel scroll.
     (function attachWheelForward() {
       const screen = document.querySelector('.xterm-screen');
       if (!screen) { setTimeout(attachWheelForward, 200); return; }
       screen.addEventListener('wheel', (e) => {
-        if (!isMouseMode) return; // normal mode: let xterm.js handle
+        if (!isTuiMouseActive()) return; // normal mode: let xterm.js handle
         e.preventDefault();
         e.stopPropagation();
         const rect = screen.getBoundingClientRect();
@@ -332,6 +412,7 @@ function getClientScript(ctx) {
     const setFontfamily = document.getElementById('set-fontfamily');
     const setSound = document.getElementById('set-sound');
     const setParticles = document.getElementById('set-particles');
+    const setAutoEffortMax = document.getElementById('set-autoeffortmax');
 
     function toggleSettings() {
       const visible = settingsModal.style.display === 'block';
@@ -390,20 +471,85 @@ function getClientScript(ctx) {
     const btnListEl = document.getElementById('set-buttons-list');
 
     function renderBtnList() {
+      const n = localButtons.length;
       btnListEl.innerHTML = localButtons.map((b, i) =>
-        '<div class="set-item"><span style="font-weight:600;">' + escapeHtml(b.label) + '</span><span style="color:${statusGray};">' + escapeHtml(b.command) + '</span><span class="set-item-del" data-bi="' + i + '">&#x2715;</span></div>'
+        '<div class="set-item" data-bi="' + i + '">' +
+          '<span class="set-item-field" data-field="label" title="Click to edit" style="font-weight:600;">' + escapeHtml(b.label) + '</span>' +
+          '<span class="set-item-field" data-field="command" title="Click to edit" style="color:${statusGray};">' + escapeHtml(b.command) + '</span>' +
+          '<span class="set-item-move' + (i === 0 ? ' disabled' : '') + '" data-bi="' + i + '" data-dir="up" title="Move up">&#x25B2;</span>' +
+          '<span class="set-item-move' + (i === n - 1 ? ' disabled' : '') + '" data-bi="' + i + '" data-dir="down" title="Move down">&#x25BC;</span>' +
+          '<span class="set-item-del" data-bi="' + i + '" title="Delete">&#x2715;</span>' +
+        '</div>'
       ).join('');
     }
     renderBtnList();
 
+    // v2.6.5: inline edit. Click label/command span → turns into <input>.
+    // Enter commits · Escape cancels · blur commits. Rendering is fully
+    // replaced on commit/cancel so stray listeners die with the old DOM.
+    function startBtnEdit(span) {
+      const row = span.closest('.set-item');
+      if (!row) return;
+      const bi = parseInt(row.dataset.bi);
+      const key = span.dataset.field;
+      const original = localButtons[bi][key];
+
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = original;
+      input.className = 'set-item-input';
+
+      let done = false;
+      const commit = () => {
+        if (done) return; done = true;
+        const v = input.value.trim();
+        if (v && v !== original) {
+          localButtons[bi][key] = v;
+          vscode.postMessage({ type: 'save-setting', key: 'customButtons', value: localButtons });
+          showToast('Reload to apply button changes');
+        }
+        renderBtnList();
+      };
+      const cancel = () => {
+        if (done) return; done = true;
+        renderBtnList();
+      };
+
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); commit(); }
+        else if (e.key === 'Escape') { e.preventDefault(); cancel(); }
+      });
+      input.addEventListener('blur', commit);
+
+      span.replaceWith(input);
+      input.focus();
+      input.select();
+    }
+
     btnListEl.addEventListener('click', (e) => {
+      const move = e.target.closest('.set-item-move');
+      if (move && !move.classList.contains('disabled')) {
+        const i = parseInt(move.dataset.bi);
+        const j = move.dataset.dir === 'up' ? i - 1 : i + 1;
+        if (j < 0 || j >= localButtons.length) return;
+        const tmp = localButtons[i];
+        localButtons[i] = localButtons[j];
+        localButtons[j] = tmp;
+        renderBtnList();
+        vscode.postMessage({ type: 'save-setting', key: 'customButtons', value: localButtons });
+        showToast('Reload to apply button changes');
+        return;
+      }
       const del = e.target.closest('.set-item-del');
       if (del) {
         localButtons.splice(parseInt(del.dataset.bi), 1);
         renderBtnList();
         vscode.postMessage({ type: 'save-setting', key: 'customButtons', value: localButtons });
         showToast('Reload to apply button changes');
+        return;
       }
+      const field = e.target.closest('.set-item-field');
+      if (field) startBtnEdit(field);
     });
 
     document.getElementById('set-btn-add').addEventListener('click', () => {
@@ -502,6 +648,16 @@ function getClientScript(ctx) {
       document.getElementById('ctx-particles').innerHTML = (particlesEnabled ? T.ctxParticlesOff : T.ctxParticlesOn) + '<span class="shortcut">&#x2728;</span>';
       vscode.postMessage({ type: 'save-setting', key: 'particlesEnabled', value: particlesEnabled });
       if (particlesEnabled) animateParticles();
+    });
+
+    // v2.6.5: auto /effort max — send the command once on first idle after
+    // session start. Saved globally so reload window restores it.
+    let autoEffortMaxEnabled = SETTINGS.autoEffortMax === true;
+    setAutoEffortMax.addEventListener('click', () => {
+      autoEffortMaxEnabled = !autoEffortMaxEnabled;
+      setAutoEffortMax.classList.toggle('on', autoEffortMaxEnabled);
+      vscode.postMessage({ type: 'save-setting', key: 'autoEffortMax', value: autoEffortMaxEnabled });
+      showToast(autoEffortMaxEnabled ? T.autoEffortMaxOn : T.autoEffortMaxOff);
     });
 
     // Tab memo
@@ -889,6 +1045,16 @@ function getClientScript(ctx) {
       }
       // Track state for queue auto-start
       lastKnownState = state;
+      // v2.6.5: auto /effort max — fire once on first idle (waiting or
+      // needs-attention). Delay a beat so Claude CLI's prompt is really ready
+      // to accept input, not mid-render from the restore animation.
+      if ((state === 'waiting' || state === 'needs-attention') && autoEffortMaxEnabled && !autoEffortMaxSent) {
+        autoEffortMaxSent = true;
+        setTimeout(() => {
+          vscode.postMessage({ type: 'input', data: '/effort max' + String.fromCharCode(13) });
+          showToast(T.autoEffortMaxToast);
+        }, 800);
+      }
       // Queue: auto-send next item when idle
       if (state === 'waiting' || state === 'needs-attention') {
         if (queueRunning && queueCurrentIndex >= 0) {
@@ -1369,6 +1535,7 @@ function getClientScript(ctx) {
     }
 
     let lastKnownState = 'waiting';
+    let autoEffortMaxSent = false;
 
     queueAddBtn.addEventListener('click', () => {
       const text = editorTextarea.value.trim();

@@ -44,6 +44,24 @@ function routeWebviewMessage(msg, ctx) {
       if (entry.pty) try { entry.pty.resize(msg.cols, msg.rows); } catch (_) {}
       return;
 
+    // v2.6.4: force TUI full redraw without touching session or scrollback.
+    // Useful when fullscreen rendering gets corrupted (overlapping text,
+    // ghost lines) after wheel scrolling. We toggle the PTY size by 1 column
+    // and back so the TUI receives two SIGWINCH signals and redraws from
+    // scratch. No SIGINT, no /clear, no /compact — just a visual refresh.
+    case 'redraw-screen':
+      if (!entry.pty) return;
+      try {
+        const cols = entry._lastCols || 80;
+        const rows = entry._lastRows || 24;
+        const tmpCols = Math.max(2, cols - 1);
+        entry.pty.resize(tmpCols, rows);
+        setTimeout(() => {
+          try { entry.pty && entry.pty.resize(cols, rows); } catch (_) {}
+        }, 40);
+      } catch (_) {}
+      return;
+
     case 'toolbar':
       handleToolbar(msg.action, entry, context, extensionPath, createPanel);
       return;

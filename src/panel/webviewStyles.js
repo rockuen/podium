@@ -285,6 +285,34 @@ function getStyles(ctx) {
       opacity: 0.6; padding: 0 2px;
     }
     .set-item-del:hover { opacity: 1; }
+    .set-item-move {
+      cursor: pointer; color: ${statusGray}; font-size: 9px;
+      flex: 0 0 auto; opacity: 0.55; padding: 0 1px;
+      user-select: none; line-height: 1;
+    }
+    .set-item-move:hover { opacity: 1; color: ${fg}; }
+    .set-item-move.disabled { visibility: hidden; }
+    .set-item-field {
+      cursor: text;
+      padding: 1px 4px;
+      border-radius: 3px;
+      transition: background 0.1s;
+    }
+    .set-item-field:hover {
+      background: ${isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.05)'};
+    }
+    .set-item-input {
+      flex: 1 1 auto;
+      min-width: 0;
+      font-size: 10px;
+      font-family: inherit;
+      padding: 1px 4px;
+      border: 1px solid #D97757;
+      border-radius: 3px;
+      background: ${isDark ? '#2a2a2a' : '#ffffff'};
+      color: ${fg};
+      outline: none;
+    }
     #settings-modal details summary { user-select: none; }
     #settings-modal details summary:hover { color: #D97757; }
 
@@ -710,9 +738,21 @@ function getStyles(ctx) {
       padding: 2px 7px;
       height: 22px;
       background: ${isDark ? 'rgba(232,163,23,0.1)' : 'rgba(232,163,23,0.08)'};
-      cursor: help;
+      cursor: pointer;
       flex-shrink: 0;
       animation: fs-pulse 2s ease-in-out infinite;
+      user-select: none;
+    }
+    #fs-indicator:hover {
+      border-color: rgba(232,163,23,0.7);
+    }
+    #fs-indicator.fs-overridden {
+      color: ${statusGray};
+      border-color: ${border};
+      background: ${isDark ? 'rgba(120,120,120,0.12)' : 'rgba(120,120,120,0.08)'};
+      text-decoration: line-through;
+      animation: none;
+      opacity: 0.75;
     }
     @keyframes fs-pulse {
       0%, 100% { opacity: 1; }

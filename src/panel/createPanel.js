@@ -26,6 +26,26 @@ const { routeWebviewMessage } = require('./messageRouter');
 
 const IDLE_DELAY_MS = 3000;
 
+// v2.6.6: interactive prompt patterns. When the PTY emits any of these,
+// escalate the entry to needs-attention immediately instead of waiting
+// out the 7-second running threshold. False positives are bounded by
+// keeping the patterns specific to user-prompting language.
+const INTERACTIVE_PROMPT_PATTERNS = [
+  /Do you want to/i,
+  /\[Y\/n\]/,
+  /\[y\/N\]/,
+  /\(y\/n\)/i,
+  /\(yes\/no\)/i,
+  /Press Enter to continue/i,
+  /Press \[?Esc\]? to/i,
+];
+function looksLikePrompt(data) {
+  for (let i = 0; i < INTERACTIVE_PROMPT_PATTERNS.length; i++) {
+    if (INTERACTIVE_PROMPT_PATTERNS[i].test(data)) return true;
+  }
+  return false;
+}
+
 function createPanel(context, extensionPath, session) {
   let pty;
   try {
@@ -62,6 +82,7 @@ function createPanel(context, extensionPath, session) {
   const defaultTheme = config.get('defaultTheme', 'default');
   const soundEnabled = config.get('soundEnabled', true);
   const particlesEnabled = config.get('particlesEnabled', true);
+  const autoEffortMax = config.get('autoEffortMax', false);
   const pasteToFileThreshold = config.get('pasteToFileThreshold', 2000);
   const pasteTableAsMarkdown = config.get('pasteTableAsMarkdown', true);
 
@@ -89,7 +110,7 @@ function createPanel(context, extensionPath, session) {
   const customSlashCommands = config.get('customSlashCommands', []);
   const fileAssociations = config.get('fileAssociations', {});
   const T = getTranslations();
-  const settings = { fontFamily, defaultTheme, soundEnabled, particlesEnabled, fileAssociations, pasteToFileThreshold, pasteTableAsMarkdown };
+  const settings = { fontFamily, defaultTheme, soundEnabled, particlesEnabled, autoEffortMax, fileAssociations, pasteToFileThreshold, pasteTableAsMarkdown };
   panel.webview.html = getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUri, searchAddonUri, isDark, fontSize, tabTitle, initialMemo, customButtons, T, settings, customSlashCommands);
 
   // Spawn claude CLI
@@ -163,6 +184,29 @@ function createPanel(context, extensionPath, session) {
   state.panels.set(tabId, entry);
   saveSessions();
 
+  // v2.6.6: title blink while needs-attention AND tab not focused.
+  // Self-stops via state polling, so external state changes don't need
+  // explicit stopBlink() calls. Restored on focus or state transition.
+  let blinkInterval = null;
+  let blinkOn = false;
+  function startTitleBlink() {
+    if (blinkInterval) return;
+    blinkInterval = setInterval(() => {
+      if (entry._disposed || entry.state !== 'needs-attention' || panel.active) {
+        stopTitleBlink();
+        return;
+      }
+      blinkOn = !blinkOn;
+      try { panel.title = (blinkOn ? '\u26A0 ' : '') + entry.title; } catch (_) {}
+    }, 800);
+  }
+  function stopTitleBlink() {
+    if (blinkInterval) { clearInterval(blinkInterval); blinkInterval = null; }
+    blinkOn = false;
+    try { panel.title = entry.title; } catch (_) {}
+  }
+  entry._stopBlink = stopTitleBlink;
+
   // PTY → Webview + activity detection
   let runningDelayTimer = null;
   let dataCount = 0;
@@ -186,6 +230,25 @@ function createPanel(context, extensionPath, session) {
     const usage = contextParser.feed(data, entry);
     if (usage) {
       try { panel.webview.postMessage({ type: 'context-usage', ...usage }); } catch (_) {}
+    }
+
+    // v2.6.6: interactive prompt fast-path. Skip the 7-second running
+    // threshold when we recognize a "Do you want / [Y/n] / Press Enter"
+    // style prompt — the user needs to act NOW, not after the timer.
+    if (entry.state !== 'needs-attention' && entry.state !== 'done' && entry.state !== 'error' && looksLikePrompt(data)) {
+      if (entry.idleTimer) { clearTimeout(entry.idleTimer); entry.idleTimer = null; }
+      if (runningDelayTimer) { clearTimeout(runningDelayTimer); runningDelayTimer = null; }
+      entry.state = 'needs-attention';
+      setTabIcon(panel, 'done', extensionPath);
+      try { panel.webview.postMessage({ type: 'state', state: 'needs-attention' }); } catch (_) {}
+      showDesktopNotification(entry.title);
+      if (!panel.active) {
+        try { panel.webview.postMessage({ type: 'notify' }); } catch (_) {}
+        startTitleBlink();
+      }
+      updateStatusBar();
+      if (state.sessionTreeProvider) state.sessionTreeProvider.refresh();
+      return;
     }
 
     // Only transition to 'running' if output persists for 3s+
@@ -223,6 +286,7 @@ function createPanel(context, extensionPath, session) {
         showDesktopNotification(entry.title);
         if (!panel.active) {
           try { panel.webview.postMessage({ type: 'notify' }); } catch (_) {}
+          startTitleBlink();
         }
       } else {
         entry.state = 'waiting';
@@ -302,6 +366,7 @@ function createPanel(context, extensionPath, session) {
     entry._disposed = true;
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     if (runningDelayTimer) { clearTimeout(runningDelayTimer); runningDelayTimer = null; }
+    stopTitleBlink();
     killPtyProcess(entry.pty);
     state.panels.delete(tabId);
     if (!state.isDeactivating) {
