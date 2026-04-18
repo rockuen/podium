@@ -298,6 +298,59 @@ function activate(context) {
     })
   );
 
+  // ─── Orchestration placeholder commands (M2에서 실제 구현) ───
+  const orchPlaceholderCmds = [
+    ['claudeCodeLauncher.session.filter',                  'Filter Sessions (TODO M2)'],
+    ['claudeCodeLauncher.session.clearFilter',             'Clear Session Filter (TODO M2)'],
+    ['claudeCodeLauncher.session.openDir',                 'Open Session Directory (TODO M2)'],
+    ['claudeCodeLauncher.team.create',                     'New Team (TODO M2)'],
+    ['claudeCodeLauncher.team.createIntegrated',           'New Team Integrated (TODO M2)'],
+    ['claudeCodeLauncher.team.quickCreate',                'Quick Create Team (TODO M2)'],
+    ['claudeCodeLauncher.team.attach',                     'Attach Team (TODO M2)'],
+    ['claudeCodeLauncher.team.missions.focus',             'Show Missions (TODO M2)'],
+    ['claudeCodeLauncher.team.missions.refresh',           'Refresh Missions (TODO M2)'],
+    ['claudeCodeLauncher.podium.enter',                    'Enter Podium Mode (TODO M2)'],
+    ['claudeCodeLauncher.podium.exit',                     'Exit Podium Mode (TODO M2)'],
+    ['claudeCodeLauncher.podium.grid',                     'Show Multi-pane (TODO M2)'],
+    ['claudeCodeLauncher.podium.dashboard',                'Show Team Dashboard (TODO M2)'],
+    ['claudeCodeLauncher.hud.focus',                       'Show HUD (TODO M2)'],
+    ['claudeCodeLauncher.hud.refresh',                     'Refresh HUD (TODO M2)'],
+    ['claudeCodeLauncher.conversation.focus',              'Show Team Conversation (TODO M2)'],
+    ['claudeCodeLauncher.conversation.openLatest',         'Open Latest Team Conversation (TODO M2)'],
+    ['claudeCodeLauncher.history.focus',                   'Show Team Session History (TODO M2)'],
+    ['claudeCodeLauncher.history.refresh',                 'Refresh History (TODO M2)'],
+    ['claudeCodeLauncher.ccg.focus',                       'Show CCG (TODO M2)'],
+    ['claudeCodeLauncher.ccg.refresh',                     'Refresh CCG (TODO M2)'],
+    ['claudeCodeLauncher.ccg.openPair',                    'Open CCG Pair (TODO M2)'],
+    ['claudeCodeLauncher.ccg.rerun',                       'Rerun CCG (TODO M2)'],
+    ['claudeCodeLauncher.system.registerGateway',          'Register OpenClaw Gateway (TODO M2)'],
+    ['claudeCodeLauncher.system.copyGatewayUrl',           'Copy Gateway URL (TODO M2)'],
+    ['claudeCodeLauncher.system.rotateGatewayToken',       'Rotate Gateway Token (TODO M2)'],
+    ['claudeCodeLauncher.system.openGatewayConfig',        'Open Gateway Config (TODO M2)'],
+    ['claudeCodeLauncher.system.installWorkerPermissions', 'Install Worker Permissions (TODO M2)'],
+    ['claudeCodeLauncher.system.installGeminiAutoApprove', 'Install Gemini Auto-Approve (TODO M2)'],
+  ];
+  for (const [id, msg] of orchPlaceholderCmds) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(id, () => vscode.window.showInformationMessage(msg))
+    );
+  }
+
+  // ─── Orchestration layer (Podium) — conditional load ───
+  // M0: placeholder via out/orchestration/index.js (tsc output of src/orchestration/index.ts).
+  // M2: actual SessionDetector / OMCRuntime / HookReceiver integration.
+  try {
+    const orchModule = require('../out/orchestration/index.js');
+    state.orch = orchModule.activate(context);
+    context.subscriptions.push({
+      dispose: () => {
+        try { state.orch?.dispose(); } catch (_) { /* ignore */ }
+      }
+    });
+  } catch (e) {
+    console.warn('[orchestration] not available:', e?.message || e);
+  }
+
   // Restore previous sessions (MUST be last — tree + commands must be ready first)
   restoreSessions(s => createPanel(context, extensionPath, s));
 }
