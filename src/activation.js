@@ -303,10 +303,7 @@ function activate(context) {
     ['claudeCodeLauncher.session.filter',                  'Filter Sessions (TODO M2)'],
     ['claudeCodeLauncher.session.clearFilter',             'Clear Session Filter (TODO M2)'],
     ['claudeCodeLauncher.session.openDir',                 'Open Session Directory (TODO M2)'],
-    ['claudeCodeLauncher.team.create',                     'New Team (TODO M2)'],
-    ['claudeCodeLauncher.team.createIntegrated',           'New Team Integrated (TODO M2)'],
-    ['claudeCodeLauncher.team.quickCreate',                'Quick Create Team (TODO M2)'],
-    ['claudeCodeLauncher.team.attach',                     'Attach Team (TODO M2)'],
+    // team.create/createIntegrated/quickCreate/attach는 M2.B.3에서 orch API로 위임
     ['claudeCodeLauncher.team.missions.focus',             'Show Missions (TODO M2)'],
     ['claudeCodeLauncher.team.missions.refresh',           'Refresh Missions (TODO M2)'],
     ['claudeCodeLauncher.podium.grid',                     'Show Multi-pane (TODO M2)'],
@@ -368,14 +365,32 @@ function activate(context) {
     console.warn('[orchestration] not available:', e?.message || e);
   }
 
-  // ─── Podium Mode commands wired to orchestration API (M1) ───
+  // ─── Orchestration API commands (M1 + M2.B.3) ───
+  const warnNoOrch = () =>
+    vscode.window.showWarningMessage('Orchestration layer not loaded.');
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.podium.enter', async () => {
       if (state.orch) await state.orch.enterPodiumMode();
-      else vscode.window.showWarningMessage('Orchestration layer not loaded.');
+      else warnNoOrch();
     }),
     vscode.commands.registerCommand('claudeCodeLauncher.podium.exit', async () => {
       if (state.orch) await state.orch.exitPodiumMode();
+    }),
+    vscode.commands.registerCommand('claudeCodeLauncher.team.create', async () => {
+      if (state.orch) await state.orch.createTeam();
+      else warnNoOrch();
+    }),
+    vscode.commands.registerCommand('claudeCodeLauncher.team.createIntegrated', async () => {
+      if (state.orch) await state.orch.createTeam();
+      else warnNoOrch();
+    }),
+    vscode.commands.registerCommand('claudeCodeLauncher.team.quickCreate', async () => {
+      if (state.orch) await state.orch.createTeam();
+      else warnNoOrch();
+    }),
+    vscode.commands.registerCommand('claudeCodeLauncher.team.attach', async () => {
+      if (state.orch) await state.orch.attachTeam();
+      else warnNoOrch();
     })
   );
 
