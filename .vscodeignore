@@ -1,11 +1,74 @@
+# ────────────────────────────────────────────────────────────────
+# .vscodeignore — runtime-only payload for VSIX
+#
+# Kept (runtime):
+#   extension.js (entry)
+#   out/orchestration/**/*.js (tsc + esbuild outputs, no maps)
+#   node_modules/<runtime deps>/ (binary / bundles only)
+#   package.json, package.nls*, icons/icon-128.png
+#   README.md, CHANGELOG.md, LICENSE
+#
+# Excluded:
+#   source (.ts), scripts, build tooling, sourcemaps, repo metadata,
+#   node_modules docs/tests
+# ────────────────────────────────────────────────────────────────
+
+# --- Git / VCS ---
 .git/**
 .gitignore
-icons/icon-128.svg
+.gitattributes
+**/.gitkeep
+
+# --- Source (launcher + orchestration TypeScript) ---
+src/**
+scripts/**
+
+# --- Build configuration / tooling ---
+tsconfig.json
+esbuild.webview.config.mjs
+esbuild.config.mjs
+
+# --- Local runtime state / editor config ---
+.omc/**
+.vscode/**
+.github/**
+
+# --- Shell helpers (dev-only) ---
+install.sh
+build.sh
+
+# --- Documentation: keep only README + CHANGELOG ---
 *.md
 !README.md
 !CHANGELOG.md
-install.sh
 260322 INSTALL.md
-**/.gitkeep
+
+# --- Icons: PNG is used at runtime, SVG source excluded ---
+icons/icon-128.svg
+
+# --- VSIX outputs (do not embed previous VSIX) ---
 *.vsix
-build.sh
+
+# --- Source maps (runtime does not need them) ---
+**/*.map
+
+# --- Windows debug symbols (~55 MB in node-pty prebuilds) ---
+**/*.pdb
+
+# --- Trim node_modules metadata / tests / docs ---
+node_modules/**/*.md
+node_modules/**/*.ts
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/__tests__/**
+node_modules/**/.github/**
+node_modules/**/examples/**
+node_modules/**/docs/**
+node_modules/**/doc/**
+node_modules/**/CHANGELOG*
+node_modules/**/HISTORY*
+node_modules/**/CONTRIBUTING*
+node_modules/**/Makefile
+node_modules/**/binding.gyp
+node_modules/**/tsconfig*.json
+node_modules/**/*.d.ts.map
