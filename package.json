@@ -170,9 +170,19 @@
           "when": "claudeCodeLauncher.podiumModeActive"
         },
         {
-          "id": "claudeCodeLauncher.context",
-          "name": "HUD · Conversation · Multi-pane",
-          "when": "claudeCodeLauncher.teamSelected"
+          "id": "claudeCodeLauncher.hudPanel",
+          "name": "HUD",
+          "when": "claudeCodeLauncher.podiumModeActive"
+        },
+        {
+          "id": "claudeCodeLauncher.missionsPanel",
+          "name": "Missions",
+          "when": "claudeCodeLauncher.podiumModeActive"
+        },
+        {
+          "id": "claudeCodeLauncher.historyPanel",
+          "name": "Session History",
+          "when": "claudeCodeLauncher.podiumModeActive"
         }
       ]
     },
