@@ -19,8 +19,12 @@
 .gitattributes
 **/.gitkeep
 
-# --- Source (launcher + orchestration TypeScript) ---
-src/**
+# --- Source ---
+# NOTE: launcher JS (src/*.js, src/panel/, src/pty/, etc.) is REQUIRED AT RUNTIME
+# — extension.js does `require('./src/activation')`. Only TypeScript source
+# (src/orchestration/**/*.ts) is excluded since it is pre-compiled to out/.
+src/**/*.ts
+src/**/*.ts.map
 scripts/**
 
 # --- Build configuration / tooling ---
