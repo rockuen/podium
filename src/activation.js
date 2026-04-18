@@ -313,13 +313,31 @@ function activate(context) {
     vscode.commands.executeCommand('setContext', ck, false);
   }
 
-  // ─── Orchestration status bar entry point (M1) ───
+  // ─── Orchestration status bar entry point (M1, toggle wrapper in M3) ───
+  state.podiumModeActive = false;
   state.orchStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
   state.orchStatusBar.text = '$(organization) Orchestration';
   state.orchStatusBar.tooltip = 'Claude: Enter Podium Mode';
-  state.orchStatusBar.command = 'claudeCodeLauncher.podium.enter';
+  state.orchStatusBar.command = 'claudeCodeLauncher.podium.toggle';
   state.orchStatusBar.show();
   context.subscriptions.push(state.orchStatusBar);
+
+  // Toggle wrapper — flips between enter/exit + syncs status bar visual
+  context.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.toggle', async () => {
+      if (state.podiumModeActive) {
+        await vscode.commands.executeCommand('claudeCodeLauncher.podium.exit');
+        state.podiumModeActive = false;
+        state.orchStatusBar.text = '$(organization) Orchestration';
+        state.orchStatusBar.tooltip = 'Claude: Enter Podium Mode';
+      } else {
+        await vscode.commands.executeCommand('claudeCodeLauncher.podium.enter');
+        state.podiumModeActive = true;
+        state.orchStatusBar.text = '$(organization) Podium Mode';
+        state.orchStatusBar.tooltip = 'Claude: Exit Podium Mode';
+      }
+    })
+  );
 
   // ─── Orchestration layer (Podium) — conditional load ───
   // M2.F: orchestration/index.ts activate() is async and registers all

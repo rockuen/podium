@@ -131,6 +131,7 @@
       { "command": "claudeCodeLauncher.team.missions.refresh",           "title": "Refresh Missions",                "icon": "$(refresh)",            "category": "Claude" },
       { "command": "claudeCodeLauncher.podium.enter",                    "title": "Enter Podium Mode",                                                 "category": "Claude" },
       { "command": "claudeCodeLauncher.podium.exit",                     "title": "Exit Podium Mode",                                                  "category": "Claude" },
+      { "command": "claudeCodeLauncher.podium.toggle",                   "title": "Toggle Podium Mode",                                                "category": "Claude" },
       { "command": "claudeCodeLauncher.podium.grid",                     "title": "Show Multi-pane",                 "icon": "$(layout)",             "category": "Claude" },
       { "command": "claudeCodeLauncher.podium.dashboard",                "title": "Show Team Dashboard",             "icon": "$(dashboard)",          "category": "Claude" },
       { "command": "claudeCodeLauncher.hud.focus",                       "title": "Show HUD",                                                          "category": "Claude" },
