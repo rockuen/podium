@@ -352,6 +352,64 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         multiplexerBinary: binaryFor(backend),
       });
     }),
+    vscode.commands.registerCommand('claudeCodeLauncher.team.kill', async (item: unknown) => {
+      if (!(item instanceof SessionNode)) {
+        vscode.window.showWarningMessage(
+          'Claude: right-click a session in the Teams view to kill it.',
+        );
+        return;
+      }
+      const name = item.detected.session.name;
+      const answer = await vscode.window.showWarningMessage(
+        `Kill session "${name}"? This will also call "omc team shutdown" to release OMC state.`,
+        { modal: true },
+        'Kill',
+      );
+      if (answer !== 'Kill') return;
+
+      const teamName = name.replace(/^omc-team-/, '');
+      const canonical = teamName.replace(/-[a-z0-9]{8}$/, '');
+      const targets = canonical !== teamName ? [teamName, canonical] : [teamName];
+      output.appendLine(
+        `[orch.kill] shutdown candidates: ${targets.map((t) => `"${t}"`).join(', ')}`,
+      );
+      let anyOk = false;
+      for (const target of targets) {
+        const r = await runtime.shutdownOmcTeam(target, currentCwd());
+        const stdoutTail = (r.stdout ?? '').trim().slice(-200);
+        const stderrTail = stripDeprecationWarnings(r.stderr ?? '').trim().slice(-200);
+        if (r.ok) {
+          anyOk = true;
+          output.appendLine(
+            `[orch.kill] "${target}" -> ok${stdoutTail ? ` · ${stdoutTail}` : ''}`,
+          );
+        } else {
+          output.appendLine(
+            `[orch.kill] "${target}" -> non-fatal (exit=${r.exitCode ?? '?'})${r.errMessage ? ` err=${r.errMessage.slice(0, 160)}` : ''}${stdoutTail ? ` stdout=${stdoutTail}` : ''}${stderrTail ? ` stderr=${stderrTail}` : ''}`,
+          );
+        }
+      }
+      const omcOk = anyOk;
+      try {
+        await detector.killSession(name);
+        vscode.window.showInformationMessage(
+          omcOk
+            ? `Claude: killed session ${name} (omc team shutdown + backend kill)`
+            : `Claude: killed session ${name} (backend kill; omc shutdown skipped)`,
+        );
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (omcOk && /no server|not found|can't find session/i.test(msg)) {
+          vscode.window.showInformationMessage(
+            `Claude: killed session ${name} (already cleaned up by omc)`,
+          );
+        } else {
+          output.appendLine(`[orch.kill] backend kill failed: ${msg}`);
+          vscode.window.showErrorMessage(`Claude: failed to kill ${name} — ${msg}`);
+        }
+      }
+      teamsProvider.refresh();
+    }),
     vscode.commands.registerCommand('claudeCodeLauncher.team.missions.focus', async () => {
       await vscode.commands.executeCommand('workbench.view.extension.claude-code-launcher');
       await vscode.commands.executeCommand('claudeCodeLauncher.missionsPanel.focus');
@@ -658,7 +716,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       ['podium.openClaudeTerminal',         'claudeCodeLauncher.open'],
       ['podium.attachSession',              'claudeCodeLauncher.resumeSession'],
       ['podium.refresh',                    'claudeCodeLauncher.refreshSessions'],
-      ['podium.killSession',                'claudeCodeLauncher.trashSession'],
+      ['podium.killSession',                'claudeCodeLauncher.team.kill'],
       ['podium.searchSessions',             'claudeCodeLauncher.session.filter'],
       ['podium.clearSessionFilter',         'claudeCodeLauncher.session.clearFilter'],
       ['podium.openSessionDir',             'claudeCodeLauncher.session.openDir'],
@@ -753,6 +811,13 @@ function currentCwd(): string {
   const folders = vscode.workspace.workspaceFolders;
   if (folders && folders.length > 0) return folders[0].uri.fsPath;
   return process.cwd();
+}
+
+function stripDeprecationWarnings(text: string): string {
+  return text
+    .split(/\r?\n/)
+    .filter((line) => !/DeprecationWarning|trace-deprecation/i.test(line))
+    .join('\n');
 }
 
 async function promptTeamSpec(): Promise<TeamSpec | undefined> {
