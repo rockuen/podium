@@ -63,7 +63,7 @@ export class SpawnTeamPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'webview')],
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'orchestration', 'webview')],
       },
     );
     const instance = new SpawnTeamPanel(panel, context, runtime, manager, output, health);
@@ -314,7 +314,7 @@ export class SpawnTeamPanel {
 
   private buildHtml(): string {
     const scriptUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'webview', 'spawn-team.js'),
+      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'orchestration', 'webview', 'spawn-team.js'),
     );
     const nonce = makeNonce();
     const csp = [

@@ -87,7 +87,7 @@ export class TeamConversationPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'webview')],
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'orchestration', 'webview')],
       },
     );
     const watcher = new TeamConversationWatcher((msg) => output.appendLine(msg));
@@ -121,7 +121,7 @@ export class TeamConversationPanel {
 
   private buildHtml(): string {
     const scriptUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'webview', 'team-conversation.js'),
+      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'orchestration', 'webview', 'team-conversation.js'),
     );
     const nonce = makeNonce();
     const csp = [

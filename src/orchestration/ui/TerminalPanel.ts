@@ -124,7 +124,7 @@ function createPanel(context: vscode.ExtensionContext, title: string): vscode.We
     {
       enableScripts: true,
       retainContextWhenHidden: true,
-      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'webview')],
+      localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'orchestration', 'webview')],
     },
   );
 }
@@ -189,7 +189,7 @@ function wirePanel(
 
 function buildHtml(panel: vscode.WebviewPanel, context: vscode.ExtensionContext): string {
   const scriptUri = panel.webview.asWebviewUri(
-    vscode.Uri.joinPath(context.extensionUri, 'out', 'webview', 'terminal.js'),
+    vscode.Uri.joinPath(context.extensionUri, 'out', 'orchestration', 'webview', 'terminal.js'),
   );
   const nonce = makeNonce();
   const csp = [

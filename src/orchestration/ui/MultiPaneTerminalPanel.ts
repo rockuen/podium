@@ -74,7 +74,7 @@ export class MultiPaneTerminalPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'webview')],
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'orchestration', 'webview')],
       },
     );
     const instance = new MultiPaneTerminalPanel(
@@ -244,7 +244,7 @@ export class MultiPaneTerminalPanel {
 
   private buildHtml(): string {
     const scriptUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'webview', 'multipane.js'),
+      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'orchestration', 'webview', 'multipane.js'),
     );
     const nonce = makeNonce();
     const csp = [

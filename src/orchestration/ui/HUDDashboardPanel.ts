@@ -57,7 +57,7 @@ export class HUDDashboardPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'webview')],
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'orchestration', 'webview')],
       },
     );
     const instance = new HUDDashboardPanel(panel, context, output);
@@ -115,7 +115,7 @@ export class HUDDashboardPanel {
 
   private buildHtml(): string {
     const scriptUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'webview', 'hud-dashboard.js'),
+      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'orchestration', 'webview', 'hud-dashboard.js'),
     );
     const nonce = makeNonce();
     const csp = [
