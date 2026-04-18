@@ -183,6 +183,11 @@
           "id": "claudeCodeLauncher.historyPanel",
           "name": "Session History",
           "when": "claudeCodeLauncher.podiumModeActive"
+        },
+        {
+          "id": "claudeCodeLauncher.ccgPanel",
+          "name": "CCG",
+          "when": "claudeCodeLauncher.podiumModeActive"
         }
       ]
     },

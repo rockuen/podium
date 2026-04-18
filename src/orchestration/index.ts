@@ -53,10 +53,15 @@ import { MissionsTreeProvider } from './ui/MissionsTreeProvider';
 import { SessionHistoryProvider } from './ui/SessionHistoryProvider';
 import { TeamConversationPanel } from './ui/TeamConversationPanel';
 
+import { CcgArtifactWatcher } from './core/CcgArtifactWatcher';
+import { CcgTreeProvider } from './ui/CcgTreeProvider';
+import { CcgViewerPanel } from './ui/CcgViewerPanel';
+
 import type { MissionSnapshot } from './core/MissionWatcher';
 import type { SessionHistorySnapshot } from './types/history';
 import type { HUDStdinCache } from './types/hud';
 import type { OMCOpenClawPayload } from './types/events';
+import type { CcgPair, CcgSnapshot } from './types/ccg';
 
 export interface OrchestrationAPI {
   dispose(): void;
@@ -144,6 +149,33 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   });
   ctx.subscriptions.push({ dispose: () => historyWatcher.stop() });
   historyWatcher.start(initialRoot);
+
+  // ─── CCG (Claude-Codex-Gemini) ───
+  const ccgProvider = new CcgTreeProvider();
+  const ccgView = vscode.window.createTreeView('claudeCodeLauncher.ccgPanel', {
+    treeDataProvider: ccgProvider,
+  });
+  ctx.subscriptions.push(ccgView);
+  const ccgWatcher = new CcgArtifactWatcher((msg) => output.appendLine(msg));
+  ccgWatcher.on('snapshot', (snap: CcgSnapshot) => {
+    ccgProvider.update(snap);
+    CcgViewerPanel.refreshIfOpen();
+    HUDDashboardPanel.broadcast({ ccg: snap });
+  });
+  ctx.subscriptions.push({ dispose: () => ccgWatcher.stop() });
+  ccgWatcher.start(initialRoot);
+
+  const ccgDeps = {
+    getPair: (id: string): CcgPair | null => ccgProvider.findPair(id),
+    onRerun: async (pair: CcgPair) => {
+      const promptText = pair.codex?.originalTask ?? pair.gemini?.originalTask ?? pair.title;
+      const text = promptText.replace(/\s+/g, ' ').trim().slice(0, 600);
+      await vscode.env.clipboard.writeText(`/ccg "${text}"`);
+      vscode.window.showInformationMessage(
+        'Claude: /ccg command copied. Paste it into a Claude Code terminal to re-run.',
+      );
+    },
+  };
 
   // ─── Hook Receiver (OpenClaw gateway) ───
   const tokenStore = new TokenStore(ctx.secrets);
@@ -360,11 +392,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     }),
     vscode.commands.registerCommand('claudeCodeLauncher.podium.dashboard', () => {
       output.appendLine('[orch] podium.dashboard invoked');
-      // ccg: null — Claude-Codex-Gemini watcher deferred to M3
       HUDDashboardPanel.show(ctx, output, {
         hud: stateWatcher.snapshot(),
         history: historyWatcher.snapshot(),
-        ccg: null,
+        ccg: ccgWatcher.snapshot(),
       });
     }),
   );
@@ -444,6 +475,43 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     }),
     vscode.commands.registerCommand('claudeCodeLauncher.history.refresh', () => {
       historyWatcher.forceRefresh();
+    }),
+  );
+
+  // ─── CCG commands ───
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.ccg.focus', async () => {
+      await vscode.commands.executeCommand('workbench.view.extension.claude-code-launcher');
+      await vscode.commands.executeCommand('claudeCodeLauncher.ccgPanel.focus');
+      const snap = ccgProvider.getSnapshot();
+      if (snap && snap.pairs.length > 0) {
+        CcgViewerPanel.show(ctx, ccgDeps, output, snap.pairs[0].id);
+      }
+    }),
+    vscode.commands.registerCommand('claudeCodeLauncher.ccg.refresh', () => {
+      ccgWatcher.forceRefresh();
+    }),
+    vscode.commands.registerCommand('claudeCodeLauncher.ccg.openPair', (id: unknown) => {
+      if (typeof id !== 'string') return;
+      CcgViewerPanel.show(ctx, ccgDeps, output, id);
+    }),
+    vscode.commands.registerCommand('claudeCodeLauncher.ccg.rerun', async () => {
+      const snap = ccgProvider.getSnapshot();
+      if (!snap || snap.pairs.length === 0) {
+        vscode.window.showInformationMessage('Claude: no CCG sessions to re-run yet.');
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        snap.pairs.map((p) => ({
+          label: p.title,
+          description: new Date(p.createdAt).toLocaleString(),
+          id: p.id,
+        })),
+        { placeHolder: 'Pick a CCG session to re-run' },
+      );
+      if (!picked) return;
+      const pair = ccgProvider.findPair(picked.id);
+      if (pair) await ccgDeps.onRerun(pair);
     }),
   );
 
@@ -578,6 +646,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       stateWatcher.start(next);
       missionWatcher.start(next);
       historyWatcher.start(next);
+      ccgWatcher.start(next);
       providerHealth.setCwd(next);
     }),
   );
@@ -606,6 +675,10 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       ['podium.openLatestTeamConversation', 'claudeCodeLauncher.conversation.openLatest'],
       ['podium.showHistory',                'claudeCodeLauncher.history.focus'],
       ['podium.refreshHistory',             'claudeCodeLauncher.history.refresh'],
+      ['podium.showCcg',                    'claudeCodeLauncher.ccg.focus'],
+      ['podium.refreshCcg',                 'claudeCodeLauncher.ccg.refresh'],
+      ['podium.openCcgPair',                'claudeCodeLauncher.ccg.openPair'],
+      ['podium.rerunCcg',                   'claudeCodeLauncher.ccg.rerun'],
       ['podium.registerOpenclawGateway',    'claudeCodeLauncher.system.registerGateway'],
       ['podium.copyHookReceiverUrl',        'claudeCodeLauncher.system.copyGatewayUrl'],
       ['podium.rotateHookReceiverToken',    'claudeCodeLauncher.system.rotateGatewayToken'],

@@ -298,22 +298,9 @@ function activate(context) {
     })
   );
 
-  // ─── Orchestration placeholder commands (CCG only — deferred to M3) ───
-  // All other orchestration commands are registered inside orchestration/index.ts
-  // after M2.F. CCG (Claude-Codex-Gemini diff) imports are deliberately NOT
-  // ported yet; placeholders prevent "Command not found" errors when users
-  // click the entries that still appear in the command palette.
-  const orchPlaceholderCmds = [
-    ['claudeCodeLauncher.ccg.focus',    'Show CCG (deferred to M3)'],
-    ['claudeCodeLauncher.ccg.refresh',  'Refresh CCG (deferred to M3)'],
-    ['claudeCodeLauncher.ccg.openPair', 'Open CCG Pair (deferred to M3)'],
-    ['claudeCodeLauncher.ccg.rerun',    'Rerun CCG (deferred to M3)'],
-  ];
-  for (const [id, msg] of orchPlaceholderCmds) {
-    context.subscriptions.push(
-      vscode.commands.registerCommand(id, () => vscode.window.showInformationMessage(msg))
-    );
-  }
+  // ─── Orchestration placeholder commands ───
+  // M3.A: All orchestration commands (including CCG) are registered inside
+  // orchestration/index.ts. No placeholders remain in activation.js.
 
   // ─── Context keys for conditional views (M1) ───
   for (const ck of [
