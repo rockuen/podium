@@ -27,6 +27,7 @@ const entries = [
   ['src/orchestration/webview/spawn-team-main.ts',         'out/orchestration/webview/spawn-team.js'],
   ['src/orchestration/webview/multipane-main.ts',          'out/orchestration/webview/multipane.js'],
   ['src/orchestration/webview/terminal-main.ts',           'out/orchestration/webview/terminal.js'],
+  ['src/orchestration/webview/ccg-viewer-main.ts',         'out/orchestration/webview/ccg-viewer.js'],
 ];
 
 const configs = entries

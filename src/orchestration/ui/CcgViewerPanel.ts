@@ -98,7 +98,7 @@ export class CcgViewerPanel {
       {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'webview')],
+        localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'orchestration', 'webview')],
       },
     );
     const instance = new CcgViewerPanel(panel, context, deps, output, pairId);
@@ -127,7 +127,7 @@ export class CcgViewerPanel {
 
   private buildHtml(): string {
     const scriptUri = this.panel.webview.asWebviewUri(
-      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'webview', 'ccg-viewer.js'),
+      vscode.Uri.joinPath(this.context.extensionUri, 'out', 'orchestration', 'webview', 'ccg-viewer.js'),
     );
     const nonce = makeNonce();
     const csp = [
