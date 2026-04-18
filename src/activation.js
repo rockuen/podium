@@ -309,8 +309,6 @@ function activate(context) {
     ['claudeCodeLauncher.team.attach',                     'Attach Team (TODO M2)'],
     ['claudeCodeLauncher.team.missions.focus',             'Show Missions (TODO M2)'],
     ['claudeCodeLauncher.team.missions.refresh',           'Refresh Missions (TODO M2)'],
-    ['claudeCodeLauncher.podium.enter',                    'Enter Podium Mode (TODO M2)'],
-    ['claudeCodeLauncher.podium.exit',                     'Exit Podium Mode (TODO M2)'],
     ['claudeCodeLauncher.podium.grid',                     'Show Multi-pane (TODO M2)'],
     ['claudeCodeLauncher.podium.dashboard',                'Show Team Dashboard (TODO M2)'],
     ['claudeCodeLauncher.hud.focus',                       'Show HUD (TODO M2)'],
@@ -336,6 +334,25 @@ function activate(context) {
     );
   }
 
+  // ─── Context keys for conditional views (M1) ───
+  for (const ck of [
+    'claudeCodeLauncher.podiumModeActive',
+    'claudeCodeLauncher.teamSelected',
+    'claudeCodeLauncher.hasAnyTeam',
+    'claudeCodeLauncher.gatewayRegistered',
+    'claudeCodeLauncher.providerHealthy'
+  ]) {
+    vscode.commands.executeCommand('setContext', ck, false);
+  }
+
+  // ─── Orchestration status bar entry point (M1) ───
+  state.orchStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
+  state.orchStatusBar.text = '$(organization) Orchestration';
+  state.orchStatusBar.tooltip = 'Claude: Enter Podium Mode';
+  state.orchStatusBar.command = 'claudeCodeLauncher.podium.enter';
+  state.orchStatusBar.show();
+  context.subscriptions.push(state.orchStatusBar);
+
   // ─── Orchestration layer (Podium) — conditional load ───
   // M0: placeholder via out/orchestration/index.js (tsc output of src/orchestration/index.ts).
   // M2: actual SessionDetector / OMCRuntime / HookReceiver integration.
@@ -350,6 +367,17 @@ function activate(context) {
   } catch (e) {
     console.warn('[orchestration] not available:', e?.message || e);
   }
+
+  // ─── Podium Mode commands wired to orchestration API (M1) ───
+  context.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.enter', async () => {
+      if (state.orch) await state.orch.enterPodiumMode();
+      else vscode.window.showWarningMessage('Orchestration layer not loaded.');
+    }),
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.exit', async () => {
+      if (state.orch) await state.orch.exitPodiumMode();
+    })
+  );
 
   // Restore previous sessions (MUST be last — tree + commands must be ready first)
   restoreSessions(s => createPanel(context, extensionPath, s));

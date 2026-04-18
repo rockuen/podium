@@ -34,13 +34,24 @@ class NoopOrchestration implements OrchestrationAPI {
   }
 
   async enterPodiumMode(): Promise<void> {
+    this._active = true;
+    await vscode.commands.executeCommand(
+      "setContext",
+      "claudeCodeLauncher.podiumModeActive",
+      true
+    );
     vscode.window.showInformationMessage(
-      "Podium Mode (TODO M2): orchestration core not yet implemented"
+      "Podium Mode activated (orchestration core: M2에서 실제 구현)"
     );
   }
 
   async exitPodiumMode(): Promise<void> {
     this._active = false;
+    await vscode.commands.executeCommand(
+      "setContext",
+      "claudeCodeLauncher.podiumModeActive",
+      false
+    );
   }
 
   async createTeam(): Promise<void> {

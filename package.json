@@ -383,14 +383,18 @@
     "xterm-addon-web-links": "^0.9.0"
   },
   "scripts": {
+    "vscode:prepublish": "npm run build",
     "build": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "package": "vsce package",
-    "probe:pty": "node scripts/probe/pty-smoke.js"
+    "probe:pty": "node scripts/probe/pty-smoke.js",
+    "clean": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\"",
+    "lint": "tsc -p ./ --noEmit"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
     "typescript": "^5.4.0",
     "esbuild": "^0.21.0"
   }
