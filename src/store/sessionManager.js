@@ -9,14 +9,19 @@ function saveSessions() {
   let order = 0;
   for (const [, entry] of state.panels) {
     if (entry.pty) {
-      sessions.push({
+      const item = {
         title: entry.title,
         memo: entry.memo || '',
         cwd: entry.cwd,
         sessionId: entry.sessionId,
         order: order++,
         viewColumn: entry.panel.viewColumn || 1
-      });
+      };
+      // v2.6.12: preserve Podium-ready flag + tmux session name so reload
+      // window restarts the session in its wrapping tmux instead of a raw PTY.
+      if (entry.podiumReady) item.podiumReady = true;
+      if (entry.tmuxSession) item.tmuxSession = entry.tmuxSession;
+      sessions.push(item);
     }
   }
   sessionStoreUpdate('claudeSessions', sessions);
@@ -31,6 +36,19 @@ function saveSessions() {
     }
   }
   sessionStoreUpdate('claudeSessionTitles', titleMap);
+
+  // v2.6.12: durable Podium-ready map (sessionId → tmuxSession). Unlike
+  // `claudeSessions` which is cleared on restore, this persists across reloads
+  // so the tree provider can badge Podium-ready sessions even after Claude
+  // CLI has been closed/restarted.
+  const podiumMap = sessionStoreGet('claudePodiumReadySessions', {});
+  for (const [, entry] of state.panels) {
+    if (entry.sessionId && entry.podiumReady && entry.tmuxSession) {
+      podiumMap[entry.sessionId] = { tmuxSession: entry.tmuxSession };
+    }
+  }
+  sessionStoreUpdate('claudePodiumReadySessions', podiumMap);
+
   if (state.sessionTreeProvider) state.sessionTreeProvider.refresh();
 }
 

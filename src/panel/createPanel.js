@@ -19,6 +19,7 @@ const { saveSessions } = require('../store/sessionManager');
 const { resolveClaudeCli } = require('../pty/resolveCli');
 const { killPtyProcess } = require('../pty/kill');
 const { createContextParser } = require('../pty/contextParser');
+const { buildTmuxSpawnArgs } = require('../pty/tmuxWrap');
 const { getWebviewContent } = require('./webviewContent');
 const { showDesktopNotification } = require('../handlers/desktopNotification');
 const { setTabIcon, setStatusBar, updateStatusBar } = require('./statusIndicator');
@@ -131,18 +132,41 @@ function createPanel(context, extensionPath, session) {
     return;
   }
 
-  const shell = resolved.shell;
+  const claudeShell = resolved.shell;
   const claudeArgs = session?.sessionId
     ? ['--resume', session.sessionId]
     : ['--session-id', sessionId];
-  const args = [...resolved.args, ...claudeArgs];
+  const directArgs = [...resolved.args, ...claudeArgs];
 
-  console.log('[Claude Launcher] Spawning:', shell, args.join(' '), '| cwd:', cwd);
-  console.log('[Claude Launcher] resolved shell:', shell, '| args prefix:', resolved.args);
+  // v2.6.12: Podium-ready sessions wrap Claude in a tmux session so an
+  // `omc team …` can later use this pane as leader. When false (default),
+  // behavior is unchanged — direct node-pty spawn of Claude CLI.
+  const podiumReady = !!session?.podiumReady;
+  let spawnShell = claudeShell;
+  let spawnArgs = directArgs;
+  let tmuxSessionName = null;
+  if (podiumReady) {
+    const cols = 120;
+    const rows = 30;
+    const wrap = buildTmuxSpawnArgs({ sessionId, cols, rows, claudeShell, claudeArgs: directArgs });
+    if (wrap) {
+      spawnShell = wrap.shell;
+      spawnArgs = wrap.args;
+      tmuxSessionName = wrap.tmuxName;
+      console.log('[Claude Launcher] Podium-ready spawn via', wrap.muxBin, '| tmux:', tmuxSessionName);
+    } else {
+      vscode.window.showWarningMessage(
+        'Podium-ready session requested but tmux/psmux not found on PATH. Falling back to direct spawn (not team-capable).'
+      );
+    }
+  }
+
+  console.log('[Claude Launcher] Spawning:', spawnShell, spawnArgs.join(' '), '| cwd:', cwd);
+  console.log('[Claude Launcher] resolved shell:', spawnShell, '| podiumReady:', podiumReady);
 
   let ptyProcess;
   try {
-    ptyProcess = pty.spawn(shell, args, {
+    ptyProcess = pty.spawn(spawnShell, spawnArgs, {
       name: 'xterm-256color',
       cols: 120,
       rows: 30,
@@ -179,7 +203,11 @@ function createPanel(context, extensionPath, session) {
     cwd: cwd,
     sessionId: sessionId,
     state: 'running',
-    idleTimer: null
+    idleTimer: null,
+    // v2.6.12: Podium-ready metadata. podiumReady gates tmux wrapping; tmuxSession
+    // is the actual multiplexer session name used for leader injection.
+    podiumReady: podiumReady && !!tmuxSessionName,
+    tmuxSession: tmuxSessionName
   };
   state.panels.set(tabId, entry);
   saveSessions();

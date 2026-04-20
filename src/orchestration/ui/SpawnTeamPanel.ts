@@ -6,13 +6,50 @@ import { OMCRuntime, TeamSpec, TeamSlot, AgentModel, summarizeSlots, normalizeSl
 import { ensurePsmuxTmuxConf, isPsmuxServerRunning } from '../core/PsmuxSetup';
 import { checkGeminiAutoApprove } from '../core/GeminiAutoApprove';
 import { PodiumManager } from '../core/PodiumManager';
+import { autoDisplayName, writeTeamDisplay } from '../core/TeamDisplayStore';
 import { TerminalPanel } from './TerminalPanel';
 import { HEX } from './colors';
 import { buildSharedWebviewCss } from './webviewTheme';
+import { execFile } from 'child_process';
 import type { ProviderHealthChecker } from '../core/ProviderHealthChecker';
 import type { ProviderHealth } from '../types/provider';
 
+interface LauncherPodiumSession {
+  sessionId: string;
+  title: string;
+  tmuxSession: string;
+  cwd?: string;
+}
+
+// Bridge to the launcher's CommonJS store without creating a TypeScript
+// circular dep. The compiled out/ structure keeps the launcher's src/store/
+// adjacent; at runtime the orchestration code runs in the same extension host.
+function listLauncherPodiumSessions(cwd: string): LauncherPodiumSession[] {
+  try {
+    // Relative to out/orchestration/ui/SpawnTeamPanel.js → up two, then
+    // src/store/sessionStore.js. We ship src/ alongside out/ in the VSIX so
+    // this require resolves in both dev and packaged modes.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const store = require('../../../src/store/sessionStore');
+    if (typeof store.listPodiumReadySessionsForCwd === 'function') {
+      const list = store.listPodiumReadySessionsForCwd(cwd) as LauncherPodiumSession[];
+      return Array.isArray(list) ? list : [];
+    }
+  } catch {
+    /* launcher store not reachable — return empty list */
+  }
+  return [];
+}
+
 const VALID_MODELS: AgentModel[] = ['claude', 'codex', 'gemini'];
+const RECENT_PROJECTS_KEY = 'claudeCodeLauncher.recentProjects';
+const RECENT_PROJECTS_MAX = 8;
+
+interface ProjectEntry {
+  path: string;
+  label: string;
+  source: 'workspace' | 'recent' | 'cwd';
+}
 
 export class SpawnTeamPanel {
   static readonly viewType = 'podium.spawnTeam';
@@ -77,7 +114,14 @@ export class SpawnTeamPanel {
 
   private async onMessage(msg: unknown): Promise<void> {
     if (!msg || typeof msg !== 'object') return;
-    const m = msg as { type?: string; slots?: unknown; prompt?: unknown; mode?: unknown };
+    const m = msg as {
+      type?: string;
+      slots?: unknown;
+      prompt?: unknown;
+      mode?: unknown;
+      cwd?: unknown;
+      leaderSource?: unknown;
+    };
 
     if (m.type === 'cancel') {
       this.panel.dispose();
@@ -87,6 +131,32 @@ export class SpawnTeamPanel {
     if (m.type === 'refresh-health') {
       this.output.appendLine('[podium.spawn] health refresh requested');
       void this.health.forceRefresh();
+      return;
+    }
+
+    if (m.type === 'list-leader-sources') {
+      const requestedCwd = typeof m.cwd === 'string' ? m.cwd.trim() : '';
+      const resolvedCwd = resolveCwd(requestedCwd);
+      this.postLeaderSources(resolvedCwd);
+      return;
+    }
+
+    if (m.type === 'browse-project') {
+      const picked = await vscode.window.showOpenDialog({
+        canSelectFiles: false,
+        canSelectFolders: true,
+        canSelectMany: false,
+        openLabel: 'Select project folder',
+      });
+      if (picked && picked.length > 0) {
+        const folder = picked[0].fsPath;
+        this.output.appendLine(`[podium.spawn] browse picked: ${folder}`);
+        this.persistRecentProject(folder);
+        this.panel.webview.postMessage({
+          type: 'project-added',
+          project: { path: folder, label: path.basename(folder) || folder, source: 'recent' },
+        });
+      }
       return;
     }
 
@@ -109,6 +179,14 @@ export class SpawnTeamPanel {
     const slots = normalizeSlots(parsedSlots);
     const prompt = String(m.prompt ?? '').trim();
     const mode = m.mode === 'in-session' ? 'in-session' : 'shell';
+    // v2.6.12: leaderSource selects where the omc-team leader runs.
+    // "new-terminal" (default) keeps the pre-existing behaviour (opens a
+    // vscode.window.createTerminal). A sessionId string routes the omc team
+    // command INTO the launcher's Podium-ready tmux session via send-keys.
+    const rawLeaderSource = typeof m.leaderSource === 'string' ? m.leaderSource : 'new-terminal';
+    const leaderSource = rawLeaderSource && rawLeaderSource !== 'new-terminal'
+      ? rawLeaderSource
+      : 'new-terminal';
 
     if (slots.length === 0) {
       this.postStatus('error', 'pick at least one model slot');
@@ -125,7 +203,11 @@ export class SpawnTeamPanel {
     }
 
     const spec: TeamSpec = { slots, prompt };
-    const cwd = currentCwd();
+    const requestedCwd = typeof m.cwd === 'string' ? m.cwd.trim() : '';
+    const cwd = resolveCwd(requestedCwd);
+    if (requestedCwd && requestedCwd !== cwd) {
+      this.output.appendLine(`[podium.spawn] cwd fallback: requested="${requestedCwd}" resolved="${cwd}"`);
+    }
     const dispatchDelayMs = vscode.workspace
       .getConfiguration('podium')
       .get<number>('teamDispatchDelayMs', 1500);
@@ -156,11 +238,17 @@ export class SpawnTeamPanel {
     );
 
     try {
-      if (mode === 'shell') {
+      if (mode === 'shell' && leaderSource !== 'new-terminal') {
+        // Route omc-team command into an existing Podium-ready launcher
+        // session via tmux/psmux send-keys. Leader ends up as the Claude
+        // process the user already has running.
+        await this.dispatchViaTmuxSession(spec, cwd, leaderSource);
+      } else if (mode === 'shell') {
         await this.dispatchShell(spec, cwd);
       } else {
         await this.dispatchInSession(spec, cwd, dispatchDelayMs);
       }
+      this.persistRecentProject(cwd);
       this.postStatus('success', `team dispatched · ${summarizeSlots(spec.slots)}`);
       // Auto-open Conversation Panel for shell-mode spawns. 3 workers + long
       // prompts can take 10–20s to produce state dir — retry a handful of
@@ -203,6 +291,85 @@ export class SpawnTeamPanel {
     this.output.appendLine('[podium.spawn] in-session terminal opened');
   }
 
+  private postLeaderSources(cwd: string): void {
+    const sessions = listLauncherPodiumSessions(cwd);
+    this.panel.webview.postMessage({
+      type: 'leader-sources',
+      cwd,
+      sessions: sessions.map((s) => ({
+        sessionId: s.sessionId,
+        title: s.title,
+        tmuxSession: s.tmuxSession,
+      })),
+    });
+  }
+
+  /**
+   * Dispatch `omc team …` into an existing launcher Podium-ready tmux session.
+   * The command runs inside that session's leader pane, so OMC detects
+   * `$TMUX` and splits worker panes alongside — no brand-new terminal is
+   * created. Resulting config.json will have tmux_session matching the
+   * launcher's `podium-leader-<sid8>` name.
+   *
+   * When `--new-window` is preferred (e.g. to keep the leader's conversation
+   * visually separate from workers), that is NOT used here: we want the user's
+   * Claude pane to be the leader, so the default split-pane layout is correct.
+   */
+  private async dispatchViaTmuxSession(spec: TeamSpec, cwd: string, sessionId: string): Promise<void> {
+    const sessions = listLauncherPodiumSessions(cwd);
+    const target = sessions.find((s) => s.sessionId === sessionId);
+    if (!target) {
+      throw new Error(
+        `Podium-ready session ${sessionId.slice(0, 8)}… not found in this cwd. Is it still running?`,
+      );
+    }
+
+    const muxBin = process.platform === 'win32' ? 'psmux' : 'tmux';
+    const slugSeed = buildSafeTeamSeed();
+    const seededPrompt = `${slugSeed}. ${spec.prompt}`;
+
+    // Write display sidecar — same behaviour as dispatchShell.
+    try {
+      const displayName = autoDisplayName(spec.prompt);
+      writeTeamDisplay(cwd, slugSeed, {
+        displayName,
+        initialPrompt: spec.prompt,
+        createdAt: Date.now(),
+      });
+      this.output.appendLine(
+        `[podium.spawn] display sidecar written: "${displayName}" → ${slugSeed}`,
+      );
+    } catch (err) {
+      this.output.appendLine(
+        `[podium.spawn] display sidecar write failed (non-fatal): ${err instanceof Error ? err.message : err}`,
+      );
+    }
+
+    // Build the shell string. tmux send-keys passes the whole string as-is,
+    // so we escape double-quotes in the prompt. Using printf to preserve
+    // newlines and avoid subshell expansion oddities.
+    const escapedPrompt = seededPrompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const slotStr = normalizeSlots(spec.slots).map((s) => `${s.count}:${s.model}`).join(',');
+    const cmdString = `omc team ${slotStr} "${escapedPrompt}"`;
+
+    this.output.appendLine(
+      `[podium.spawn] leader=current-session tmux=${target.tmuxSession} cmd="${cmdString.slice(0, 120)}…"`,
+    );
+    this.postStatus(
+      'running',
+      `injecting omc team into ${target.title} (${target.tmuxSession})…`,
+    );
+
+    // 1) send-keys the command string (no Enter yet) so readline parses it
+    // 2) send-keys Enter to submit. Separate calls avoid quoting pitfalls
+    // when the prompt itself contains backticks / special chars.
+    const target1 = `${target.tmuxSession}:0`;
+    await runMuxCmd(muxBin, ['send-keys', '-t', target1, cmdString]);
+    await runMuxCmd(muxBin, ['send-keys', '-t', target1, 'Enter']);
+
+    this.output.appendLine('[podium.spawn] leader inject ok (send-keys Enter delivered)');
+  }
+
   private async dispatchShell(spec: TeamSpec, cwd: string): Promise<void> {
     // Prepend a deterministic 48-char ASCII seed to the prompt. OMC slugifies
     // the first N chars of the task description to build the team name, which
@@ -215,6 +382,25 @@ export class SpawnTeamPanel {
     // of what the user's prompt contains.
     const slugSeed = buildSafeTeamSeed();
     const seededPrompt = `${slugSeed}. ${spec.prompt}`;
+
+    // Write the display-name sidecar so the Team Conversation panel can show a
+    // human-friendly tab title + inline the original prompt as the first
+    // message. Best-effort — any failure is logged but doesn't block spawn.
+    try {
+      const displayName = autoDisplayName(spec.prompt);
+      writeTeamDisplay(cwd, slugSeed, {
+        displayName,
+        initialPrompt: spec.prompt,
+        createdAt: Date.now(),
+      });
+      this.output.appendLine(
+        `[podium.spawn] display sidecar written: "${displayName}" → ${slugSeed}`,
+      );
+    } catch (err) {
+      this.output.appendLine(
+        `[podium.spawn] display sidecar write failed (non-fatal): ${err instanceof Error ? err.message : err}`,
+      );
+    }
 
     // Route the prompt through a temp file rather than inline-escaping it on
     // the command line. Solves:
@@ -312,6 +498,38 @@ export class SpawnTeamPanel {
     this.panel.webview.postMessage({ type: 'status', level, text });
   }
 
+  private listProjects(): ProjectEntry[] {
+    const entries: ProjectEntry[] = [];
+    const seen = new Set<string>();
+    const add = (p: string, source: ProjectEntry['source']) => {
+      if (!p) return;
+      const key = path.resolve(p);
+      if (seen.has(key)) return;
+      seen.add(key);
+      entries.push({ path: key, label: path.basename(key) || key, source });
+    };
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    for (const f of folders) add(f.uri.fsPath, 'workspace');
+    const recent = this.context.globalState.get<string[]>(RECENT_PROJECTS_KEY, []);
+    for (const r of recent) {
+      try {
+        if (fs.existsSync(r) && fs.statSync(r).isDirectory()) add(r, 'recent');
+      } catch {
+        /* skip unreadable path */
+      }
+    }
+    if (entries.length === 0) add(process.cwd(), 'cwd');
+    return entries;
+  }
+
+  private persistRecentProject(folder: string): void {
+    if (!folder) return;
+    const normalized = path.resolve(folder);
+    const prev = this.context.globalState.get<string[]>(RECENT_PROJECTS_KEY, []);
+    const next = [normalized, ...prev.filter((p) => path.resolve(p) !== normalized)].slice(0, RECENT_PROJECTS_MAX);
+    void this.context.globalState.update(RECENT_PROJECTS_KEY, next);
+  }
+
   private buildHtml(): string {
     const scriptUri = this.panel.webview.asWebviewUri(
       vscode.Uri.joinPath(this.context.extensionUri, 'out', 'orchestration', 'webview', 'spawn-team.js'),
@@ -322,6 +540,16 @@ export class SpawnTeamPanel {
       `style-src ${this.panel.webview.cspSource} 'unsafe-inline'`,
       `script-src 'nonce-${nonce}'`,
     ].join('; ');
+
+    const projects = this.listProjects();
+    const projectOptions = projects
+      .map((p, i) => {
+        const badge = p.source === 'workspace' ? ' [workspace]' : p.source === 'recent' ? ' [recent]' : '';
+        const labelEsc = escapeHtml(`${p.label}${badge} — ${p.path}`);
+        const valueEsc = escapeHtml(p.path);
+        return `<option value="${valueEsc}"${i === 0 ? ' selected' : ''}>${labelEsc}</option>`;
+      })
+      .join('');
 
     return `<!DOCTYPE html>
 <html lang="en">
@@ -397,6 +625,13 @@ ${buildSharedWebviewCss()}
   .mode-toggle .mbtn:not(.active) .badge { background: var(--bg-card); color: var(--text-disabled); }
   .mode-hint { font-size: 10px; color: var(--text-disabled); margin-top: 4px; }
 
+  .project-row { display: flex; align-items: center; gap: 8px; }
+  .project-row select { flex: 1 1 auto; min-width: 0; height: 34px; background: var(--bg-input); color: var(--text-primary); border: 1px solid var(--border); border-radius: 4px; padding: 0 10px; font-size: 12px; font-family: Consolas, "Cascadia Code", monospace; }
+  .project-row select:focus { outline: none; border-color: var(--accent-omc); }
+  .project-row .browse-btn { flex: 0 0 auto; height: 34px; padding: 0 14px; border-radius: 4px; background: var(--bg-input); border: 1px solid var(--border); color: var(--text-primary); cursor: pointer; font-size: 11px; font-weight: 600; user-select: none; }
+  .project-row .browse-btn:hover { border-color: var(--border-focus); background: var(--bg-card); }
+  .project-hint { font-size: 10px; color: var(--text-disabled); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
   .prompt-box { background: var(--bg-input); border: 1px solid var(--border); border-radius: 4px; padding: 0; }
   .prompt-box:focus-within { border-color: var(--accent-omc); }
   .prompt-box textarea { width: 100%; min-height: 120px; resize: vertical; background: transparent; border: none; padding: 10px 12px; color: var(--text-primary); font-family: Consolas, "Cascadia Code", monospace; font-size: 12px; line-height: 1.5; outline: none; }
@@ -448,6 +683,25 @@ ${buildSharedWebviewCss()}
           <div class="mbtn" data-mode="in-session"><span>In-session</span><span class="badge">/team</span></div>
         </div>
         <div class="mode-hint" id="mode-hint">Shell: opens a terminal and runs <code>omc team …</code> → tmux session + Sessions tree.</div>
+      </div>
+
+      <div class="field">
+        <label>Project <span class="hint">· cwd for every team pane</span></label>
+        <div class="project-row">
+          <select id="project-select">${projectOptions}</select>
+          <button type="button" class="browse-btn" id="browse-project">Browse…</button>
+        </div>
+        <div class="project-hint" id="project-hint"></div>
+      </div>
+
+      <div class="field" id="leader-source-field">
+        <label>Leader <span class="hint">· where the orchestrator Claude runs</span></label>
+        <div class="project-row">
+          <select id="leader-source-select">
+            <option value="new-terminal" selected>New terminal (default)</option>
+          </select>
+        </div>
+        <div class="project-hint" id="leader-source-hint">Uses a fresh VSCode terminal for the leader. Pick a Podium-ready session to host the leader in your current Claude pane.</div>
       </div>
 
       <div class="field">
@@ -528,9 +782,46 @@ function currentCwd(): string {
   return process.cwd();
 }
 
+function resolveCwd(preferred: string): string {
+  if (preferred) {
+    try {
+      if (fs.existsSync(preferred) && fs.statSync(preferred).isDirectory()) return path.resolve(preferred);
+    } catch {
+      /* fall through to default */
+    }
+  }
+  return currentCwd();
+}
+
 function makeNonce(): string {
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
   let out = '';
   for (let i = 0; i < 32; i++) out += chars[Math.floor(Math.random() * chars.length)];
   return out;
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/**
+ * Run a tmux/psmux command with argv-level escaping (no shell). Errors reject
+ * the promise so callers can surface them; stdout is returned for diagnostics.
+ */
+function runMuxCmd(bin: string, args: string[]): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execFile(bin, args, { timeout: 8000, windowsHide: true }, (err, stdout, stderr) => {
+      if (err) {
+        const msg = stderr?.trim() || err.message;
+        reject(new Error(`${bin} ${args.slice(0, 3).join(' ')}… failed: ${msg}`));
+        return;
+      }
+      resolve({ stdout: String(stdout ?? ''), stderr: String(stderr ?? '') });
+    });
+  });
 }

@@ -2,7 +2,7 @@
   "name": "cli-launcher-for-claude",
   "displayName": "CLI Launcher for Claude",
   "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
-  "version": "2.6.6",
+  "version": "2.6.19",
   "publisher": "rockuen",
   "license": "MIT",
   "repository": {
@@ -29,6 +29,12 @@
           "light": "./icons/claude-robot.svg",
           "dark": "./icons/claude-robot.svg"
         },
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.createPodiumSession",
+        "title": "New Podium-ready Session",
+        "icon": "$(organization)",
         "category": "Claude"
       },
       {
@@ -119,37 +125,179 @@
         "icon": "$(arrow-down)",
         "category": "Claude"
       },
-      { "command": "claudeCodeLauncher.session.filter",                  "title": "Filter Sessions",                 "icon": "$(filter)",             "category": "Claude" },
-      { "command": "claudeCodeLauncher.session.clearFilter",             "title": "Clear Session Filter",                                              "category": "Claude" },
-      { "command": "claudeCodeLauncher.session.openDir",                 "title": "Open Session Directory",          "icon": "$(folder-opened)",      "category": "Claude" },
-      { "command": "claudeCodeLauncher.team.create",                     "title": "New Team",                        "icon": "$(add)",                "category": "Claude" },
-      { "command": "claudeCodeLauncher.team.createIntegrated",           "title": "New Team (Integrated Terminal)",                                    "category": "Claude" },
-      { "command": "claudeCodeLauncher.team.quickCreate",                "title": "Quick Create Team",                                                 "category": "Claude" },
-      { "command": "claudeCodeLauncher.team.attach",                     "title": "Attach Team",                     "icon": "$(link)",               "category": "Claude" },
-      { "command": "claudeCodeLauncher.team.kill",                       "title": "Kill Team",                       "icon": "$(trash)",              "category": "Claude" },
-      { "command": "claudeCodeLauncher.team.missions.focus",             "title": "Show Missions",                                                     "category": "Claude" },
-      { "command": "claudeCodeLauncher.team.missions.refresh",           "title": "Refresh Missions",                "icon": "$(refresh)",            "category": "Claude" },
-      { "command": "claudeCodeLauncher.podium.enter",                    "title": "Enter Podium Mode",                                                 "category": "Claude" },
-      { "command": "claudeCodeLauncher.podium.exit",                     "title": "Exit Podium Mode",                                                  "category": "Claude" },
-      { "command": "claudeCodeLauncher.podium.toggle",                   "title": "Toggle Podium Mode",                                                "category": "Claude" },
-      { "command": "claudeCodeLauncher.podium.grid",                     "title": "Show Multi-pane",                 "icon": "$(layout)",             "category": "Claude" },
-      { "command": "claudeCodeLauncher.podium.dashboard",                "title": "Show Team Dashboard",             "icon": "$(dashboard)",          "category": "Claude" },
-      { "command": "claudeCodeLauncher.hud.focus",                       "title": "Show HUD",                                                          "category": "Claude" },
-      { "command": "claudeCodeLauncher.hud.refresh",                     "title": "Refresh HUD",                     "icon": "$(refresh)",            "category": "Claude" },
-      { "command": "claudeCodeLauncher.conversation.focus",              "title": "Show Team Conversation",          "icon": "$(comment-discussion)", "category": "Claude" },
-      { "command": "claudeCodeLauncher.conversation.openLatest",         "title": "Open Latest Team Conversation",                                     "category": "Claude" },
-      { "command": "claudeCodeLauncher.history.focus",                   "title": "Show Team Session History",                                         "category": "Claude" },
-      { "command": "claudeCodeLauncher.history.refresh",                 "title": "Refresh History",                 "icon": "$(refresh)",            "category": "Claude" },
-      { "command": "claudeCodeLauncher.ccg.focus",                       "title": "Show CCG",                                                          "category": "Claude" },
-      { "command": "claudeCodeLauncher.ccg.refresh",                     "title": "Refresh CCG",                     "icon": "$(refresh)",            "category": "Claude" },
-      { "command": "claudeCodeLauncher.ccg.openPair",                    "title": "Open CCG Pair",                                                     "category": "Claude" },
-      { "command": "claudeCodeLauncher.ccg.rerun",                       "title": "Rerun CCG",                                                         "category": "Claude" },
-      { "command": "claudeCodeLauncher.system.registerGateway",          "title": "Register OpenClaw Gateway",                                         "category": "Claude" },
-      { "command": "claudeCodeLauncher.system.copyGatewayUrl",           "title": "Copy Gateway URL",                                                  "category": "Claude" },
-      { "command": "claudeCodeLauncher.system.rotateGatewayToken",       "title": "Rotate Gateway Token",                                              "category": "Claude" },
-      { "command": "claudeCodeLauncher.system.openGatewayConfig",        "title": "Open Gateway Config",                                               "category": "Claude" },
-      { "command": "claudeCodeLauncher.system.installWorkerPermissions", "title": "Install Worker Permissions",                                        "category": "Claude" },
-      { "command": "claudeCodeLauncher.system.installGeminiAutoApprove", "title": "Install Gemini Auto-Approve",                                       "category": "Claude" }
+      {
+        "command": "claudeCodeLauncher.session.filter",
+        "title": "Filter Sessions",
+        "icon": "$(filter)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.session.clearFilter",
+        "title": "Clear Session Filter",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.session.openDir",
+        "title": "Open Session Directory",
+        "icon": "$(folder-opened)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.team.create",
+        "title": "New Team",
+        "icon": "$(add)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.team.createIntegrated",
+        "title": "New Team (Integrated Terminal)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.team.quickCreate",
+        "title": "Quick Create Team",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.team.attach",
+        "title": "Attach Team",
+        "icon": "$(link)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.team.kill",
+        "title": "Kill Team",
+        "icon": "$(trash)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.team.rename",
+        "title": "Rename Team Display Name",
+        "icon": "$(edit)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.team.missions.focus",
+        "title": "Show Missions",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.team.missions.refresh",
+        "title": "Refresh Missions",
+        "icon": "$(refresh)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.enter",
+        "title": "Enter Podium Mode",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.exit",
+        "title": "Exit Podium Mode",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.toggle",
+        "title": "Toggle Podium Mode",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.grid",
+        "title": "Show Multi-pane",
+        "icon": "$(layout)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.dashboard",
+        "title": "Show Team Dashboard",
+        "icon": "$(dashboard)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.hud.focus",
+        "title": "Show HUD",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.hud.refresh",
+        "title": "Refresh HUD",
+        "icon": "$(refresh)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.conversation.focus",
+        "title": "Show Team Conversation",
+        "icon": "$(comment-discussion)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.conversation.openLatest",
+        "title": "Open Latest Team Conversation",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.history.focus",
+        "title": "Show Team Session History",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.history.refresh",
+        "title": "Refresh History",
+        "icon": "$(refresh)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.ccg.focus",
+        "title": "Show CCG",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.ccg.refresh",
+        "title": "Refresh CCG",
+        "icon": "$(refresh)",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.ccg.openPair",
+        "title": "Open CCG Pair",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.ccg.rerun",
+        "title": "Rerun CCG",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.system.registerGateway",
+        "title": "Register OpenClaw Gateway",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.system.copyGatewayUrl",
+        "title": "Copy Gateway URL",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.system.rotateGatewayToken",
+        "title": "Rotate Gateway Token",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.system.openGatewayConfig",
+        "title": "Open Gateway Config",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.system.installWorkerPermissions",
+        "title": "Install Worker Permissions",
+        "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.system.installGeminiAutoApprove",
+        "title": "Install Gemini Auto-Approve",
+        "category": "Claude"
+      }
     ],
     "viewsContainers": {
       "activitybar": [
@@ -288,6 +436,11 @@
           "group": "inline@4"
         },
         {
+          "command": "claudeCodeLauncher.team.rename",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == omcSession",
+          "group": "1_order@3"
+        },
+        {
           "command": "claudeCodeLauncher.session.openDir",
           "when": "view == claudeCodeLauncher.historyPanel && (viewItem == historyEntry || viewItem == historyEntryActive)",
           "group": "inline@1"
@@ -300,8 +453,13 @@
           "when": "view == claudeCodeLauncher.sessionList"
         },
         {
-          "command": "claudeCodeLauncher.refreshSessions",
+          "command": "claudeCodeLauncher.createPodiumSession",
           "group": "navigation@2",
+          "when": "view == claudeCodeLauncher.sessionList"
+        },
+        {
+          "command": "claudeCodeLauncher.refreshSessions",
+          "group": "navigation@3",
           "when": "view == claudeCodeLauncher.sessionList"
         },
         {
@@ -347,7 +505,15 @@
         "claudeCodeLauncher.defaultTheme": {
           "type": "string",
           "default": "default",
-          "enum": ["default", "midnight", "ocean", "forest", "sunset", "aurora", "warm"],
+          "enum": [
+            "default",
+            "midnight",
+            "ocean",
+            "forest",
+            "sunset",
+            "aurora",
+            "warm"
+          ],
           "enumDescriptions": [
             "IDE default theme",
             "Midnight — deep purple (#1c1740)",
@@ -403,10 +569,19 @@
           "items": {
             "type": "object",
             "properties": {
-              "cmd": { "type": "string", "description": "Slash command (e.g. /wrap-up)" },
-              "desc": { "type": "string", "description": "Description shown in dropdown" }
+              "cmd": {
+                "type": "string",
+                "description": "Slash command (e.g. /wrap-up)"
+              },
+              "desc": {
+                "type": "string",
+                "description": "Description shown in dropdown"
+              }
             },
-            "required": ["cmd", "desc"]
+            "required": [
+              "cmd",
+              "desc"
+            ]
           },
           "description": "Custom slash commands for the autocomplete dropdown. Shareable as JSON."
         },
@@ -416,10 +591,19 @@
           "items": {
             "type": "object",
             "properties": {
-              "label": { "type": "string", "description": "Button label" },
-              "command": { "type": "string", "description": "Slash command to execute (e.g. /wrap-up)" }
+              "label": {
+                "type": "string",
+                "description": "Button label"
+              },
+              "command": {
+                "type": "string",
+                "description": "Slash command to execute (e.g. /wrap-up)"
+              }
             },
-            "required": ["label", "command"]
+            "required": [
+              "label",
+              "command"
+            ]
           },
           "description": "Custom buttons in the input panel. Each button has a label and a slash command."
         },
@@ -455,7 +639,11 @@
         "claudeCodeLauncher.orchestration.backend": {
           "type": "string",
           "default": "auto",
-          "enum": ["auto", "tmux", "psmux"],
+          "enum": [
+            "auto",
+            "tmux",
+            "psmux"
+          ],
           "description": "Multiplexer backend for orchestration (auto: psmux on win32, tmux elsewhere)."
         },
         "claudeCodeLauncher.orchestration.sessionFilter": {

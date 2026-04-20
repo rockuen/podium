@@ -63,6 +63,15 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       <button class="search-btn" id="search-close" title="${T.searchCloseTip}">&#x2715;</button>
     </div>
     <div id="terminal"></div>
+    <div id="copy-mode-overlay">
+      <div class="copy-mode-bar">
+        <span class="copy-mode-label" id="copy-mode-label">${T.copyModeHint}</span>
+        <button id="copy-mode-copy-selection" title="${T.copySelection || T.ctxCopy}">${T.copySelection || T.ctxCopy}</button>
+        <button id="copy-mode-copy-all" title="${T.copyAll}">${T.copyAll}</button>
+        <button id="copy-mode-exit" title="${T.copyModeExit}">${T.copyModeExit}</button>
+      </div>
+      <pre id="copy-mode-content" class="copy-mode-content"></pre>
+    </div>
     <div id="restart-bar">
       <span id="restart-msg">${T.processExited}</span>
       <button id="restart-btn">&#x25B6; ${T.restartBtn}</button>
@@ -205,6 +214,8 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       <div class="ctx-item" data-action="search">${T.ctxSearch}<span class="shortcut">Ctrl+F</span></div>
       <div class="ctx-item" data-action="clear">${T.ctxClear}<span class="shortcut">/clear</span></div>
       <div class="ctx-item" data-action="export">${T.ctxExport}<span class="shortcut">&#x1F4BE;</span></div>
+      <div class="ctx-item" data-action="copy-all">${T.copyAll}<span class="shortcut">&#x1F4CB;</span></div>
+      <div class="ctx-item" data-action="copy-mode">${T.copyMode}<span class="shortcut">&#x2702;</span></div>
       <div class="ctx-sep"></div>
       <div class="ctx-item" data-action="zoom-in">${T.ctxZoomIn}<span class="shortcut">Ctrl+=</span></div>
       <div class="ctx-item" data-action="zoom-out">${T.ctxZoomOut}<span class="shortcut">Ctrl+-</span></div>

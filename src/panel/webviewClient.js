@@ -320,7 +320,9 @@ function getClientScript(ctx) {
     // auto-updates from output — so clicking was most often used when the
     // bar hit the danger zone (80%+) and the user wanted to compact anyway.
     ctxIndicator.addEventListener('click', () => {
-      vscode.postMessage({ type: 'input', data: '/compact' + String.fromCharCode(13) });
+      // v2.6.18: use auto-send so Podium-ready sessions route through send-keys
+      // (win32-input-mode fix). Extension appends Enter via tmux send-keys.
+      vscode.postMessage({ type: 'auto-send', text: '/compact' });
       showToast(T.ctxCompacting);
       term.focus();
     });
@@ -729,25 +731,71 @@ function getClientScript(ctx) {
     });
 
     function exportConversation() {
-      // v2.5.3: TUI apps (Claude CLI = Ink-based) emit cursor-move + partial
-      // writes that look like gibberish once you strip ANSI blindly (which
-      // v2.5.2 did). xterm.js already runs a full virtual-terminal state
-      // machine — let it do the work, then export the resulting text.
-      // term.getSelection() merges isWrapped logical lines correctly.
-      //
-      // v2.5.7: In alternate screen (fullscreen mode), selectAll only captures
-      // the current viewport — scroll history lives in the normal buffer which
-      // is not accessible. Warn the user so they know the export is partial.
-      if (isAlternateScreen) {
-        showToast(T.fsExportWarn);
+      // v2.6.9: extension side reads Claude Code's own JSONL transcript; the
+      // webview no longer needs to supply the full buffer. We still send the
+      // current xterm viewport as a last-resort fallback for non-Claude CLI
+      // sessions (no JSONL on disk).
+      let fallback = '';
+      try { fallback = getCleanSelectAll(); } catch (_) {}
+      vscode.postMessage({ type: 'export-conversation', text: fallback });
+      showToast(T.exportingToast);
+    }
+
+    // Collect the whole xterm viewport/scrollback as plain text. Fallback path
+    // when JSONL is missing — Ink fullscreen mode will still produce garbled
+    // output here, but it's better than nothing for non-Claude CLI panes.
+    function getCleanSelectAll() {
+      try {
+        term.selectAll();
+        const s = term.getSelection() || '';
+        term.clearSelection();
+        return s.split('\\n').map(l => l.replace(/\\s+$/, '')).join('\\n').replace(/\\n+$/, '');
+      } catch (_) { return ''; }
+    }
+
+    // ── Copy All / Copy Mode (v2.6.9 JSONL-backed) ──
+    // Extension owns clipboard writes so we don't depend on the webview's
+    // clipboard permissions. We ask for the content, extension reads JSONL,
+    // writes to vscode.env.clipboard, and toasts success/failure.
+    function copyAllConversation() {
+      let fallback = '';
+      try { fallback = getCleanSelectAll(); } catch (_) {}
+      vscode.postMessage({ type: 'copy-all-request', fallback: fallback });
+    }
+
+    function enterCopyMode() {
+      // Ask extension for the rendered transcript (MD form). Extension replies
+      // with { type: 'copy-mode-content', text, source, turns }.
+      let fallback = '';
+      try { fallback = getCleanSelectAll(); } catch (_) {}
+      vscode.postMessage({ type: 'copy-mode-request', fallback: fallback });
+    }
+
+    function showCopyModeOverlay(text, source, turns) {
+      const overlay = document.getElementById('copy-mode-overlay');
+      const pre = document.getElementById('copy-mode-content');
+      const label = document.getElementById('copy-mode-label');
+      if (!overlay || !pre) return;
+      pre.textContent = text || '';
+      if (label) {
+        if (source === 'jsonl') {
+          const loaded = T.copyModeLoadedJsonl || 'Loaded transcript';
+          label.textContent = loaded.replace('{0}', String(turns || 0)) +
+            ' · ' + (T.copyModeHint || '');
+        } else {
+          label.textContent = (T.copyModeNoTranscript || '') + ' · ' + (T.copyModeHint || '');
+        }
       }
-      term.selectAll();
-      const all = term.getSelection();
-      term.clearSelection();
-      let text = all.split('\\n').map(l => l.replace(/\\s+$/, '')).join('\\n');
-      text = text.replace(/\\n+$/, '');
-      vscode.postMessage({ type: 'export-conversation', text: text });
-      if (!isAlternateScreen) showToast(T.exportingToast);
+      overlay.style.display = 'flex';
+      // Scroll the <pre> to the bottom so the latest turn is visible first.
+      requestAnimationFrame(() => { try { pre.scrollTop = pre.scrollHeight; } catch (_) {} });
+    }
+
+    function exitCopyMode() {
+      const overlay = document.getElementById('copy-mode-overlay');
+      if (!overlay) return;
+      overlay.style.display = 'none';
+      try { term.focus(); } catch (_) {}
     }
 
     document.getElementById('btn-zoom-in').addEventListener('click', () => {
@@ -911,6 +959,15 @@ function getClientScript(ctx) {
       if (msg.type === 'export-result') {
         showToast(msg.success ? T.exportDone : T.exportFailToast);
       }
+      if (msg.type === 'copy-mode-content') {
+        showCopyModeOverlay(msg.text || '', msg.source || 'jsonl', msg.turns || 0);
+      }
+      if (msg.type === 'copy-all-result') {
+        showToast(msg.success ? T.copiedAll : T.copiedAllFail);
+      }
+      if (msg.type === 'copy-selection-result') {
+        showToast(msg.success ? (T.copiedSelection || T.copied) : T.copiedAllFail);
+      }
       if (msg.type === 'paste-file-ready') {
         if (msg.error) {
           showToast('\\u274C \\uD30C\\uC77C \\uC800\\uC7A5 \\uC2E4\\uD328');
@@ -1051,7 +1108,10 @@ function getClientScript(ctx) {
       if ((state === 'waiting' || state === 'needs-attention') && autoEffortMaxEnabled && !autoEffortMaxSent) {
         autoEffortMaxSent = true;
         setTimeout(() => {
-          vscode.postMessage({ type: 'input', data: '/effort max' + String.fromCharCode(13) });
+          // v2.6.18: programmatic send via auto-send. The extension routes this
+          // through psmux send-keys for Podium-ready sessions (win32-input-mode
+          // fix) and falls back to pty.write + CR for regular sessions.
+          vscode.postMessage({ type: 'auto-send', text: '/effort max' });
           showToast(T.autoEffortMaxToast);
         }, 800);
       }
@@ -1336,6 +1396,30 @@ function getClientScript(ctx) {
       }
     });
 
+    // Copy Mode overlay wiring (v2.6.9 JSONL-backed)
+    (function wireCopyModeOverlay() {
+      const exitBtn = document.getElementById('copy-mode-exit');
+      const copyAllBtn = document.getElementById('copy-mode-copy-all');
+      const copySelBtn = document.getElementById('copy-mode-copy-selection');
+      if (exitBtn) exitBtn.addEventListener('click', exitCopyMode);
+      if (copyAllBtn) copyAllBtn.addEventListener('click', copyAllConversation);
+      if (copySelBtn) copySelBtn.addEventListener('click', () => {
+        const sel = (document.getSelection && document.getSelection().toString()) || '';
+        if (!sel) { showToast(T.selectTextFirst); return; }
+        vscode.postMessage({ type: 'copy-selection-from-overlay', text: sel });
+      });
+      // Escape exits overlay (only when visible; let other Esc handlers run otherwise)
+      document.addEventListener('keydown', (e) => {
+        if (e.key !== 'Escape') return;
+        const overlay = document.getElementById('copy-mode-overlay');
+        if (overlay && overlay.style.display !== 'none' && overlay.style.display !== '') {
+          e.preventDefault();
+          e.stopPropagation();
+          exitCopyMode();
+        }
+      }, true);
+    })();
+
     ctxMenu.addEventListener('click', (e) => {
       const item = e.target.closest('.ctx-item');
       if (!item) return;
@@ -1379,6 +1463,12 @@ function getClientScript(ctx) {
           break;
         case 'export':
           exportConversation();
+          break;
+        case 'copy-all':
+          copyAllConversation();
+          break;
+        case 'copy-mode':
+          enterCopyMode();
           break;
         case 'edit-memo':
           memoEl.click();
@@ -1470,14 +1560,11 @@ function getClientScript(ctx) {
       const text = editorTextarea.value;
       if (!text.trim()) return;
       flashSend();
-      // Send each line followed by newline
-      const lines = text.split('\\n');
-      for (let i = 0; i < lines.length; i++) {
-        if (i > 0) vscode.postMessage({ type: 'input', data: '\\n' });
-        vscode.postMessage({ type: 'input', data: lines[i] });
-      }
-      // Send final Enter to submit
-      vscode.postMessage({ type: 'input', data: '\\r' });
+      // v2.6.18: single auto-send — extension appends Enter via send-keys on
+      // Podium-ready sessions so submit survives Claude CLI's win32-input-mode.
+      // Embedded newlines (Shift+Enter inside the editor) are preserved in the
+      // body; only the trailing submit is the responsibility of auto-send.
+      vscode.postMessage({ type: 'auto-send', text: text });
       // Add to input history
       if (text.trim().length > 0) {
         if (inputHistory.length === 0 || inputHistory[inputHistory.length - 1] !== text.trim()) {
@@ -1499,7 +1586,10 @@ function getClientScript(ctx) {
       btn.addEventListener('click', () => {
         const cmd = btn.getAttribute('data-cmd');
         if (cmd) {
-          vscode.postMessage({ type: 'input', data: cmd + String.fromCharCode(13) });
+          // v2.6.18: programmatic auto-send — Podium-ready sessions route
+          // through psmux send-keys so Enter is delivered as a proper submit
+          // under Claude CLI's win32-input-mode.
+          vscode.postMessage({ type: 'auto-send', text: cmd });
         }
         term.focus();
       });
@@ -1579,12 +1669,10 @@ function getClientScript(ctx) {
         return;
       }
       const text = taskQueue[index];
-      const lines = text.split('\\n');
-      for (let i = 0; i < lines.length; i++) {
-        if (i > 0) vscode.postMessage({ type: 'input', data: '\\n' });
-        vscode.postMessage({ type: 'input', data: lines[i] });
-      }
-      vscode.postMessage({ type: 'input', data: '\\r' });
+      // v2.6.18: programmatic auto-send so Podium-ready sessions submit via
+      // psmux send-keys (win32-input-mode fix). Embedded newlines survive; the
+      // trailing Enter is appended by the extension.
+      vscode.postMessage({ type: 'auto-send', text: text });
     }
 
     // Slash command menu

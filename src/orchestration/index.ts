@@ -352,6 +352,53 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         multiplexerBinary: binaryFor(backend),
       });
     }),
+    vscode.commands.registerCommand('claudeCodeLauncher.team.rename', async (item: unknown) => {
+      let teamName: string | undefined;
+      if (item instanceof SessionNode) {
+        const sessionName = item.detected.session.name;
+        const stripped = sessionName.replace(/^omc-team-/, '');
+        const canonical = stripped.replace(/-[a-z0-9]{8}$/, '');
+        const canonicalDir = path.join(currentCwd(), '.omc', 'state', 'team', canonical);
+        const suffixedDir = path.join(currentCwd(), '.omc', 'state', 'team', stripped);
+        teamName = canonical;
+        if (!fs.existsSync(canonicalDir) && fs.existsSync(suffixedDir)) teamName = stripped;
+      } else {
+        const teamsDir = path.join(currentCwd(), '.omc', 'state', 'team');
+        if (!fs.existsSync(teamsDir)) {
+          vscode.window.showInformationMessage('Podium: no team state dirs found.');
+          return;
+        }
+        const entries = fs
+          .readdirSync(teamsDir)
+          .map((name: string) => {
+            const full = path.join(teamsDir, name);
+            try {
+              const stat = fs.statSync(full);
+              return stat.isDirectory() ? { name, mtime: stat.mtimeMs } : null;
+            } catch {
+              return null;
+            }
+          })
+          .filter((e): e is { name: string; mtime: number } => e !== null)
+          .sort((a, b) => b.mtime - a.mtime);
+        if (entries.length === 0) {
+          vscode.window.showInformationMessage('Podium: no teams to rename.');
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          entries.map((e) => ({
+            label: e.name,
+            description: new Date(e.mtime).toLocaleString(),
+          })),
+          { placeHolder: 'Pick a team to rename' },
+        );
+        if (!picked) return;
+        teamName = picked.label;
+      }
+      if (!teamName) return;
+      await TeamConversationPanel.renameTeam(ctx, output, currentCwd(), teamName);
+      teamsProvider.refresh();
+    }),
     vscode.commands.registerCommand('claudeCodeLauncher.team.kill', async (item: unknown) => {
       if (!(item instanceof SessionNode)) {
         vscode.window.showWarningMessage(
@@ -717,6 +764,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       ['podium.attachSession',              'claudeCodeLauncher.resumeSession'],
       ['podium.refresh',                    'claudeCodeLauncher.refreshSessions'],
       ['podium.killSession',                'claudeCodeLauncher.team.kill'],
+      ['podium.team.rename',                'claudeCodeLauncher.team.rename'],
       ['podium.searchSessions',             'claudeCodeLauncher.session.filter'],
       ['podium.clearSessionFilter',         'claudeCodeLauncher.session.clearFilter'],
       ['podium.openSessionDir',             'claudeCodeLauncher.session.openDir'],

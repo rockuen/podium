@@ -22,6 +22,47 @@ function boot(): void {
   const closeBtn = document.getElementById('podium-close')!;
   const statusEl = document.getElementById('status')!;
   const spawnCountBadge = document.getElementById('spawn-count')!;
+  const projectSelect = document.getElementById('project-select') as HTMLSelectElement | null;
+  const browseBtn = document.getElementById('browse-project');
+  const projectHint = document.getElementById('project-hint');
+  const leaderSelect = document.getElementById('leader-source-select') as HTMLSelectElement | null;
+  const leaderHint = document.getElementById('leader-source-hint');
+
+  function updateProjectHint(): void {
+    if (!projectSelect || !projectHint) return;
+    projectHint.textContent = projectSelect.value || '';
+  }
+  function updateLeaderHint(): void {
+    if (!leaderSelect || !leaderHint) return;
+    const val = leaderSelect.value;
+    if (val === 'new-terminal') {
+      leaderHint.textContent = 'Uses a fresh VSCode terminal for the leader. Pick a Podium-ready session to host the leader in your current Claude pane.';
+    } else {
+      const opt = leaderSelect.options[leaderSelect.selectedIndex];
+      leaderHint.textContent = `Leader will run inside the selected launcher session (tmux: ${opt?.dataset.tmux ?? 'unknown'}).`;
+    }
+  }
+  function requestLeaderSources(): void {
+    vscode.postMessage({ type: 'list-leader-sources', cwd: projectSelect?.value ?? '' });
+  }
+  if (projectSelect) {
+    projectSelect.addEventListener('change', () => {
+      updateProjectHint();
+      requestLeaderSources();
+    });
+    updateProjectHint();
+  }
+  if (leaderSelect) {
+    leaderSelect.addEventListener('change', updateLeaderHint);
+    updateLeaderHint();
+  }
+  requestLeaderSources();
+  if (browseBtn) {
+    browseBtn.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      vscode.postMessage({ type: 'browse-project' });
+    });
+  }
 
   const slots: Record<AgentModel, SlotState> = {
     claude: { model: 'claude', count: 2, selected: true },
@@ -189,6 +230,8 @@ function boot(): void {
       mode,
       slots: active.map((s) => ({ model: s.model, count: s.count })),
       prompt,
+      cwd: projectSelect?.value ?? '',
+      leaderSource: leaderSelect?.value ?? 'new-terminal',
     });
   }
 
@@ -246,6 +289,47 @@ function boot(): void {
     }
     if (msg.type === 'health') {
       applyHealth(msg.health);
+      return;
+    }
+    if (msg.type === 'leader-sources' && leaderSelect) {
+      const sessions = Array.isArray(msg.sessions) ? msg.sessions : [];
+      const prev = leaderSelect.value;
+      // Keep the first "new-terminal" option, replace the rest.
+      leaderSelect.innerHTML = '<option value="new-terminal" selected>New terminal (default)</option>';
+      for (const s of sessions) {
+        const sess = s as { sessionId?: string; title?: string; tmuxSession?: string };
+        if (!sess.sessionId) continue;
+        const opt = document.createElement('option');
+        opt.value = sess.sessionId;
+        opt.textContent = `Current session: ${sess.title ?? sess.sessionId.slice(0, 8)}`;
+        if (sess.tmuxSession) opt.dataset.tmux = sess.tmuxSession;
+        leaderSelect.appendChild(opt);
+      }
+      // Try to restore previous selection; fall back to new-terminal.
+      if (prev && Array.from(leaderSelect.options).some((o) => o.value === prev)) {
+        leaderSelect.value = prev;
+      } else {
+        leaderSelect.value = 'new-terminal';
+      }
+      updateLeaderHint();
+      return;
+    }
+    if (msg.type === 'project-added' && msg.project && projectSelect) {
+      const p = msg.project as { path?: string; label?: string; source?: string };
+      if (!p.path) return;
+      const existing = Array.from(projectSelect.options).find((o) => o.value === p.path);
+      if (existing) {
+        projectSelect.value = existing.value;
+      } else {
+        const opt = document.createElement('option');
+        opt.value = p.path;
+        const badge = p.source === 'workspace' ? ' [workspace]' : p.source === 'recent' ? ' [recent]' : '';
+        opt.textContent = `${p.label ?? p.path}${badge} — ${p.path}`;
+        opt.selected = true;
+        projectSelect.appendChild(opt);
+        projectSelect.value = p.path;
+      }
+      updateProjectHint();
       return;
     }
   });

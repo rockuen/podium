@@ -1,5 +1,10 @@
 # Changelog
 
+## [2.6.19] - 2026-04-20
+
+### Fixed
+- **Mouse wheel scroll restored in Podium-ready sessions** — v2.6.15 set `set -g mouse off` in the leader tmux conf to work around a drag-selection auto-clear regression, but the side effect was that tmux dropped the SGR wheel reports emitted by xterm.js's wheel-forward path. The inner TUI (Claude CLI) never saw scroll events, making alt-screen scrollback unreachable in every Podium-ready pane. Restored `set -g mouse on` and mitigated the original regression by unbinding `MouseDrag1Pane` / `MouseDragEnd1Pane` in `root`, `copy-mode`, and `copy-mode-vi` tables — tmux no longer hijacks drag selections into copy-mode, so xterm.js's native text selection stays intact while wheel events pass through to the inner program. `~/.claude-launcher/tmux-leader.conf` is rewritten by `ensureLeaderConf()` on next extension activation; existing psmux sessions are unaffected until restarted, because tmux only loads the conf at `new-session`.
+
 ## [2.6.6] - 2026-04-17
 
 ### Added

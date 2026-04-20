@@ -145,3 +145,48 @@ export function statusHex(status: PodiumStatus | undefined): string {
       return HEX.statusIdle;
   }
 }
+
+// -----------------------------------------------------------------------------
+// Per-worker accent tinting
+// -----------------------------------------------------------------------------
+// Two workers with the same provider (e.g. claude-1 and claude-2) should be
+// visually distinguishable while staying close to the provider's base hue.
+// We compute an HSL shift keyed on the worker's 1-based index so same-provider
+// workers get a deterministic, reasonably-spaced set of accents.
+
+export type ConversationProvider = 'claude' | 'codex' | 'gemini' | 'leader' | 'unknown';
+
+// Base hues derived empirically from the HEX palette above. Keeping S/L fixed
+// gives the variants a uniform "feel" instead of veering into muddy territory.
+const PROVIDER_BASE_HSL: Record<ConversationProvider, { h: number; s: number; l: number }> = {
+  // #C084FC (purple)
+  claude: { h: 270, s: 95, l: 75 },
+  // #10B981 (emerald)
+  codex: { h: 160, s: 84, l: 39 },
+  // #60A5FA (blue)
+  gemini: { h: 217, s: 91, l: 68 },
+  // #FB923C (orange) — matches --podium-omc / --accent-leader
+  leader: { h: 24, s: 95, l: 61 },
+  // fall back to neutral gray tone
+  unknown: { h: 220, s: 9, l: 56 },
+};
+
+/**
+ * Return an HSL color string for a worker bubble accent.
+ *
+ * Provider drives the base hue; workerIndex drives a subtle hue shift so
+ * `claude-1` and `claude-2` read as distinct:
+ *   shift = (index - 1) * 12deg
+ * For a 4-worker team of the same provider this spans 0° → 36°, staying
+ * inside "same family" range. Saturation/lightness stay fixed per provider.
+ *
+ * `workerIndex <= 0` (leader / unknown / absent) → base color unchanged.
+ */
+export function workerAccentColor(provider: ConversationProvider, workerIndex: number): string {
+  const base = PROVIDER_BASE_HSL[provider] ?? PROVIDER_BASE_HSL.unknown;
+  const idx = Number.isFinite(workerIndex) && workerIndex > 0 ? Math.floor(workerIndex) : 0;
+  const shift = idx > 0 ? (idx - 1) * 12 : 0;
+  // Wrap into [0, 360)
+  const h = ((base.h + shift) % 360 + 360) % 360;
+  return `hsl(${h.toFixed(1)}, ${base.s}%, ${base.l}%)`;
+}

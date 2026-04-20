@@ -17,6 +17,7 @@ const { t } = require('../i18n');
 const { sessionStoreGet, sessionStoreUpdate } = require('../store/sessionStore');
 const { saveSessions } = require('../store/sessionManager');
 const { writePtyChunked } = require('../pty/write');
+const { autoSendToEntry } = require('../pty/autoSend');
 const { handleToolbar } = require('../handlers/toolbar');
 const { handlePasteImage, readClipboardImageFromSystem } = require('../handlers/pasteImage');
 const { handleDropFiles } = require('../handlers/dropFiles');
@@ -24,6 +25,13 @@ const { handleOpenFile } = require('../handlers/openFile');
 const { handleOpenFolder } = require('../handlers/openFolder');
 const { handleExportConversation } = require('../handlers/exportConversation');
 const { handlePasteLargeText } = require('../handlers/pasteLargeText');
+const {
+  getSessionJsonlPath,
+  readSessionTurns,
+  renderMarkdown,
+  renderPlainText,
+  countConversationTurns,
+} = require('../handlers/jsonlTranscript');
 const { restartPty } = require('./restartPty');
 
 function routeWebviewMessage(msg, ctx) {
@@ -36,6 +44,14 @@ function routeWebviewMessage(msg, ctx) {
 
     case 'input':
       if (entry.pty) writePtyChunked(entry, msg.data);
+      return;
+
+    // v2.6.18: programmatic slash-command / text submission. Unlike `input`,
+    // this path appends Enter via `tmux send-keys` in Podium-ready sessions so
+    // Claude CLI's win32-input-mode receives a proper submit instead of a
+    // literal newline. See src/pty/autoSend.js for the root-cause write-up.
+    case 'auto-send':
+      if (entry.pty) autoSendToEntry(entry, msg.text);
       return;
 
     case 'resize':
@@ -176,6 +192,98 @@ function routeWebviewMessage(msg, ctx) {
     case 'export-conversation':
       handleExportConversation(msg.text, entry, panel);
       return;
+
+    // v2.6.9: Copy-All reads Claude's JSONL and writes plain text to the
+    // system clipboard from the extension side. The webview supplies a
+    // viewport fallback for the rare case that JSONL is missing.
+    case 'copy-all-request': {
+      (async () => {
+        try {
+          const jsonlPath = getSessionJsonlPath(entry.cwd, entry.sessionId);
+          let textToCopy;
+          if (jsonlPath) {
+            const turns = readSessionTurns(jsonlPath);
+            textToCopy = renderPlainText(turns);
+          } else {
+            textToCopy = msg.fallback || '';
+          }
+          if (!textToCopy) {
+            panel.webview.postMessage({ type: 'copy-all-result', success: false });
+            vscode.window.showWarningMessage(t('copiedAllFail'));
+            return;
+          }
+          await vscode.env.clipboard.writeText(textToCopy);
+          panel.webview.postMessage({ type: 'copy-all-result', success: true, source: jsonlPath ? 'jsonl' : 'fallback' });
+          vscode.window.showInformationMessage(t('copiedAll'));
+        } catch (e) {
+          console.warn('[copy-all] failed:', e && e.message);
+          panel.webview.postMessage({ type: 'copy-all-result', success: false });
+          vscode.window.showErrorMessage(t('copiedAllFail') + ': ' + (e && e.message || ''));
+        }
+      })();
+      return;
+    }
+
+    // v2.6.9: Copy-Mode overlay requests the rendered Markdown transcript.
+    // If JSONL is missing, fall back to the viewport text the webview sent.
+    case 'copy-mode-request': {
+      try {
+        const jsonlPath = getSessionJsonlPath(entry.cwd, entry.sessionId);
+        if (jsonlPath) {
+          const turns = readSessionTurns(jsonlPath);
+          const md = renderMarkdown(turns, {
+            title: entry.title,
+            sessionId: entry.sessionId,
+            cwd: entry.cwd,
+          });
+          panel.webview.postMessage({
+            type: 'copy-mode-content',
+            text: md,
+            source: 'jsonl',
+            turns: countConversationTurns(turns),
+          });
+        } else {
+          const notice = t('copyModeNoTranscript') || 'No Claude transcript found — showing terminal viewport.';
+          const text = notice + '\n\n' + (msg.fallback || '');
+          panel.webview.postMessage({
+            type: 'copy-mode-content',
+            text,
+            source: 'fallback',
+            turns: 0,
+          });
+        }
+      } catch (e) {
+        console.warn('[copy-mode] failed:', e && e.message);
+        panel.webview.postMessage({
+          type: 'copy-mode-content',
+          text: 'Failed to load transcript: ' + (e && e.message || 'unknown error'),
+          source: 'fallback',
+          turns: 0,
+        });
+      }
+      return;
+    }
+
+    // Overlay "Copy Selection" — webview sends the drag-selected text and
+    // the extension writes it to the clipboard. Avoids webview clipboard
+    // permission pitfalls.
+    case 'copy-selection-from-overlay': {
+      (async () => {
+        try {
+          const sel = String(msg.text || '').trim();
+          if (!sel) {
+            panel.webview.postMessage({ type: 'copy-selection-result', success: false });
+            return;
+          }
+          await vscode.env.clipboard.writeText(sel);
+          panel.webview.postMessage({ type: 'copy-selection-result', success: true });
+        } catch (e) {
+          console.warn('[copy-selection] failed:', e && e.message);
+          panel.webview.postMessage({ type: 'copy-selection-result', success: false });
+        }
+      })();
+      return;
+    }
 
     case 'paste-large-text':
       handlePasteLargeText(msg, entry, panel);

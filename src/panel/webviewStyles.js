@@ -759,6 +759,80 @@ function getStyles(ctx) {
       50% { opacity: 0.7; }
     }
 
+    /* Copy Mode overlay (v2.6.9 — JSONL transcript preview) */
+    #copy-mode-overlay {
+      display: none;
+      position: absolute;
+      inset: 0;
+      z-index: 20;
+      background: ${bg};
+      flex-direction: column;
+    }
+    .copy-mode-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 32px;
+      padding: 0 12px;
+      background: ${toolbarBg};
+      border-bottom: 1px solid ${toolbarBorder};
+      flex-shrink: 0;
+      user-select: none;
+    }
+    .copy-mode-label {
+      flex: 1;
+      font-size: 11px;
+      color: ${fg};
+      font-family: -apple-system, "Segoe UI", sans-serif;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .copy-mode-bar button {
+      height: 24px;
+      padding: 0 10px;
+      border: 1px solid ${border};
+      border-radius: 4px;
+      background: ${btnBg};
+      color: ${fg};
+      font-size: 11px;
+      font-family: -apple-system, "Segoe UI", sans-serif;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+    .copy-mode-bar button:hover { background: ${btnHover}; }
+    #copy-mode-copy-all, #copy-mode-copy-selection {
+      border-color: #D97757;
+      color: #D97757;
+      background: transparent;
+    }
+    #copy-mode-copy-all:hover, #copy-mode-copy-selection:hover {
+      background: ${isDark ? 'rgba(217,119,87,0.12)' : 'rgba(201,100,66,0.08)'};
+    }
+    /* The preview <pre> is a real DOM element, so native drag-select
+       + Ctrl+C work. 'white-space: pre-wrap' keeps long lines readable
+       without horizontal scroll. */
+    #copy-mode-content.copy-mode-content {
+      flex: 1;
+      margin: 0;
+      padding: 14px 18px;
+      overflow-y: auto;
+      overflow-x: auto;
+      background: ${bg};
+      color: ${fg};
+      font-family: "D2Coding", "D2Coding ligature", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      user-select: text;
+      -webkit-user-select: text;
+    }
+    #copy-mode-content::-webkit-scrollbar { width: 8px; }
+    #copy-mode-content::-webkit-scrollbar-track { background: ${scrollTrack}; border-radius: 4px; }
+    #copy-mode-content::-webkit-scrollbar-thumb { background: ${scrollThumb}; border-radius: 4px; }
+    #copy-mode-content::-webkit-scrollbar-thumb:hover { background: ${isDark ? '#777' : '#999'}; }
+
     /* Toast notification */
     #paste-toast {
       display: none;
