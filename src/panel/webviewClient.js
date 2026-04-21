@@ -86,19 +86,20 @@ function getClientScript(ctx) {
 
     // Detect mouse tracking from raw PTY data (for UI indicator only).
     function checkMouseMode(data) {
-      if (/\\x1b\\[\\?100[0-6]h/.test(data) || /\\x1b\\[\\?1015h/.test(data)) {
+      if (/\\x1b\\[\\?(?:9|100[0-6]|101[56])h/.test(data)) {
         if (!isMouseMode) { isMouseMode = true; updateFullscreenUI(); }
       }
-      if (/\\x1b\\[\\?100[0-6]l/.test(data) || /\\x1b\\[\\?1015l/.test(data)) {
+      if (/\\x1b\\[\\?(?:9|100[0-6]|101[56])l/.test(data)) {
         if (isMouseMode) { isMouseMode = false; updateFullscreenUI(); }
       }
     }
 
-    // Strip mouse-mode sequences so xterm.js never enters mouse reporting.
-    // Covers: 1000-1006 (tracking modes), 1015 (urxvt extended).
-    // This preserves normal drag-select, Ctrl+C copy, and context menu.
+    // v2.6.27: Strip mouse-mode sequences so xterm.js never enters mouse reporting.
+    // Expanded from 1000-1006+1015 (v2.5.7) to include 9 (X10) and 1016 (SGR pixel).
+    // Claude Ink fullscreen TUI in Podium-ready sessions was still breaking drag
+    // selection, suggesting one of these broader modes was slipping through.
     function stripMouseMode(data) {
-      return data.replace(/\\x1b\\[\\?(?:100[0-6]|1015)[hl]/g, '');
+      return data.replace(/\\x1b\\[\\?(?:9|100[0-6]|101[56])[hl]/g, '');
     }
 
     // Alternate screen buffer detection via xterm.js API.
@@ -238,7 +239,15 @@ function getClientScript(ctx) {
 
     // Trim trailing whitespace from each line of terminal selection
     function getCleanSelection() {
-      const sel = term.getSelection();
+      let sel = term.getSelection();
+      if (!sel) {
+        // v2.6.29: fall back to DOM selection so Copy Mode overlay (<pre>)
+        // and any other non-xterm UI element can feed Open File / Open Folder
+        // / Copy via the context menu cache.
+        try {
+          sel = (window.getSelection && window.getSelection().toString()) || '';
+        } catch (_) { /* getSelection can throw in odd states */ }
+      }
       if (!sel) return '';
       return sel.split('\\n').map(line => line.replace(/\\s+$/, '')).join('\\n');
     }
@@ -254,6 +263,19 @@ function getClientScript(ctx) {
       const sel = getCleanSelection().trim();
       if (sel) lastSelectionCache = sel;
     });
+    // v2.6.31: document-level mouseup snapshot (capture phase).
+    // v2.6.30 registered on term.element in bubble phase, which failed in
+    // fullscreen because (a) term.element can be null at setup time depending
+    // on xterm init order, and (b) xterm's own mouseup handler can
+    // stopPropagation(), so the bubble listener never fires. Capture phase on
+    // document fires BEFORE any target handler, guaranteeing we snapshot the
+    // selection while xterm still has it — right before the next pty-data
+    // chunk triggers a Claude redraw that wipes it.
+    const snapshotSelection = () => {
+      const sel = getCleanSelection().trim();
+      if (sel) lastSelectionCache = sel;
+    };
+    document.addEventListener('mouseup', snapshotSelection, true);
     function readSelection() {
       const live = getCleanSelection().trim();
       if (live) return live;
@@ -1381,8 +1403,14 @@ function getClientScript(ctx) {
     // reporting intercepts and stopPropagation's the event in bubble phase.
     document.addEventListener('contextmenu', (e) => {
       e.preventDefault();
-      // Snapshot selection before the menu click (mousedown/click may clear xterm selection)
-      ctxSelectionCache = getCleanSelection().trim();
+      // Snapshot selection before the menu click (mousedown/click may clear xterm selection).
+      // v2.6.29: only overwrite when a live selection actually exists. Claude
+      // fullscreen redraws can wipe xterm selection between mouseup and this
+      // handler; without this guard an empty string was overwriting the real
+      // cache and Open Folder / Open File failed on the very text the user
+      // had just selected.
+      const snap = getCleanSelection().trim();
+      if (snap) ctxSelectionCache = snap;
       showContextMenu(e.clientX, e.clientY);
     }, true);
 

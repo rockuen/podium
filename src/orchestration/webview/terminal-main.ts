@@ -31,6 +31,23 @@ term.open(container);
 fit.fit();
 term.focus();
 
+// v2.6.28: selection cache + auto-copy on mouseup. Claude's fullscreen TUI
+// redraws continuously, which clears xterm's visible selection on every frame.
+// We snapshot the selection as it changes and push to the OS clipboard when
+// the user releases the mouse, mirroring src/panel/webviewClient.js.
+let lastSelection = '';
+term.onSelectionChange(() => {
+  const sel = term.getSelection().trim();
+  if (sel) lastSelection = sel;
+});
+container.addEventListener('mouseup', () => {
+  const sel = (term.getSelection() || lastSelection).trim();
+  if (sel) {
+    vscode.postMessage({ type: 'copy-selection', text: sel });
+    lastSelection = sel;
+  }
+});
+
 function sendResize(): void {
   const cols = term.cols;
   const rows = term.rows;
@@ -58,7 +75,10 @@ window.addEventListener('message', (ev: MessageEvent) => {
   const msg = ev.data as { type?: string; data?: string; exitCode?: number };
   if (!msg || typeof msg !== 'object') return;
   if (msg.type === 'pty-data' && typeof msg.data === 'string') {
-    term.write(msg.data);
+    // v2.6.27: strip mouse-mode enable/disable sequences, expanded set.
+    // Covers: 9 (X10), 1000-1006 (tracking modes), 1015 (urxvt), 1016 (SGR pixel).
+    // Without this, xterm.js enters passthrough mode and drag selection fails.
+    term.write(msg.data.replace(/\x1b\[\?(?:9|100[0-6]|101[56])[hl]/g, ''));
   } else if (msg.type === 'pty-exit') {
     term.writeln('');
     term.writeln(`\r\n\x1b[33m[process exited with code ${msg.exitCode ?? '?'}]\x1b[0m`);

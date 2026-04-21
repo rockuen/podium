@@ -82,8 +82,63 @@ export class PsmuxBackend implements IMultiplexerBackend {
     await this.run(['kill-session', '-t', sessionName]);
   }
 
+  async killServer(): Promise<void> {
+    try {
+      await this.run(['kill-server']);
+    } catch (err) {
+      if (isNoServerError(err)) return;
+      throw err;
+    }
+  }
+
+  async setServerOption(option: string, value: string): Promise<void> {
+    await this.run(['set-option', '-g', option, value]);
+  }
+
   async killPane(paneId: string): Promise<void> {
     await this.run(['kill-pane', '-t', paneId]);
+  }
+
+  async splitWorker(
+    session: string,
+    envPairs: ReadonlyArray<[string, string]>,
+    command: string,
+    args: ReadonlyArray<string>,
+    cwd?: string,
+  ): Promise<string> {
+    // `-d` keeps focus on the leader pane · `-P -F '#{pane_id}'` prints the
+    // new pane id so we can track it · `-e K=V` passes env (tmux 3.0+/psmux
+    // 3.3.2 verified 2026-04-21). Passing command+args after `--` avoids
+    // shell-quoting issues.
+    const psArgs: string[] = [
+      'split-window',
+      '-t',
+      `${session}:0`,
+      '-d',
+      '-P',
+      '-F',
+      '#{pane_id}',
+    ];
+    if (cwd) {
+      psArgs.push('-c', cwd);
+    }
+    for (const [k, v] of envPairs) {
+      psArgs.push('-e', `${k}=${v}`);
+    }
+    psArgs.push(command, ...args);
+    const { stdout } = await this.run(psArgs);
+    const paneId = stdout.trim().split(/\r?\n/)[0] ?? '';
+    if (!paneId.startsWith('%')) {
+      throw new Error(`splitWorker: unexpected output "${stdout.trim()}"`);
+    }
+    return paneId;
+  }
+
+  async applyLayout(
+    session: string,
+    layout: 'tiled' | 'even-horizontal' | 'even-vertical' | 'main-horizontal' | 'main-vertical',
+  ): Promise<void> {
+    await this.run(['select-layout', '-t', `${session}:0`, layout]);
   }
 
   async sendKeys(paneId: string, keys: string[], literal = false): Promise<void> {

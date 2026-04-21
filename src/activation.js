@@ -385,22 +385,17 @@ function activate(context) {
 function deactivate() {
   state.isDeactivating = true;
 
-  // Save sessions BEFORE cleanup so they survive reload
+  // v2.6.32: reuse saveSessions() so podiumReady / tmuxSession / titleMap /
+  // claudePodiumReadySessions all get persisted identically to the in-flight
+  // path (rename-tab etc). Previously this block hand-rolled the entry object
+  // and dropped the podium fields, so psmux-wrapped sessions restored as
+  // plain pty after VSCode reload.
   if (state.context && state.panels.size > 0) {
-    const sessions = [];
-    let order = 0;
-    for (const [, entry] of state.panels) {
-      if (!entry.pty) continue; // don't restore dead sessions
-      sessions.push({
-        title: entry.title,
-        memo: entry.memo || '',
-        cwd: entry.cwd,
-        sessionId: entry.sessionId,
-        order: order++,
-        viewColumn: entry.panel.viewColumn || 1
-      });
+    try {
+      saveSessions();
+    } catch (e) {
+      console.warn('[Claude Launcher] deactivate saveSessions failed:', e?.message || e);
     }
-    sessionStoreUpdate('claudeSessions', sessions);
   }
 
   for (const [, entry] of state.panels) {

@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as fs from 'fs';
+import * as os from 'os';
 import * as path from 'path';
 import { execFile } from 'child_process';
 import { randomUUID } from 'crypto';
@@ -253,7 +254,16 @@ export class TeamConversationPanel {
     const target = leaderPaneId || tmuxSession;
 
     try {
-      await execFilePromise(muxBin, ['send-keys', '-t', target, text]);
+      // v2.6.24: join lines with Win32-input-mode Shift+Enter KEY_EVENT ANSI
+      // sequence (down + up). Claude readline sees a real Shift+Enter key
+      // event and keeps newline-in-buffer. Final bare Enter submits.
+      // Replaces v2.6.23's raw LF approach — Claude readline treated raw LF
+      // bytes as submit (same as CR), dropping everything after the first
+      // line. See pty/autoSend.js for the full spec reference.
+      const SHIFT_ENTER_KEY_EVENT =
+        '\x1b[13;28;10;1;16;1_' + '\x1b[13;28;10;0;16;1_';
+      const payload = text.split(/\r?\n/).join(SHIFT_ENTER_KEY_EVENT);
+      await execFilePromise(muxBin, ['send-keys', '-l', '-t', target, payload]);
       await execFilePromise(muxBin, ['send-keys', '-t', target, 'Enter']);
       this.output.appendLine(`[podium.inject] sent (${text.length} chars) → ${target}`);
       this.panel.webview.postMessage({ type: 'leader-inject-result', ok: true });

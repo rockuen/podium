@@ -13,7 +13,10 @@ export class SessionNode extends vscode.TreeItem {
     this.contextValue = 'omcSession';
     const attached = detected.session.attached ? ' · attached' : '';
     const mix = summarizeAgents(detected.panes);
-    this.description = `${detected.panes.length} pane${detected.panes.length === 1 ? '' : 's'}${mix}${attached}`;
+    // v2.6.37: tag inline teams so users can tell apart an `omc-team-*`
+    // standalone session from a `/team`-split leader session.
+    const inlineTag = detected.kind === 'podium-inline' ? ' · inline' : '';
+    this.description = `${detected.panes.length} pane${detected.panes.length === 1 ? '' : 's'}${mix}${attached}${inlineTag}`;
     this.iconPath = new vscode.ThemeIcon(
       'organization',
       new vscode.ThemeColor(COLOR_IDS.omc),
@@ -39,9 +42,14 @@ class EmptyNode extends vscode.TreeItem {
   readonly kind = 'empty' as const;
 
   constructor(prefix: string, nameFilter: string) {
+    // v2.6.37: detector now also picks up podium-leader-* sessions with ≥2
+    // panes (inline /team), so the "no sessions" label shouldn't name only
+    // the omc-team- prefix.
     const label = nameFilter
-      ? `No sessions matching "${nameFilter}" (prefix "${prefix}")`
-      : `No sessions starting with "${prefix}"`;
+      ? `No team sessions matching "${nameFilter}"`
+      : prefix
+        ? `No team sessions (checked "${prefix}*" and "podium-leader-*" with ≥2 panes)`
+        : 'No team sessions found';
     super(label, vscode.TreeItemCollapsibleState.None);
     this.iconPath = new vscode.ThemeIcon('info');
     this.contextValue = 'omcEmpty';

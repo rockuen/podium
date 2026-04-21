@@ -155,7 +155,7 @@ function wirePanel(
 
   const onMessage = panel.webview.onDidReceiveMessage((msg: unknown) => {
     if (!msg || typeof msg !== 'object') return;
-    const m = msg as { type?: string; data?: unknown; cols?: unknown; rows?: unknown };
+    const m = msg as { type?: string; data?: unknown; cols?: unknown; rows?: unknown; text?: unknown };
     if (m.type === 'input' && typeof m.data === 'string') {
       try {
         proc.write(m.data);
@@ -172,6 +172,13 @@ function wirePanel(
           output.appendLine(`[podium] resize failed: ${err}`);
         }
       }
+    } else if (m.type === 'copy-selection' && typeof m.text === 'string' && m.text) {
+      // v2.6.28: auto-copy webview drag selection on mouseup so Claude TUI
+      // redraw doesn't cost the user their highlight. Visible selection may
+      // clear on the next frame but clipboard content is already set.
+      vscode.env.clipboard.writeText(m.text).then(undefined, (err) => {
+        output.appendLine(`[podium] clipboard write failed: ${err}`);
+      });
     }
   });
 

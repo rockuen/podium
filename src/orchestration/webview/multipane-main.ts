@@ -188,6 +188,22 @@ function createPane(info: PaneInfo): PaneInstance {
     /* ignore */
   }
 
+  // v2.6.28: selection cache + auto-copy on mouseup. Claude's fullscreen TUI
+  // clears xterm's visible selection on every redraw, so we snapshot and push
+  // to the OS clipboard on mouseup. Mirrors src/panel/webviewClient.js.
+  let lastSelection = '';
+  term.onSelectionChange(() => {
+    const sel = term.getSelection().trim();
+    if (sel) lastSelection = sel;
+  });
+  body.addEventListener('mouseup', () => {
+    const sel = (term.getSelection() || lastSelection).trim();
+    if (sel) {
+      vscode.postMessage({ type: 'copy-selection', text: sel });
+      lastSelection = sel;
+    }
+  });
+
   return { info, term, fit, el };
 }
 
@@ -338,7 +354,11 @@ window.addEventListener('message', (ev: MessageEvent) => {
     const inst = instances.get(msg.paneId);
     if (!inst) return;
     inst.term.reset();
-    inst.term.write(msg.content ?? '');
+    // v2.6.27: strip mouse-mode enable/disable sequences, expanded set.
+    // Covers: 9 (X10), 1000-1006 (tracking modes), 1015 (urxvt), 1016 (SGR pixel).
+    // Without this, xterm enters passthrough mode and native drag selection
+    // is disabled. Mirrors src/panel/webviewClient.js:stripMouseMode.
+    inst.term.write((msg.content ?? '').replace(/\x1b\[\?(?:9|100[0-6]|101[56])[hl]/g, ''));
     flashStatus();
     return;
   }

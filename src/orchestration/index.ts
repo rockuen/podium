@@ -46,6 +46,19 @@ import { SessionNode, SessionTreeProvider as TeamsTreeProvider } from './ui/Team
 import { TerminalPanel } from './ui/TerminalPanel';
 import { SpawnTeamPanel } from './ui/SpawnTeamPanel';
 import { MultiPaneTerminalPanel } from './ui/MultiPaneTerminalPanel';
+import { LiveMultiPanel } from './ui/LiveMultiPanel';
+import { PodiumOrchestrator } from './core/PodiumOrchestrator';
+import { buildLeaderExtraArgs } from './core/leaderProtocol';
+import { pickClaudeSession } from './core/sessionPicker';
+import {
+  makeSnapshotId,
+  pickSnapshot,
+  promptSnapshotName,
+  resolveSnapshotPath,
+  saveSnapshot,
+  type TeamSnapshot,
+} from './core/teamSnapshot';
+import type { CapturedSnapshot } from './core/PodiumOrchestrator';
 import { HUDStatusBarItem } from './ui/HUDStatusBarItem';
 import { HUDTreeProvider } from './ui/HUDTreeProvider';
 import { HUDDashboardPanel } from './ui/HUDDashboardPanel';
@@ -296,7 +309,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   ctx.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.team.create', () => {
       output.appendLine('[orch] team.create invoked');
-      SpawnTeamPanel.show(ctx, runtime, manager, output, providerHealth);
+      SpawnTeamPanel.show(ctx, runtime, manager, output, providerHealth, backend);
     }),
     vscode.commands.registerCommand('claudeCodeLauncher.team.createIntegrated', async () => {
       output.appendLine('[orch] team.createIntegrated invoked');
@@ -463,6 +476,415 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     }),
     vscode.commands.registerCommand('claudeCodeLauncher.team.missions.refresh', () => {
       missionWatcher.forceRefresh();
+    }),
+  );
+
+  // ─── Emergency Reset (P0.1) ───
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.orchestration.killAll', async () => {
+      output.appendLine('[orch.killAll] invoked');
+      await runKillAll(backend, detector, teamsProvider, output, prefix);
+    }),
+  );
+
+  // ─── Phase 1 · v2.7.0 — Live Multi-Pane test command ───
+  // Opens a LiveMultiPanel seeded with two Claude panes side by side. Lets
+  // us verify node-pty streaming, per-pane input routing, and UTF-8 before
+  // we layer the v2.7 orchestrator on top.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.liveTest', async () => {
+      output.appendLine('[orch.liveTest] invoked');
+      const cwd = currentCwd();
+      const panel = LiveMultiPanel.create(ctx, output, 'Podium · Live Test (2 Claudes)');
+      panel.addPane({
+        paneId: 'claude-1',
+        label: 'claude-1 (leader)',
+        agent: 'claude',
+        cwd,
+        autoSessionId: true,
+      });
+      panel.addPane({
+        paneId: 'claude-2',
+        label: 'claude-2 (worker)',
+        agent: 'claude',
+        cwd,
+        autoSessionId: true,
+      });
+      panel.reveal();
+    }),
+  );
+
+  // ─── Phase 2 · v2.7.2 — Orchestrated team (leader + 2 workers) ───
+  // Spawns a 3-pane team with a PodiumOrchestrator attached. The leader is
+  // typed into normally; whenever its stream contains `@worker-1: ...` or
+  // `@worker-2: ...`, the orchestrator injects the payload into that worker
+  // once the worker's prompt is visible and its output has gone quiet.
+  const orchestratorRegistry = new Map<string, PodiumOrchestrator>();
+  ctx.subscriptions.push({
+    dispose() {
+      for (const o of orchestratorRegistry.values()) o.dispose();
+      orchestratorRegistry.clear();
+    },
+  });
+
+  // v2.7.19 · Auto-save snapshot hook factory.
+  // Invoked by PodiumOrchestrator on dissolve or first pane-exit; writes a
+  // TeamSnapshot entry to the OneDrive-synced claudeTeams.json (capped at 10
+  // newest). Returns a non-async callback so orchestrator can fire-and-forget.
+  const makeAutoSnapshotHook = (
+    outputChannel: vscode.OutputChannel,
+    defaultName: string,
+  ) => (snap: CapturedSnapshot, source: 'dissolve' | 'pane-exit') => {
+    const file = resolveSnapshotPath();
+    const team: TeamSnapshot = {
+      id: makeSnapshotId(),
+      name: `auto · ${defaultName} (${source})`,
+      createdAt: new Date().toISOString(),
+      source,
+      cwd: snap.cwd,
+      leader: {
+        paneId: snap.leader.paneId,
+        agent: snap.leader.agent,
+        sessionId: snap.leader.sessionId ?? '',
+        label: snap.leader.label,
+      },
+      workers: snap.workers
+        .filter((w) => w.sessionId)
+        .map((w) => ({ paneId: w.paneId, agent: w.agent, sessionId: w.sessionId!, label: w.id })),
+    };
+    saveSnapshot(file, team)
+      .then(() =>
+        outputChannel.appendLine(`[orch.snapshot] auto-saved (${source}) → ${file}`),
+      )
+      .catch((err) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        outputChannel.appendLine(`[orch.snapshot] auto-save FAILED — ${msg}`);
+      });
+  };
+
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.orchestrate', async () => {
+      output.appendLine('[orch.orchestrate] invoked');
+      const cwd = currentCwd();
+      const panel = LiveMultiPanel.create(
+        ctx,
+        output,
+        'Podium · Orchestrated Team (leader + 2 workers)',
+      );
+
+      // v2.7.19: pre-generate UUIDs so we can snapshot & restore.
+      const leaderSid = randomUUID();
+      const worker1Sid = randomUUID();
+      const worker2Sid = randomUUID();
+
+      panel.addPane({
+        paneId: 'leader',
+        label: 'leader (claude)',
+        agent: 'claude',
+        cwd,
+        sessionId: leaderSid,
+        extraArgs: buildLeaderExtraArgs(),
+      });
+      panel.addPane({
+        paneId: 'worker-1',
+        label: 'worker-1 (claude)',
+        agent: 'claude',
+        cwd,
+        sessionId: worker1Sid,
+      });
+      panel.addPane({
+        paneId: 'worker-2',
+        label: 'worker-2 (claude)',
+        agent: 'claude',
+        cwd,
+        sessionId: worker2Sid,
+      });
+
+      const orch = new PodiumOrchestrator(panel, output);
+      orch.attach({
+        leader: { paneId: 'leader', agent: 'claude', sessionId: leaderSid, label: 'leader (claude)' },
+        workers: [
+          { id: 'worker-1', paneId: 'worker-1', agent: 'claude', sessionId: worker1Sid },
+          { id: 'worker-2', paneId: 'worker-2', agent: 'claude', sessionId: worker2Sid },
+        ],
+        dispatchDebounceMs: 1200,
+        cwd,
+        onAutoSnapshot: makeAutoSnapshotHook(output, `team ${new Date().toLocaleString()}`),
+      });
+
+      const sessionKey = `orch-${Date.now()}`;
+      orchestratorRegistry.set(sessionKey, orch);
+
+      panel.onPaneExit(() => {
+        // Any pane exit implies the team is broken; tear down the orchestrator.
+        const existing = orchestratorRegistry.get(sessionKey);
+        if (existing) {
+          existing.dispose();
+          orchestratorRegistry.delete(sessionKey);
+        }
+      });
+
+      panel.reveal();
+      vscode.window.showInformationMessage(
+        'Podium orchestrator attached. Type into the leader pane and say e.g. "@worker-1: ..." to route.',
+      );
+    }),
+  );
+
+  // ─── Phase 3.4 · v2.7.12 — Resume an existing Claude session as leader ───
+  // Variant of `podium.orchestrate`: scans ~/.claude/projects/<cwd>/ for
+  // prior sessions, lets the user pick one, then spawns the leader pane
+  // with `--resume <uuid>` on top of the normal Podium leader flags. The
+  // leader's conversation carries over; the routing protocol and Task-tool
+  // block are applied fresh via `--disallowedTools` + `--append-system-prompt`,
+  // which Claude re-asserts on every process launch.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.orchestrate.resume', async () => {
+      output.appendLine('[orch.orchestrate.resume] invoked');
+      const cwd = currentCwd();
+      const sessionId = await pickClaudeSession(cwd);
+      if (!sessionId) {
+        output.appendLine('[orch.orchestrate.resume] cancelled — no session picked');
+        return;
+      }
+      output.appendLine(`[orch.orchestrate.resume] resuming session=${sessionId}`);
+
+      const panel = LiveMultiPanel.create(
+        ctx,
+        output,
+        `Podium · Resumed Team (leader=${sessionId.slice(0, 8)} + 2 workers)`,
+      );
+
+      // v2.7.19: resume keeps the leader's session ID; workers get fresh UUIDs.
+      const worker1Sid = randomUUID();
+      const worker2Sid = randomUUID();
+
+      panel.addPane({
+        paneId: 'leader',
+        label: `leader (claude, resumed ${sessionId.slice(0, 8)})`,
+        agent: 'claude',
+        cwd,
+        autoSessionId: false,
+        extraArgs: buildLeaderExtraArgs({ resumeSessionId: sessionId }),
+      });
+      panel.addPane({
+        paneId: 'worker-1',
+        label: 'worker-1 (claude)',
+        agent: 'claude',
+        cwd,
+        sessionId: worker1Sid,
+      });
+      panel.addPane({
+        paneId: 'worker-2',
+        label: 'worker-2 (claude)',
+        agent: 'claude',
+        cwd,
+        sessionId: worker2Sid,
+      });
+
+      const orch = new PodiumOrchestrator(panel, output);
+      orch.attach({
+        leader: { paneId: 'leader', agent: 'claude', sessionId, label: `leader (resumed ${sessionId.slice(0, 8)})` },
+        workers: [
+          { id: 'worker-1', paneId: 'worker-1', agent: 'claude', sessionId: worker1Sid },
+          { id: 'worker-2', paneId: 'worker-2', agent: 'claude', sessionId: worker2Sid },
+        ],
+        dispatchDebounceMs: 1200,
+        cwd,
+        onAutoSnapshot: makeAutoSnapshotHook(output, `resumed ${sessionId.slice(0, 8)}`),
+      });
+
+      const sessionKey = `orch-resume-${Date.now()}`;
+      orchestratorRegistry.set(sessionKey, orch);
+
+      panel.onPaneExit(() => {
+        const existing = orchestratorRegistry.get(sessionKey);
+        if (existing) {
+          existing.dispose();
+          orchestratorRegistry.delete(sessionKey);
+        }
+      });
+
+      panel.reveal();
+      vscode.window.showInformationMessage(
+        `Podium orchestrator attached (resumed ${sessionId.slice(0, 8)}). Leader has prior context; delegate with @worker-N: directives.`,
+      );
+    }),
+  );
+
+  // ─── Phase 4.A · v2.7.19 — Team Snapshot: save ───
+  // Manually record the current team's session IDs + metadata to the
+  // OneDrive-synced claudeTeams.json so the user can reopen it later via
+  // `podium.snapshot.load`. Auto-save also runs on dissolve / pane-exit.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.snapshot.save', async () => {
+      const active = [...orchestratorRegistry.values()];
+      if (active.length === 0) {
+        vscode.window.showInformationMessage(
+          'Podium: no active team to snapshot. Start a team first.',
+        );
+        return;
+      }
+      const target = active[active.length - 1];
+      let snap: CapturedSnapshot;
+      try {
+        snap = target.captureSnapshot();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Podium snapshot capture failed: ${msg}`);
+        return;
+      }
+      const defaultName = `Team ${new Date().toLocaleString()}`;
+      const name = await promptSnapshotName(defaultName);
+      if (!name) {
+        output.appendLine('[orch.snapshot.save] cancelled — no name');
+        return;
+      }
+      const file = resolveSnapshotPath();
+      const team: TeamSnapshot = {
+        id: makeSnapshotId(),
+        name,
+        createdAt: new Date().toISOString(),
+        source: 'manual',
+        cwd: snap.cwd,
+        leader: {
+          paneId: snap.leader.paneId,
+          agent: snap.leader.agent,
+          sessionId: snap.leader.sessionId ?? '',
+          label: snap.leader.label,
+        },
+        workers: snap.workers
+          .filter((w) => w.sessionId)
+          .map((w) => ({ paneId: w.paneId, agent: w.agent, sessionId: w.sessionId!, label: w.id })),
+      };
+      try {
+        await saveSnapshot(file, team);
+        output.appendLine(`[orch.snapshot.save] saved "${name}" → ${file}`);
+        vscode.window.showInformationMessage(`Podium snapshot saved: "${name}"`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Podium snapshot save failed: ${msg}`);
+      }
+    }),
+  );
+
+  // ─── Phase 4.A · v2.7.19 — Team Snapshot: load/restore ───
+  // Picker over saved teams. Spawns a new LiveMultiPanel with each pane
+  // `--resume`'d to its saved session, applying the Podium protocol fresh
+  // to the leader. Workers keep their prior conversations.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.snapshot.load', async () => {
+      output.appendLine('[orch.snapshot.load] invoked');
+      const file = resolveSnapshotPath();
+      const snap = await pickSnapshot(file);
+      if (!snap) {
+        output.appendLine('[orch.snapshot.load] cancelled — no snapshot picked');
+        return;
+      }
+      if (!snap.leader.sessionId) {
+        vscode.window.showErrorMessage('Snapshot has no leader session — cannot restore.');
+        return;
+      }
+      output.appendLine(
+        `[orch.snapshot.load] restoring "${snap.name}" leader=${snap.leader.sessionId.slice(0, 8)} workers=${snap.workers.length}`,
+      );
+      const cwd = snap.cwd;
+      const panel = LiveMultiPanel.create(
+        ctx,
+        output,
+        `Podium · Restored: ${snap.name}`,
+      );
+
+      panel.addPane({
+        paneId: snap.leader.paneId,
+        label: `leader (restored ${snap.leader.sessionId.slice(0, 8)})`,
+        agent: snap.leader.agent,
+        cwd,
+        autoSessionId: false,
+        extraArgs: buildLeaderExtraArgs({ resumeSessionId: snap.leader.sessionId }),
+      });
+      for (const w of snap.workers) {
+        panel.addPane({
+          paneId: w.paneId,
+          label: `${w.label ?? w.paneId} (restored ${w.sessionId.slice(0, 8)})`,
+          agent: w.agent,
+          cwd,
+          autoSessionId: false,
+          extraArgs: ['--resume', w.sessionId],
+        });
+      }
+
+      const orch = new PodiumOrchestrator(panel, output);
+      orch.attach({
+        leader: {
+          paneId: snap.leader.paneId,
+          agent: snap.leader.agent,
+          sessionId: snap.leader.sessionId,
+          label: snap.leader.label,
+        },
+        workers: snap.workers.map((w) => ({
+          id: w.label ?? w.paneId,
+          paneId: w.paneId,
+          agent: w.agent,
+          sessionId: w.sessionId,
+        })),
+        dispatchDebounceMs: 1200,
+        cwd,
+        onAutoSnapshot: makeAutoSnapshotHook(output, snap.name),
+      });
+
+      const sessionKey = `orch-restore-${Date.now()}`;
+      orchestratorRegistry.set(sessionKey, orch);
+
+      panel.onPaneExit(() => {
+        const existing = orchestratorRegistry.get(sessionKey);
+        if (existing) {
+          existing.dispose();
+          orchestratorRegistry.delete(sessionKey);
+        }
+      });
+
+      panel.reveal();
+      vscode.window.showInformationMessage(
+        `Podium restored "${snap.name}" (${snap.workers.length} workers). Prior context loaded; delegate with @worker-N: directives.`,
+      );
+    }),
+  );
+
+  // ─── Phase 3 · v2.7.8 — Dissolve the active orchestrator's workers ───
+  // Kills every worker pane, asks `claude --bare -p --model haiku` for a
+  // short summary of their transcripts, then injects that summary into the
+  // leader's stdin. The leader stays alive and continues the conversation.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.dissolve', async () => {
+      output.appendLine('[orch.dissolve-cmd] invoked');
+      const active = [...orchestratorRegistry.values()];
+      if (active.length === 0) {
+        vscode.window.showInformationMessage('Podium: no active orchestrator to dissolve.');
+        return;
+      }
+      // If multiple sessions exist (e.g. user ran Orchestrate twice), dissolve
+      // the most recent one by insertion order. Rare case; MVP behavior.
+      const target = active[active.length - 1];
+      await vscode.window.withProgress(
+        {
+          location: vscode.ProgressLocation.Notification,
+          title: 'Podium: dissolving workers…',
+          cancellable: false,
+        },
+        async () => {
+          const summary = await target.dissolve();
+          if (summary === null) {
+            vscode.window.showInformationMessage(
+              'Podium: no workers attached; nothing to dissolve.',
+            );
+          } else {
+            vscode.window.showInformationMessage(
+              'Podium: workers dissolved, summary injected into leader.',
+            );
+          }
+        },
+      );
     }),
   );
 
@@ -866,6 +1288,275 @@ function stripDeprecationWarnings(text: string): string {
     .split(/\r?\n/)
     .filter((line) => !/DeprecationWarning|trace-deprecation/i.test(line))
     .join('\n');
+}
+
+// P0.1 Emergency Reset implementation. Lists all prefix-matching sessions,
+// confirms with the user, then attempts a 3-stage kill:
+//   1. kill-session per name (batch)
+//   2. if any remain → kill-pane per lingering pane
+//   3. if any still remain → offer kill-server as last resort
+// Finally, GC `.omc/state/sessions/<name>/` for each session we destroyed.
+//
+// Two orchestration-owned name spaces exist today:
+//   - OMC team sessions  → configurable prefix (default "omc-team-")
+//   - Launcher podium    → hardcoded "podium-leader-<sid8>" from
+//                          src/pty/tmuxWrap.js; single-Claude wrapper
+// Both are our responsibility, so the reset includes them. When P0.4 lands
+// the self-owned registry (`.claude-launcher/sessions.json → claudeTeams`)
+// will become the source of truth and this heuristic can step aside.
+const LAUNCHER_PODIUM_PREFIX = 'podium-leader-';
+
+async function runKillAll(
+  backend: IMultiplexerBackend,
+  detector: SessionDetector,
+  teamsProvider: TeamsTreeProvider,
+  output: vscode.OutputChannel,
+  prefix: string,
+): Promise<void> {
+  const initial = (await backend.listSessions().catch((err) => {
+    output.appendLine(`[orch.killAll] listSessions failed: ${describeErr(err)}`);
+    return [];
+  }));
+  const matches = (name: string) =>
+    (!!prefix && name.startsWith(prefix)) || name.startsWith(LAUNCHER_PODIUM_PREFIX);
+  const targets = initial.filter((s) => matches(s.name));
+  if (targets.length === 0) {
+    const label = prefix ? `"${prefix}" or "${LAUNCHER_PODIUM_PREFIX}"` : `"${LAUNCHER_PODIUM_PREFIX}"`;
+    vscode.window.showInformationMessage(
+      `Podium: no sessions starting with ${label} to kill.`,
+    );
+    return;
+  }
+
+  // v2.6.35: cross-reference launcher sessionStore so the modal shows WHICH
+  // Claude session each `podium-leader-*` belongs to. Reads workspace-scoped
+  // `.claude-launcher/sessions.json` (written by store/sessionManager.js) and
+  // builds tmuxSession → {sessionId, title, memo, cwd}. Unknown names stay
+  // bare. Fuzzy fallback: match the 8-char suffix against titleMap keys to
+  // rescue orphan sessions that pre-date the v2.6.32 deactivate fix.
+  const labelBy = readPodiumLabels(currentCwd(), output);
+  enrichFuzzyPodiumLabels(labelBy, currentCwd(), targets.map((t) => t.name));
+
+  // v2.6.36: multi-select QuickPick replaces the modal confirm so the user can
+  // uncheck sessions they want to keep. All candidates preselected — hitting
+  // OK with no changes preserves the original "Kill All" behavior, but now
+  // power users can de-select individual entries too. Cancel (Esc) aborts.
+  type KillPick = vscode.QuickPickItem & { name: string };
+  const picks: KillPick[] = targets.map((s) => {
+    const info = labelBy.get(s.name);
+    const detailBits: string[] = [];
+    if (info?.memo) {
+      detailBits.push(`memo="${info.memo.slice(0, 60)}${info.memo.length > 60 ? '…' : ''}"`);
+    }
+    if (info?.cwd) detailBits.push(`cwd=${path.basename(info.cwd)}`);
+    return {
+      name: s.name,
+      label: s.name,
+      description: info?.title ? `"${info.title}"` : undefined,
+      detail: detailBits.length > 0 ? detailBits.join(' · ') : undefined,
+      picked: true,
+    };
+  });
+  const chosen = (await vscode.window.showQuickPick(picks, {
+    canPickMany: true,
+    title: `Kill orchestration sessions (${targets.length} found · unchecking keeps them alive)`,
+    placeHolder: 'Uncheck any session you want to keep · Enter to kill selected · Esc to cancel',
+    ignoreFocusOut: true,
+  })) as KillPick[] | undefined;
+  if (!chosen) {
+    output.appendLine('[orch.killAll] user cancelled (Esc)');
+    return;
+  }
+  if (chosen.length === 0) {
+    output.appendLine('[orch.killAll] user de-selected every session; nothing to kill');
+    vscode.window.showInformationMessage('Podium: nothing selected, no sessions killed.');
+    return;
+  }
+  const selected = targets.filter((t) => chosen.some((c) => c.name === t.name));
+  output.appendLine(
+    `[orch.killAll] user picked ${selected.length}/${targets.length}: ${selected.map((s) => s.name).join(', ')}`,
+  );
+
+  // Stage 1 — batch kill-session
+  const killResults: { name: string; ok: boolean; err?: string }[] = [];
+  for (const s of selected) {
+    try {
+      await backend.killSession(s.name);
+      killResults.push({ name: s.name, ok: true });
+      output.appendLine(`[orch.killAll] kill-session "${s.name}" -> ok`);
+    } catch (err) {
+      const msg = describeErr(err);
+      killResults.push({ name: s.name, ok: false, err: msg });
+      output.appendLine(`[orch.killAll] kill-session "${s.name}" -> fail: ${msg}`);
+    }
+  }
+
+  // Stage 2 — re-list, escalate any lingering sessions to kill-pane
+  const afterStage1 = await backend.listSessions().catch(() => []);
+  const lingering = afterStage1.filter((s) => selected.some((t) => t.name === s.name));
+  let paneKilled = 0;
+  if (lingering.length > 0) {
+    output.appendLine(
+      `[orch.killAll] stage-2: ${lingering.length} session(s) still alive, escalating to kill-pane`,
+    );
+    for (const s of lingering) {
+      const panes = await backend.listPanes(s.name).catch(() => []);
+      for (const p of panes) {
+        try {
+          await backend.killPane(p.paneId);
+          paneKilled++;
+          output.appendLine(`[orch.killAll] kill-pane "${p.paneId}" (${s.name}) -> ok`);
+        } catch (err) {
+          output.appendLine(
+            `[orch.killAll] kill-pane "${p.paneId}" (${s.name}) -> fail: ${describeErr(err)}`,
+          );
+        }
+      }
+    }
+  }
+
+  // Stage 3 — final re-check, offer kill-server
+  const afterStage2 = await backend.listSessions().catch(() => []);
+  const remaining = afterStage2.filter((s) => selected.some((t) => t.name === s.name));
+  if (remaining.length > 0) {
+    output.appendLine(
+      `[orch.killAll] stage-3: ${remaining.length} session(s) refuse to die`,
+    );
+    const ans = await vscode.window.showWarningMessage(
+      `Podium: ${remaining.length} session(s) still alive after kill-session + kill-pane. Kill the entire ${backend.name} server? This terminates every session in this ${backend.name} instance (including non-orchestration ones).`,
+      { modal: true },
+      'Kill Server',
+    );
+    if (ans === 'Kill Server') {
+      try {
+        await backend.killServer();
+        output.appendLine(`[orch.killAll] kill-server -> ok`);
+      } catch (err) {
+        output.appendLine(`[orch.killAll] kill-server -> fail: ${describeErr(err)}`);
+        vscode.window.showErrorMessage(
+          `Podium: kill-server failed — ${describeErr(err)}`,
+        );
+      }
+    } else {
+      output.appendLine('[orch.killAll] user declined kill-server');
+    }
+  }
+
+  // GC — remove `.omc/state/sessions/<name>/` for every session we meant to kill.
+  const cwd = currentCwd();
+  const sessionsDir = path.join(cwd, '.omc', 'state', 'sessions');
+  let gcCount = 0;
+  if (fs.existsSync(sessionsDir)) {
+    for (const s of selected) {
+      const dir = path.join(sessionsDir, s.name);
+      if (fs.existsSync(dir)) {
+        try {
+          fs.rmSync(dir, { recursive: true, force: true });
+          gcCount++;
+        } catch (err) {
+          output.appendLine(`[orch.killAll] gc "${dir}" -> fail: ${describeErr(err)}`);
+        }
+      }
+    }
+  }
+
+  teamsProvider.refresh();
+
+  const okCount = killResults.filter((r) => r.ok).length;
+  vscode.window.showInformationMessage(
+    `Podium: killed ${okCount}/${selected.length} session(s)` +
+      (paneKilled > 0 ? `, ${paneKilled} pane(s) force-killed` : '') +
+      (gcCount > 0 ? `, ${gcCount} state dir(s) GC'd` : '') +
+      '.',
+  );
+}
+
+function describeErr(err: unknown): string {
+  if (!err) return '(unknown)';
+  if (err instanceof Error) return err.message;
+  return String(err);
+}
+
+// Build a `tmuxSession → {sessionId, title, memo, cwd}` lookup from the
+// launcher's workspace-scoped JSON store so Kill All / other diagnostics can
+// resolve anonymous `podium-leader-<sid8>` names back to the Claude session
+// the user actually recognizes. Mirrors the shape that store/sessionManager.js
+// writes (`claudeSessions`, `claudeSessionTitles`, `claudePodiumReadySessions`).
+interface PodiumLabel {
+  sessionId?: string;
+  title?: string;
+  memo?: string;
+  cwd?: string;
+}
+
+function readPodiumLabels(cwd: string, output: vscode.OutputChannel): Map<string, PodiumLabel> {
+  const out = new Map<string, PodiumLabel>();
+  const storePath = path.join(cwd, '.claude-launcher', 'sessions.json');
+  if (!fs.existsSync(storePath)) return out;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(fs.readFileSync(storePath, 'utf8'));
+  } catch (err) {
+    output.appendLine(`[orch.labels] sessions.json parse failed: ${describeErr(err)}`);
+    return out;
+  }
+  if (!raw || typeof raw !== 'object') return out;
+  const store = raw as Record<string, unknown>;
+  const titleMap = (store.claudeSessionTitles as Record<string, string>) ?? {};
+  const sessions = Array.isArray(store.claudeSessions) ? (store.claudeSessions as Array<Record<string, unknown>>) : [];
+  const podiumMap = (store.claudePodiumReadySessions as Record<string, { tmuxSession?: string }>) ?? {};
+
+  // Primary source: live claudeSessions entries (title/memo/cwd all authoritative)
+  for (const s of sessions) {
+    const tmuxSession = typeof s.tmuxSession === 'string' ? s.tmuxSession : undefined;
+    if (!tmuxSession) continue;
+    out.set(tmuxSession, {
+      sessionId: typeof s.sessionId === 'string' ? s.sessionId : undefined,
+      title: typeof s.title === 'string' ? s.title : undefined,
+      memo: typeof s.memo === 'string' && s.memo.length > 0 ? s.memo : undefined,
+      cwd: typeof s.cwd === 'string' ? s.cwd : undefined,
+    });
+  }
+  // Durable map: covers orphan sessions whose launcher tab is already closed.
+  for (const [sessionId, info] of Object.entries(podiumMap)) {
+    const tmuxSession = info?.tmuxSession;
+    if (!tmuxSession || out.has(tmuxSession)) continue;
+    out.set(tmuxSession, {
+      sessionId,
+      title: titleMap[sessionId],
+    });
+  }
+  // Last-resort fuzzy match: `podium-leader-<sid8>` → scan titleMap for any
+  // sessionId starting with those 8 chars. Rescues truly orphan psmux sessions
+  // that pre-date the v2.6.32 deactivate fix (ones that never got written to
+  // claudePodiumReadySessions).
+  return out;
+}
+
+function enrichFuzzyPodiumLabels(
+  labels: Map<string, PodiumLabel>,
+  cwd: string,
+  targetNames: string[],
+): void {
+  const storePath = path.join(cwd, '.claude-launcher', 'sessions.json');
+  if (!fs.existsSync(storePath)) return;
+  let titleMap: Record<string, string> = {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(storePath, 'utf8')) as Record<string, unknown>;
+    titleMap = (raw.claudeSessionTitles as Record<string, string>) ?? {};
+  } catch {
+    return;
+  }
+  for (const name of targetNames) {
+    if (labels.has(name)) continue;
+    const m = name.match(/^podium-leader-([a-f0-9]{8})$/i);
+    if (!m) continue;
+    const sid8 = m[1].toLowerCase();
+    const match = Object.entries(titleMap).find(([sid]) => sid.toLowerCase().startsWith(sid8));
+    if (match) {
+      labels.set(name, { sessionId: match[0], title: match[1] });
+    }
+  }
 }
 
 async function promptTeamSpec(): Promise<TeamSpec | undefined> {

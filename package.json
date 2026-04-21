@@ -2,7 +2,7 @@
   "name": "cli-launcher-for-claude",
   "displayName": "CLI Launcher for Claude",
   "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
-  "version": "2.6.19",
+  "version": "2.7.20",
   "publisher": "rockuen",
   "license": "MIT",
   "repository": {
@@ -169,6 +169,48 @@
         "title": "Kill Team",
         "icon": "$(trash)",
         "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.orchestration.killAll",
+        "title": "Kill All Orchestration Sessions (Emergency Reset)",
+        "icon": "$(warning)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.liveTest",
+        "title": "Live Multi-Pane Test (v2.7.0 prototype — 2 Claudes)",
+        "icon": "$(beaker)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.orchestrate",
+        "title": "Orchestrated Team (v2.7.2 — leader + 2 workers)",
+        "icon": "$(organization)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.orchestrate.resume",
+        "title": "Orchestrated Team — Resume Leader Session (v2.7.12)",
+        "icon": "$(history)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.dissolve",
+        "title": "Dissolve Team (v2.7.8 — summarize workers, kill panes, inject into leader)",
+        "icon": "$(close-all)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.snapshot.save",
+        "title": "Save Team Snapshot (v2.7.19)",
+        "icon": "$(save)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.snapshot.load",
+        "title": "Open Saved Team... (v2.7.19)",
+        "icon": "$(folder-opened)",
+        "category": "Podium"
       },
       {
         "command": "claudeCodeLauncher.team.rename",
@@ -473,6 +515,11 @@
           "when": "view == claudeCodeLauncher.teamsOrchestration"
         },
         {
+          "command": "claudeCodeLauncher.orchestration.killAll",
+          "group": "navigation@3",
+          "when": "view == claudeCodeLauncher.teamsOrchestration"
+        },
+        {
           "command": "claudeCodeLauncher.podium.dashboard",
           "group": "navigation@1",
           "when": "view == claudeCodeLauncher.hudPanel"
@@ -677,7 +724,9 @@
     "package": "vsce package",
     "probe:pty": "node scripts/probe/pty-smoke.js",
     "clean": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\"",
-    "lint": "tsc -p ./ --noEmit"
+    "lint": "tsc -p ./ --noEmit",
+    "build:test": "tsc -p ./tsconfig.test.json",
+    "test": "npm run build:test && node --test .test-out/test/unit/*.test.js"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",

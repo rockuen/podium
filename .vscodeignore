@@ -29,8 +29,13 @@ scripts/**
 
 # --- Build configuration / tooling ---
 tsconfig.json
+tsconfig.test.json
 esbuild.webview.config.mjs
 esbuild.config.mjs
+
+# --- Tests (source + build output, not shipped) ---
+test/**
+.test-out/**
 
 # --- Local runtime state / editor config ---
 .omc/**

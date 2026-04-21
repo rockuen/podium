@@ -13,6 +13,9 @@ import { buildSharedWebviewCss } from './webviewTheme';
 import { execFile } from 'child_process';
 import type { ProviderHealthChecker } from '../core/ProviderHealthChecker';
 import type { ProviderHealth } from '../types/provider';
+import type { IMultiplexerBackend } from '../backends/IMultiplexerBackend';
+import { spawnInlineTeam } from '../core/InlineTeamSpawner';
+import { dispatchOmcTeamInLeaderSession } from '../core/OmcCoordinator';
 
 interface LauncherPodiumSession {
   sessionId: string;
@@ -63,6 +66,7 @@ export class SpawnTeamPanel {
     private readonly manager: PodiumManager,
     private readonly output: vscode.OutputChannel,
     private readonly health: ProviderHealthChecker,
+    private readonly backend: IMultiplexerBackend,
   ) {
     panel.webview.html = this.buildHtml();
     panel.webview.onDidReceiveMessage((m) => this.onMessage(m));
@@ -87,6 +91,7 @@ export class SpawnTeamPanel {
     manager: PodiumManager,
     output: vscode.OutputChannel,
     health: ProviderHealthChecker,
+    backend: IMultiplexerBackend,
   ): SpawnTeamPanel {
     if (SpawnTeamPanel.current) {
       SpawnTeamPanel.current.panel.reveal(vscode.ViewColumn.Active, false);
@@ -103,7 +108,7 @@ export class SpawnTeamPanel {
         localResourceRoots: [vscode.Uri.joinPath(context.extensionUri, 'out', 'orchestration', 'webview')],
       },
     );
-    const instance = new SpawnTeamPanel(panel, context, runtime, manager, output, health);
+    const instance = new SpawnTeamPanel(panel, context, runtime, manager, output, health, backend);
     SpawnTeamPanel.current = instance;
     return instance;
   }
@@ -316,58 +321,25 @@ export class SpawnTeamPanel {
    * Claude pane to be the leader, so the default split-pane layout is correct.
    */
   private async dispatchViaTmuxSession(spec: TeamSpec, cwd: string, sessionId: string): Promise<void> {
-    const sessions = listLauncherPodiumSessions(cwd);
-    const target = sessions.find((s) => s.sessionId === sessionId);
-    if (!target) {
-      throw new Error(
-        `Podium-ready session ${sessionId.slice(0, 8)}… not found in this cwd. Is it still running?`,
-      );
-    }
-
-    const muxBin = process.platform === 'win32' ? 'psmux' : 'tmux';
-    const slugSeed = buildSafeTeamSeed();
-    const seededPrompt = `${slugSeed}. ${spec.prompt}`;
-
-    // Write display sidecar — same behaviour as dispatchShell.
-    try {
-      const displayName = autoDisplayName(spec.prompt);
-      writeTeamDisplay(cwd, slugSeed, {
-        displayName,
-        initialPrompt: spec.prompt,
-        createdAt: Date.now(),
-      });
-      this.output.appendLine(
-        `[podium.spawn] display sidecar written: "${displayName}" → ${slugSeed}`,
-      );
-    } catch (err) {
-      this.output.appendLine(
-        `[podium.spawn] display sidecar write failed (non-fatal): ${err instanceof Error ? err.message : err}`,
-      );
-    }
-
-    // Build the shell string. tmux send-keys passes the whole string as-is,
-    // so we escape double-quotes in the prompt. Using printf to preserve
-    // newlines and avoid subshell expansion oddities.
-    const escapedPrompt = seededPrompt.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
-    const slotStr = normalizeSlots(spec.slots).map((s) => `${s.count}:${s.model}`).join(',');
-    const cmdString = `omc team ${slotStr} "${escapedPrompt}"`;
-
-    this.output.appendLine(
-      `[podium.spawn] leader=current-session tmux=${target.tmuxSession} cmd="${cmdString.slice(0, 120)}…"`,
+    // v2.6.44 (Phase 0) — "existing session" dispatch path temporarily
+    // disabled pending the v2.7 node-pty orchestrator rewrite. See
+    // 260421 Podium 세션 확장-축소 모델.md v2.
+    //
+    // Known-broken attempts:
+    //   v2.6.39  — psmux split raw CLI panes (no orchestration, workers mute)
+    //   v2.6.41  — send-keys `omc team` into leader Claude (Claude parses as chat)
+    //   v2.6.42  — bash coordinator pane + omc team (Windows psmux split dies)
+    //   v2.6.43  — +setServerOption('default-shell', bash) (path-with-spaces breaks psmux)
+    //
+    // Until v2.7 orchestrator lands, route users to the "Shell new-terminal"
+    // mode, which produces a working standalone `omc-team-*` psmux session
+    // with real agent conversation (B mode).
+    void sessionId; void cwd; void spec;
+    throw new Error(
+      'Spawning into an existing Podium session is temporarily disabled (v2.6.44). ' +
+      'Use "Shell new-terminal" mode instead — it creates a standalone omc team with full agent conversation. ' +
+      'A node-pty based orchestrator is landing in v2.7 that will restore (and improve) the existing-session flow.',
     );
-    this.postStatus(
-      'running',
-      `injecting omc team into ${target.title} (${target.tmuxSession})…`,
-    );
-
-    // 1) send-keys the command string (no Enter yet) so readline parses it
-    // 2) send-keys Enter to submit. Separate calls avoid quoting pitfalls
-    // when the prompt itself contains backticks / special chars.
-    const target1 = `${target.tmuxSession}:0`;
-    await runMuxCmd(muxBin, ['send-keys', '-t', target1, cmdString]);
-    await runMuxCmd(muxBin, ['send-keys', '-t', target1, 'Enter']);
-
-    this.output.appendLine('[podium.spawn] leader inject ok (send-keys Enter delivered)');
   }
 
   private async dispatchShell(spec: TeamSpec, cwd: string): Promise<void> {

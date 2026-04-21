@@ -28,6 +28,8 @@ const entries = [
   ['src/orchestration/webview/multipane-main.ts',          'out/orchestration/webview/multipane.js'],
   ['src/orchestration/webview/terminal-main.ts',           'out/orchestration/webview/terminal.js'],
   ['src/orchestration/webview/ccg-viewer-main.ts',         'out/orchestration/webview/ccg-viewer.js'],
+  // Phase 1 (v2.7.0) — LiveMultiPanel: N live node-pty panes in one webview.
+  ['src/orchestration/webview/live-multipane-main.ts',     'out/orchestration/webview/live-multipane.js'],
 ];
 
 const configs = entries

@@ -20,21 +20,22 @@ const LEADER_CONF_FILE = path.join(LEADER_CONF_DIR, 'tmux-leader.conf');
 
 // Minimal chrome: status bar off, no window rename, no title escape — keeps
 // the webview terminal looking like a normal Claude CLI. Mouse reporting is
-// enabled so xterm.js can still deliver click events through tmux's pass-thru.
+// OFF so xterm.js can deliver its own drag text selection.
 const LEADER_CONF_BODY = [
   '# Podium launcher: leader-pane tmux conf (managed, do not edit by hand)',
   'set -g status off',
-  '# v2.6.19: mouse ON restored. With mouse off (v2.6.15), tmux dropped the SGR',
-  '# wheel reports that xterm.js wheel-forward emits, so the inner TUI never',
-  '# saw scroll events and Claude fullscreen scrollback was unreachable.',
-  '# The v2.6.15 regression this originally addressed (drag auto-clear killing',
-  '# native text selection) is mitigated by unbinding drag→copy-mode entries',
-  '# below — xterm.js keeps its own text selection intact, while wheel events',
-  '# are still passed through to the inner program.',
-  'set -g mouse on',
-  'unbind-key -T root MouseDrag1Pane',
-  'unbind-key -T copy-mode MouseDragEnd1Pane',
-  'unbind-key -T copy-mode-vi MouseDragEnd1Pane',
+  '# v2.6.25: mouse OFF — restores xterm native drag text selection.',
+  '# Background: v2.6.19 tried "mouse ON + unbind MouseDrag1Pane" to keep',
+  '# native text selection alive while preserving wheel-scroll passthrough.',
+  '# That assumption was wrong: xterm.js disables its native selection the',
+  '# moment terminal-side mouse tracking is active, regardless of whether',
+  '# tmux later drops the event. The drag bytes just went to /dev/null on',
+  '# the tmux side; xterm was still in passthrough mode so the highlight',
+  '# never drew. Reverting to mouse off restores xterm native drag select.',
+  '# Wheel scroll now stays inside xterm (its own scrollback buffer) — same',
+  '# visible behavior for normal-screen output. For tmux copy-mode history',
+  '# (e.g. in alt-screen TUIs), use prefix+[ (keyboard).',
+  'set -g mouse off',
   'set -g set-titles off',
   'set -g allow-rename off',
   'set -g history-limit 50000',

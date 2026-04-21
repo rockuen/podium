@@ -105,6 +105,16 @@ export class MultiPaneTerminalPanel {
         await this.pushInit();
         return;
       }
+      if (m.type === 'copy-selection') {
+        const text = (m as { text?: unknown }).text;
+        if (typeof text === 'string' && text) {
+          // v2.6.28: auto-copy webview drag selection on mouseup.
+          void vscode.env.clipboard.writeText(text).then(undefined, (err) => {
+            this.output.appendLine(`[podium.multipane] clipboard write failed: ${err}`);
+          });
+        }
+        return;
+      }
       if (m.type === 'kill' && typeof m.paneId === 'string') {
         const target = m.paneId;
         try {
