@@ -7,7 +7,12 @@ import type {
   PaneExitEvent,
 } from '../../src/orchestration/ui/LiveMultiPanel';
 import type { Summarizer } from '../../src/orchestration/core/summarizer';
-import { buildSummaryPrompt, filterTranscriptChrome } from '../../src/orchestration/core/summarizer';
+import {
+  buildSummaryPrompt,
+  claudeBareSummarizer,
+  extractLastAssistantBullet,
+  filterTranscriptChrome,
+} from '../../src/orchestration/core/summarizer';
 
 // ─── Test doubles (mirrors podiumOrchestrator.test.ts) ───
 
@@ -243,6 +248,41 @@ test('filter v2.7.20: Ink spinner status rows (Processing…/Shenaniganing…) a
     'all spinner rows dropped');
 });
 
+test('filter v2.7.23: spinner word without Braille glyph is also dropped (Osmosing…/Quantumizing…)', () => {
+  // v2.7.23 regression: Ink emits status words on their own line when the
+  // Braille glyph falls on a prior chunk boundary, or during specific cycle
+  // variants. v2.7.20's Braille-required regex missed these, reviving the
+  // "can't extract final answer" failure.
+  const raw = [
+    'Osmosing…',
+    'Quantumizing… (5s)',
+    '  Synthesizing…',
+    '●  빨강, 파랑, 초록',
+    'Percolating…',
+  ].join('\n');
+  const out = filterTranscriptChrome(raw);
+  assert.ok(out.includes('빨강, 파랑, 초록'), 'answer bullet preserved');
+  assert.ok(!/Osmosing…|Quantumizing…|Synthesizing…|Percolating…/.test(out),
+    'bare-word spinner rows dropped even without Braille prefix');
+});
+
+test('filter v2.7.23: numeric + Korean answers are NOT misclassified as spinner', () => {
+  // Regression guard: the broadened regex must not swallow legitimate
+  // worker answers. "110" is a numeric answer; Korean prose has no trailing
+  // ellipsis; short phrases with `…` but non-ASCII leading chars must pass.
+  const raw = [
+    '●  110',
+    '●  빨강, 파랑, 초록',
+    '결과만 적어주세요.',
+    '…앞뒤 말줄임표 있는 한글',
+  ].join('\n');
+  const out = filterTranscriptChrome(raw);
+  assert.ok(out.includes('110'), 'numeric answer preserved');
+  assert.ok(out.includes('빨강, 파랑, 초록'), 'korean answer preserved');
+  assert.ok(out.includes('결과만 적어주세요'), 'korean prose preserved');
+  assert.ok(out.includes('앞뒤 말줄임표 있는 한글'), 'non-ASCII leading line preserved');
+});
+
 test('filter v2.7.20: "(esc to interrupt ...)" keyboard hint banner is dropped', () => {
   const raw = [
     '●  빨강, 파랑, 초록',
@@ -279,4 +319,67 @@ test('filter v2.7.20: realistic Ink-flooded transcript preserves answer in -1500
   // so the answer survives into the tail window used by buildSummaryPrompt.
   const tail = filtered.slice(-1500);
   assert.ok(tail.includes('빨강, 파랑, 초록'), 'answer survives into -1500 tail');
+});
+
+// v2.7.24: Deterministic `●` bullet extraction + hybrid summarizer.
+
+test('extract v2.7.24: single-line `● <content>` returns content only', () => {
+  const out = extractLastAssistantBullet('user prompt echo\n\n●  빨강, 파랑, 초록\n\n>');
+  assert.equal(out, '빨강, 파랑, 초록');
+});
+
+test('extract v2.7.24: numeric single-token bullet (` ●  110 `)', () => {
+  const out = extractLastAssistantBullet('user asked for sum\n\n●  110\n\n>');
+  assert.equal(out, '110');
+});
+
+test('extract v2.7.24: multi-line indented continuation is joined with spaces', () => {
+  const raw = [
+    '●  The translations:',
+    '   red: 빨강',
+    '   blue: 파랑',
+    '   green: 초록',
+    '',
+    '>',
+  ].join('\n');
+  const out = extractLastAssistantBullet(raw);
+  assert.equal(out, 'The translations: red: 빨강 blue: 파랑 green: 초록');
+});
+
+test('extract v2.7.24: returns LAST bullet when multiple are present', () => {
+  const raw = [
+    '●  intermediate thought',
+    '',
+    '●  final answer',
+    '',
+    '>',
+  ].join('\n');
+  assert.equal(extractLastAssistantBullet(raw), 'final answer');
+});
+
+test('extract v2.7.24: returns null when no bullet present', () => {
+  const raw = 'just user text\nno assistant output\n>';
+  assert.equal(extractLastAssistantBullet(raw), null);
+});
+
+test('summarizer v2.7.24: skips Haiku entirely when every worker has a bullet', async () => {
+  // Use the real claudeBareSummarizer. Since both workers have `●` bullets,
+  // no CLI call should happen — the summary is constructed deterministically.
+  // If Haiku were called in this test env it would fail (no claude CLI in PATH
+  // of the test runner), so a fast successful return proves the happy path.
+  const items = [
+    {
+      workerId: 'worker-1',
+      transcript: 'user asked to translate\n●  빨강, 파랑, 초록\n>\n[OMC#4.12.0] | status',
+    },
+    {
+      workerId: 'worker-2',
+      transcript: 'user asked for even sum\n●  110\n>\n[OMC#4.12.0] | status',
+    },
+  ];
+  const t0 = Date.now();
+  const out = await claudeBareSummarizer(items);
+  const elapsed = Date.now() - t0;
+  assert.equal(out, '- worker-1: 빨강, 파랑, 초록\n- worker-2: 110');
+  assert.ok(elapsed < 500, `deterministic path should be instant (took ${elapsed}ms)`);
 });

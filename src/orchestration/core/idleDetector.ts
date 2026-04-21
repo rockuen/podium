@@ -74,12 +74,13 @@ const DEFAULTS = {
 //       ╰─────────────╯
 const PROMPT_PATTERNS: Record<AgentKind, RegExp[]> = {
   claude: [
-    /^╰─+╯\s*$/,                 // boxed bottom border
-    /^│\s*>\s*$/,                // boxed input row (empty)
-    /^│\s*>\s+/,                 // boxed input row (with content)
+    /^\s*╰─+╯\s*$/,              // boxed bottom border
+    /^\s*│\s*>\s*$/,             // boxed input row (empty)
+    /^\s*│\s*>\s+/,              // boxed input row (with content)
     /^\s*╰──+/,                  // boxed bottom border (loose)
-    /^>\s*$/,                    // v2.1+ plain prompt row
-    /^\[OMC#[\d.]+\]\s*\|/,      // v2.1+ OMC status line (appears only at idle)
+    /^\s*>\s*$/,                 // v2.1+ plain prompt row (v2.7.22: allow leading ws)
+    /^\s*\[OMC#[\d.]+\]\s*\|/,   // v2.1+ OMC status line (v2.7.22: allow leading ws)
+    /^\s*⏵⏵\s+bypass permissions/, // v2.7.22: bypass hint appears immediately after prompt
   ],
   // Codex CLI prints `user> ` at column 0 when awaiting input.
   codex: [/^user>\s*$/, /^user>\s+/],

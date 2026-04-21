@@ -157,6 +157,13 @@ const INJECT_SUBMIT_DELAY_MS = 25;
 // `dispatchDebounceMs` > 0 (production); tests default to 0 (synchronous).
 const DEFAULT_DISPATCH_DEBOUNCE_MS = 0;
 
+// v2.7.22: "busy" threshold for the pre-dissolve UX warning. If a worker's
+// last real output was more recent than this many ms, show the modal. See
+// `busyWorkers()` for the full rationale (prompt-pattern eviction under
+// Ink flood). Tuned to avoid warning during normal Ink re-wrap gaps while
+// still catching actively-emitting workers.
+const BUSY_WARN_MS = 2000;
+
 export class PodiumOrchestrator implements vscode.Disposable {
   private readonly parser = new WorkerPatternParser();
   private readonly workers = new Map<string, WorkerRuntime>();
@@ -299,6 +306,35 @@ export class PodiumOrchestrator implements vscode.Disposable {
     };
   }
 
+  /**
+   * v2.7.21 → v2.7.22 · Report which workers have emitted output recently.
+   * Used by the dissolve command to warn the user before summarizing.
+   *
+   * v2.7.22 fix: we intentionally do NOT gate on `IdleDetector.isIdle` here.
+   * `isIdle` requires BOTH silence AND a recognized prompt pattern in the
+   * rolling tail — but Claude v2.1+'s Ink TUI repaints the status row
+   * (`[OMC#…]`, `⏵⏵ bypass …`) many times per second even while the
+   * worker sits idle post-answer, which evicts the actual `>` prompt line
+   * out of `rollingTail` within seconds. A worker silent for 48s would
+   * still be reported "busy" — false positive blocking the user's dissolve.
+   *
+   * For the UX warning, "has there been recent output?" is the right
+   * question. If the last real output was > BUSY_WARN_MS ago, summarizing
+   * is safe (transcript tail has settled). 2s is generous: enough to avoid
+   * warning during brief Ink re-wrap gaps, short enough to not stall the
+   * user when a worker genuinely finished ~1s ago.
+   */
+  busyWorkers(): { id: string; msSinceOutput: number }[] {
+    const out: { id: string; msSinceOutput: number }[] = [];
+    for (const w of this.workers.values()) {
+      const ms = w.idle.msSinceOutput;
+      if (ms < BUSY_WARN_MS) {
+        out.push({ id: w.cfg.id, msSinceOutput: ms });
+      }
+    }
+    return out;
+  }
+
   private onPaneData(paneId: string, rawData: string): void {
     if (this.leader && paneId === this.leader.paneId) {
       this.leaderIdle?.feed(rawData);
@@ -406,6 +442,15 @@ export class PodiumOrchestrator implements vscode.Disposable {
   }
 
   private consumeLeaderOutput(rawData: string): void {
+    // v2.7.21 · After dissolve the workers Map is cleared but the leader
+    // pane stays alive. Ink keeps repainting the scrollback (including old
+    // `@worker-N:` directives), which previously produced a stream of
+    // "leader referenced unknown" log entries. With zero workers there's
+    // nothing to route to — short-circuit before the projector accumulates
+    // ghost state. Leader's pty → webview rendering is unaffected (that
+    // flow is handled by LiveMultiPanel, not here).
+    if (this.workers.size === 0) return;
+
     const cleaned = stripAnsi(rawData);
     const projected = this.leaderProjector ? this.leaderProjector.feed(cleaned) : cleaned;
 

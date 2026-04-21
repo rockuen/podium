@@ -851,6 +851,35 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     }),
   );
 
+  // ─── Phase 4.A · v2.7.21 — Team Snapshot: rename ───
+  // Picks an existing snapshot, prompts for a new name, and re-saves.
+  // `saveSnapshot` dedupes by id so the renamed entry replaces the old one
+  // and gets bumped to the front of the list (treated as "most recent").
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.snapshot.rename', async () => {
+      output.appendLine('[orch.snapshot.rename] invoked');
+      const file = resolveSnapshotPath();
+      const snap = await pickSnapshot(file);
+      if (!snap) {
+        output.appendLine('[orch.snapshot.rename] cancelled — no snapshot picked');
+        return;
+      }
+      const newName = await promptSnapshotName(snap.name);
+      if (!newName || newName === snap.name) {
+        output.appendLine('[orch.snapshot.rename] cancelled — no name change');
+        return;
+      }
+      try {
+        await saveSnapshot(file, { ...snap, name: newName });
+        output.appendLine(`[orch.snapshot.rename] "${snap.name}" → "${newName}"`);
+        vscode.window.showInformationMessage(`Podium snapshot renamed: "${newName}"`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        vscode.window.showErrorMessage(`Podium snapshot rename failed: ${msg}`);
+      }
+    }),
+  );
+
   // ─── Phase 3 · v2.7.8 — Dissolve the active orchestrator's workers ───
   // Kills every worker pane, asks `claude --bare -p --model haiku` for a
   // short summary of their transcripts, then injects that summary into the
@@ -866,6 +895,30 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       // If multiple sessions exist (e.g. user ran Orchestrate twice), dissolve
       // the most recent one by insertion order. Rare case; MVP behavior.
       const target = active[active.length - 1];
+
+      // v2.7.21 · Warn before summarizing workers that haven't gone idle.
+      // Dissolve captures the transcript tail — if a worker is still emitting
+      // or hasn't printed its final prompt, the summary will miss the answer
+      // (see v2.7.20 regression log).
+      const busy = target.busyWorkers();
+      if (busy.length > 0) {
+        const detail = busy
+          .map((b) => `${b.id} (last output ${b.msSinceOutput}ms ago)`)
+          .join(', ');
+        const pick = await vscode.window.showWarningMessage(
+          `Podium: ${busy.length} worker(s) still active — ${detail}. ` +
+            `Dissolving now will likely summarize an incomplete transcript. Continue?`,
+          { modal: true },
+          'Dissolve anyway',
+          'Cancel',
+        );
+        if (pick !== 'Dissolve anyway') {
+          output.appendLine(`[orch.dissolve-cmd] cancelled by user — busy workers: ${detail}`);
+          return;
+        }
+        output.appendLine(`[orch.dissolve-cmd] user confirmed dissolve despite busy: ${detail}`);
+      }
+
       await vscode.window.withProgress(
         {
           location: vscode.ProgressLocation.Notification,

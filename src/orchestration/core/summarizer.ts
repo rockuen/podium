@@ -97,9 +97,26 @@ export function filterTranscriptChrome(raw: string): string {
   const DOCTOR_RE = /^.*Found \d+ settings? issue.*\/doctor.*$/;
   const BANNER_RE =
     /^\s*(?:Claude Code\s+v[\d.]+|Opus\s+[\d.]+.*context|Sonnet\s+[\d.]+.*context|Haiku\s+[\d.]+.*context|Claude Max|c:\\.*Brain)\s*$/i;
-  // v2.7.20: Ink spinner status row.
-  // Shape: "<braille-glyph> <word>…[ optional trailing hint]"
-  const SPINNER_RE = /^\s*[⠀-⣿]\s+\S.*…/;
+  // v2.7.20 + v2.7.23: Ink spinner status row.
+  //
+  // v2.7.20 shape: "<braille-glyph> <word>…[ optional trailing hint]"
+  //   e.g. "⠋ Processing…", "⠙ Shenaniganing…"
+  //
+  // v2.7.23 regression: Claude v2.1+ Ink also emits the word on its own line
+  // without the Braille glyph when chunk boundaries fall mid-render, or for
+  // specific status cycle variants observed as "Osmosing…", "Quantumizing…",
+  // "Synthesizing…" etc. These slipped past the original regex and crowded
+  // out the `●` answer bullet under the -MAX_CHARS_PER_WORKER tail slice,
+  // reviving the v2.7.19 "can't extract final answer" failure.
+  //
+  // Pattern: optional Braille glyph + Capitalized word (letters only) + `…`.
+  // Trailing content after `…` is allowed (e.g. "(3s · esc to interrupt)").
+  //
+  // Non-match examples (intentional):
+  //   "● 빨강, 파랑, 초록"     — answer bullet (doesn't start with [A-Z])
+  //   "110"                    — numeric answer
+  //   "결과만 적어주세요."      — prose (no trailing ellipsis)
+  const SPINNER_RE = /^\s*(?:[⠀-⣿]\s+)?[A-Z][a-zA-Z]+…/;
   // v2.7.20: Keyboard hint under the status row.
   const ESC_HINT_RE = /^\s*\(\s*esc to interrupt.*\)\s*$/;
 
@@ -128,6 +145,8 @@ export function buildSummaryPrompt(items: readonly TranscriptItem[]): string {
   const header =
     "You are summarizing terminal transcripts from parallel Claude workers. " +
     "Each worker was given one small task. Extract the final answer each worker produced. " +
+    "Answer lines are normally prefixed with the bullet glyph ● (U+25CF) — the text after ● IS the answer; " +
+    "copy it verbatim. If you see a ● line, never claim the answer is missing. " +
     "The transcripts have been pre-filtered to remove most CLI chrome, but a few status fragments may remain — ignore them. " +
     "Output in exactly this format, one bullet per worker, 1 short sentence each:\n" +
     "- <workerId>: <answer>\n\n" +
@@ -142,8 +161,60 @@ export function buildSummaryPrompt(items: readonly TranscriptItem[]): string {
   return header + body;
 }
 
+/**
+ * v2.7.24 · Deterministic answer extraction.
+ *
+ * Claude Code v2.1+ renders every assistant response with a `●` bullet
+ * (U+25CF) glyph at column 0, followed by the answer content on the same
+ * line, optionally continued on subsequent indented lines. This is far
+ * more reliable to grep for than to ask Haiku about — Haiku has a bad
+ * habit of returning "transcript corrupted" or "answer not visible" even
+ * when the bullet is plainly there (see v2.7.19/v2.7.20/v2.7.23 regressions).
+ *
+ * Strategy: walk `filtered` backward, find the last line matching
+ * `^<ws>●<ws><content>$`, return `<content>` plus any following indented
+ * continuation lines up to the next blank line or dedent. Returns `null`
+ * when no bullet is present (e.g. worker crashed or never replied) — the
+ * caller falls back to Haiku.
+ */
+export function extractLastAssistantBullet(filtered: string): string | null {
+  const lines = filtered.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = lines[i].match(/^(\s*)●\s+(.+?)\s*$/);
+    if (!m || m[2].length === 0) continue;
+    const bulletIndent = m[1].length;
+    const parts = [m[2]];
+    // Gather continuation: lines indented past the bullet position, stopping
+    // at the first blank line or dedent.
+    for (let j = i + 1; j < lines.length; j++) {
+      const line = lines[j];
+      if (!line.trim()) break;
+      const leading = line.match(/^(\s*)/)?.[1].length ?? 0;
+      if (leading > bulletIndent) parts.push(line.trim());
+      else break;
+    }
+    return parts.join(' ');
+  }
+  return null;
+}
+
 export const claudeBareSummarizer: Summarizer = async (items) => {
   if (items.length === 0) return '';
+
+  // v2.7.24: Try deterministic bullet extraction first. If every worker
+  // has a visible `●` assistant answer in its filtered transcript, skip
+  // Haiku entirely — the result is exact, instant, and cannot hallucinate.
+  const extracted = items.map((i) => ({
+    workerId: i.workerId,
+    bullet: extractLastAssistantBullet(filterTranscriptChrome(i.transcript)),
+  }));
+  if (extracted.every((e) => e.bullet)) {
+    return extracted.map((e) => `- ${e.workerId}: ${e.bullet}`).join('\n');
+  }
+
+  // Mixed case: at least one worker has no bullet (crashed / silent / odd
+  // output). Fall back to Haiku for the whole batch so it can reason about
+  // all transcripts together and match answers to worker IDs.
   const prompt = buildSummaryPrompt(items);
   return callClaudeOneshot(prompt);
 };

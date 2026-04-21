@@ -279,6 +279,74 @@ test('orch: onAutoSnapshot fires with "dissolve" source after dissolve injects s
   orch.dispose();
 });
 
+test('orch v2.7.22: busyWorkers() uses msSinceOutput-only (prompt-pattern independent)', () => {
+  // v2.7.22 regression: under Ink flood, `isIdle`'s prompt-pattern gate
+  // could return false for 48s+ even after the worker fell silent, because
+  // status-row repaints evicted the `>` line from the rolling tail.
+  // busyWorkers() must rely on silence duration only for the UX warn.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [
+      { id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 100 },
+      { id: 'worker-2', paneId: 'W2', agent: 'claude', silenceMs: 100 },
+    ],
+    now: clock.now,
+    skipAutoTick: true,
+  });
+
+  // Fresh output → both busy (msSinceOutput = 0).
+  ctl.firePaneData({ paneId: 'W1', data: 'still thinking…\n' });
+  ctl.firePaneData({ paneId: 'W2', data: 'more output\n' });
+  let busy = orch.busyWorkers();
+  assert.equal(busy.length, 2);
+  assert.deepEqual(busy.map((b) => b.id).sort(), ['worker-1', 'worker-2']);
+
+  // Advance past BUSY_WARN_MS (2000) WITHOUT feeding a prompt line —
+  // simulates the Ink-flood scenario where `>` is evicted but silence passed.
+  clock.advance(2500);
+  assert.equal(orch.busyWorkers().length, 0, 'silence >= 2s → no warning, prompt not required');
+
+  // Fresh burst on W2 only → W2 busy again, W1 still quiet.
+  ctl.firePaneData({ paneId: 'W2', data: 'new burst\n' });
+  busy = orch.busyWorkers();
+  assert.equal(busy.length, 1);
+  assert.equal(busy[0].id, 'worker-2');
+  assert.ok(busy[0].msSinceOutput < 2000);
+  orch.dispose();
+});
+
+test('orch v2.7.21: post-dissolve ghost @worker directive is silently ignored (no "unknown worker" log)', async () => {
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel, async () => 'ok');
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+  });
+
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(100);
+
+  await orch.dissolve();
+  assert.equal(orch.snapshot.stats.dropped, 0, 'dispose baseline — no drops pre-ghost');
+
+  // Ink-style ghost repaint: leader scrollback still shows the @worker-1 directive.
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: ghost payload from scrollback\n' });
+
+  assert.equal(orch.snapshot.stats.dropped, 0, 'no dropped dispatch — parser short-circuited on empty workers');
+  const ghostLogs = out.log.filter((l) => l.includes('referenced unknown'));
+  assert.equal(ghostLogs.length, 0, 'no "leader referenced unknown" log lines');
+
+  orch.dispose();
+});
+
 test('orch: dedup suppresses redraw repeats within the window', () => {
   const ctl = makeFakePanel();
   const out = makeOutputChannel();

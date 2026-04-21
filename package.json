@@ -2,7 +2,7 @@
   "name": "cli-launcher-for-claude",
   "displayName": "CLI Launcher for Claude",
   "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
-  "version": "2.7.20",
+  "version": "2.7.24",
   "publisher": "rockuen",
   "license": "MIT",
   "repository": {
@@ -210,6 +210,12 @@
         "command": "claudeCodeLauncher.podium.snapshot.load",
         "title": "Open Saved Team... (v2.7.19)",
         "icon": "$(folder-opened)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.snapshot.rename",
+        "title": "Rename Saved Team... (v2.7.21)",
+        "icon": "$(edit)",
         "category": "Podium"
       },
       {
