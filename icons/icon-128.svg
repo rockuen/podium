@@ -1,25 +1,47 @@
 <svg width="128" height="128" viewBox="0 0 128 128" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
-      <stop offset="0%" stop-color="#1a1a2e"/>
-      <stop offset="100%" stop-color="#16213e"/>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1e1b4b"/>
+      <stop offset="100%" stop-color="#312e81"/>
     </linearGradient>
+    <linearGradient id="center" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fde68a"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+    <linearGradient id="side" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#c4b5fd"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <radialGradient id="spot" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0%" stop-color="#fef3c7" stop-opacity="0.35"/>
+      <stop offset="70%" stop-color="#fef3c7" stop-opacity="0"/>
+    </radialGradient>
   </defs>
+
+  <!-- Background -->
   <rect width="128" height="128" rx="24" fill="url(#bg)"/>
-  <!-- Robot body -->
-  <rect x="34" y="48" width="60" height="48" rx="12" fill="#D97757"/>
-  <!-- Eyes -->
-  <rect x="46" y="60" width="14" height="12" rx="3" fill="#fff"/>
-  <rect x="68" y="60" width="14" height="12" rx="3" fill="#fff"/>
-  <!-- Mouth -->
-  <rect x="50" y="80" width="28" height="6" rx="3" fill="#fff"/>
-  <!-- Antenna -->
-  <line x1="64" y1="28" x2="64" y2="48" stroke="#D97757" stroke-width="6" stroke-linecap="round"/>
-  <circle cx="64" cy="24" r="7" fill="#D97757"/>
-  <!-- Arms -->
-  <rect x="18" y="58" width="12" height="22" rx="6" fill="#D97757"/>
-  <rect x="98" y="58" width="12" height="22" rx="6" fill="#D97757"/>
-  <!-- Terminal cursor blink -->
-  <rect x="54" y="100" width="3" height="8" rx="1" fill="#4caf50" opacity="0.8"/>
-  <rect x="60" y="100" width="12" height="8" rx="1" fill="#4caf50" opacity="0.4"/>
+
+  <!-- Spotlight halo behind leader -->
+  <circle cx="64" cy="40" r="34" fill="url(#spot)"/>
+
+  <!-- Left pedestal (worker) -->
+  <rect x="16" y="80" width="30" height="36" rx="3" fill="url(#side)"/>
+
+  <!-- Right pedestal (worker) -->
+  <rect x="82" y="80" width="30" height="36" rx="3" fill="url(#side)"/>
+
+  <!-- Center pedestal (leader, tallest) -->
+  <rect x="48" y="60" width="32" height="56" rx="3" fill="url(#center)"/>
+
+  <!-- Left agent (small dot) -->
+  <circle cx="31" cy="68" r="6" fill="#ede9fe"/>
+
+  <!-- Right agent (small dot) -->
+  <circle cx="97" cy="68" r="6" fill="#ede9fe"/>
+
+  <!-- Center agent (leader — bright, larger) -->
+  <circle cx="64" cy="42" r="9" fill="#fef9c3"/>
+
+  <!-- Floor line -->
+  <rect x="8" y="114" width="112" height="3" rx="1.5" fill="#4c1d95" opacity="0.6"/>
 </svg>

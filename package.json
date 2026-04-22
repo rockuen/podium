@@ -1,8 +1,21 @@
 {
   "name": "podium",
-  "displayName": "Podium CLI Launcher for Claude",
-  "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
-  "version": "0.0.1",
+  "displayName": "Podium — Multi-Agent Stage for Claude Code",
+  "description": "Orchestrate multi-agent Claude teams from one stage — leader + worker panes with structured routing, idle detection, team snapshots, and dissolve-with-summary. Or run a solo Claude Code session in a rich Webview tab.",
+  "version": "0.1.0",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "ai",
+    "agent",
+    "multi-agent",
+    "orchestration",
+    "team",
+    "terminal",
+    "tmux",
+    "webview"
+  ],
   "publisher": "rockuen",
   "license": "MIT",
   "repository": {

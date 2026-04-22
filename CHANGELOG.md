@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.1.0] - 2026-04-22
+
+### Brand identity refresh
+
+Podium's visual and narrative identity is now distinct from its CLI Launcher ancestor. Prior v0.0.1 shipped the original orange "Claude robot on terminal" icon and a README that positioned the extension as a rich CLI wrapper — both carried too much legacy silhouette.
+
+- **New extension icon** (`icons/icon-128.png`, `icons/icon-128.svg`) — three-tier indigo podium with a bright leader spotlight and two worker dots. Instantly reads as "multi-agent stage," zero overlap with terminal/CLI imagery.
+- **New toolbar icon** (`icons/claude-robot.svg`) — monochrome podium silhouette that uses `currentColor` to theme-adapt on both light and dark VSCode themes. Previously a 16×16 orange robot face; now a 16×16 stage-platform silhouette.
+- **README rewritten** — leads with "Orchestrate multi-agent Claude teams from one stage," splits features into **Orchestration Mode** (leader + workers, routing, snapshots, dissolve-with-summary) and **Solo Mode** (single Claude tab with the old CLI Launcher extras). Adds `History` section documenting the 2026-04-22 rebrand.
+- **Marketplace metadata** (`package.json`) —
+  - `displayName`: `"Podium CLI Launcher for Claude"` → `"Podium — Multi-Agent Stage for Claude Code"` (keeps product name up front but removes "launcher" framing)
+  - `description`: expanded from single-line CLI wrapper pitch to a two-mode pitch
+  - `keywords`: 11 entries added (`claude`, `claude-code`, `anthropic`, `ai`, `agent`, `multi-agent`, `orchestration`, `team`, `terminal`, `tmux`, `webview`) for Open VSX discoverability
+
+### No functional change
+
+- All source code, commands (`claudeCodeLauncher.*` prefix preserved for back-compat), configuration keys, and tests are unchanged from v0.0.1.
+- 142/142 tests continue to pass (no code path touched).
+
+### Ongoing
+
+This release is the first pass of a larger brand-differentiation effort. Remaining pieces (tab status icons, theme palette defaults, Welcome/panel layout, stage motion effects) are staged for subsequent v0.x iterations.
+
+---
+
 ## [0.0.1] - 2026-04-22
 
 ### Rebrand

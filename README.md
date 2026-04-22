@@ -1,83 +1,85 @@
-# Podium CLI Launcher for Claude
+<p align="center">
+  <img src="icons/icon-128.png" alt="Podium" width="96" height="96"/>
+</p>
 
-Run [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) inside a rich Webview terminal tab — with status icons, session management, and productivity features.
+<h1 align="center">Podium</h1>
 
-## Features
+<p align="center">
+  <strong>Orchestrate multi-agent Claude teams from one stage — or run a single session in a rich Webview tab.</strong>
+</p>
 
-### Terminal with Status Icons
-- **Tab icon changes** based on CLI state: idle (gray), running (yellow), done (green), error (red)
-- **Ambient glow** border effect matches the current state
-- **Response timer** shows elapsed time while Claude is processing
+<p align="center">
+  <em>A VSCode / Antigravity extension for <a href="https://docs.anthropic.com/en/docs/claude-code/overview">Claude Code CLI</a>.</em>
+</p>
 
-### Session Management
-- **Session save/restore** — sessions persist across IDE restarts
-- **Resume Later** — close a session and resume it from the sidebar
-- **Session grouping** — "Resume Later" and "Recent Sessions" groups in sidebar
-- **Split view** — restore multi-panel layouts
+---
 
-### Context Usage Indicator
-- **Toolbar progress bar** shows token usage at a glance
-- **Auto-updates** from Claude Code's status line (`ctx:52%` in prompt)
-- Click `ctx` to manually refresh via `/context` command
-- Color changes based on usage: green → orange → red
+**Podium** lifts Claude Code from a single-terminal tool into a multi-agent stage. A **leader** agent coordinates **worker** agents through structured `@worker-N:` directives, tracks their idle state, captures transcripts, and summarizes the round back to the leader when the team dissolves. Snapshot-and-restore keeps multi-hour orchestration work across IDE restarts.
 
-> **Tip:** Enable the status line in Claude Code for automatic context tracking:
-> ```bash
-> claude config set -g preferredNotifChannel terminal
-> ```
-> This shows `ctx:XX%` in the prompt after each response, which the launcher reads automatically.
+For solo runs, Podium still bundles everything you'd want from a rich CLI wrapper: status-aware tab icons, session save/restore with groups, seven themes, context usage bar, smart Ctrl+C copy/interrupt, image paste, file-path click, desktop notifications.
 
-### Input Panel
-- **Rich input area** with Enter to send, Shift+Enter for newlines
-- **Slash command autocomplete** — type `/` to see available commands
-- **Task queue** — queue multiple prompts and run them sequentially
-- **Custom buttons** — add your own shortcut buttons (configurable)
-- **Input history** — Ctrl+Up/Down to navigate previous inputs
+---
 
-### Customization
-- **7 background themes** — Default, Midnight, Ocean, Forest, Sunset, Aurora, Warm
-- **Background particle effects** with state-based animations
-- **Configurable font size and family**
-- **In-extension Settings UI** — gear icon or right-click menu
-- **Export/Import settings** — share your configuration as JSON
+## 🎭 Orchestration Mode — "Podium" (the stage)
 
-### Productivity
-- **Ctrl+C smart copy** — copies selected text, sends interrupt when no selection
-- **Image paste** — Ctrl+V to attach clipboard images
-- **File path click** — click file paths to open in editor, `.md` in Obsidian, `.html` in browser
-- **Search** — Ctrl+F to search terminal content
-- **Conversation export** — save terminal content as markdown
-- **Desktop notifications** — Windows toast / macOS notification on task completion
+A leader and worker panes share one Webview multi-pane terminal, with the orchestrator watching each pane's output for directives.
 
-### i18n
-- **English** and **Korean** — auto-detected from IDE language setting
+- **Leader + worker panes** in a multi-pane Webview terminal (`psmux` on Windows, `tmux` on macOS/Linux — auto-selected)
+- **Structured routing** — leader emits `@worker-1: task` and Podium auto-dispatches to the matching pane
+- **Per-worker idle detection** — dispatches queue while the worker is busy, flush when it goes idle
+- **Dynamic team shape** — add, remove, or rename workers at runtime via the Teams tree view context menu
+- **Team snapshot / restore** — save a team's leader and worker session UUIDs to OneDrive; load it later with `--resume` on each pane
+- **Dissolve with summary** — extract the last `●` bullet from each worker, inject a consolidated summary back into the leader (deterministic hybrid, with Haiku fallback)
+- **Scrollback replay grace** — 15 s window after restore drops stale directives from Claude's Ink repaint
+- **Task-tool block on leader** — `--disallowedTools Task` + Podium system prompt keeps the leader delegating externally rather than spawning subagents
 
-## Requirements
+## ⚡ Solo Mode — "Launcher" (single tab)
 
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) must be installed
-- Node.js (for node-pty terminal backend)
+The original Claude Code experience, in a Webview tab.
 
-## Installation
+- **Status icons on the tab** — idle / running / done / needs-attention / error
+- **Ambient glow** border matching the current state, response timer while Claude is processing
+- **Tab title blink** when the tab is `needs-attention` and unfocused
+- **Session save / restore + groups** — close a session, resume it from the sidebar; organize with "Resume Later" / "Recent Sessions" groups
+- **Context usage bar** — reads `ctx:XX%` from Claude's status line, color gradient green → orange → red
+- **Rich input panel** — slash command autocomplete, task queue, custom buttons, input history (Ctrl+Up/Down)
+- **7 themes** — Default / Midnight / Ocean / Forest / Sunset / Aurora / Warm, with state-driven particle effects
+- **Productivity** — smart Ctrl+C (copy selection or send interrupt), image paste, file-path click to open in editor, terminal search, desktop notifications
+- **i18n** — English / Korean auto-detected from IDE language
 
-1. Install from Open VSX or download `.vsix` from [Releases](https://github.com/rockuen/podium/releases)
-2. Open command palette: `Ctrl+Shift+P` → `Open Claude Code`
-3. Or use keyboard shortcut: `Ctrl+Shift+;` (`Cmd+Shift+;` on Mac)
+## Install
+
+1. Install from **Open VSX** — search `rockuen.podium`, or drag-drop the `.vsix` from [Releases](https://github.com/rockuen/podium/releases) into VSCode / Antigravity
+2. Install [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview)
+3. For orchestration mode, a multiplexer: `psmux` auto-installs on Windows, `tmux` expected on macOS / Linux
+
+## Quick start
+
+**Solo session** — `Ctrl+Shift+;` (`Cmd+Shift+;` on Mac) opens Claude Code in a Webview tab.
+
+**Orchestrated team** — Command Palette → `Podium: Orchestrated Team (leader + 2 workers)`. A leader pane spawns with the Podium protocol; type a natural-language request and the leader automatically routes `@worker-N:` directives to the right worker panes.
+
+**Resume a saved team** — Command Palette → `Podium: Open Saved Team...` picks from your last 10 snapshots and resumes each pane with its original session.
+
+**Dissolve a team** — Command Palette → `Podium: Dissolve Team`. Podium extracts the last assistant bullet from each worker, injects a summary into the leader, and kills the worker panes.
 
 ## Settings
 
-Access settings via the **gear icon** in the toolbar or **right-click → Settings**.
+Gear icon in the toolbar or **right-click → Settings**. The `claudeCodeLauncher.*` prefix is retained for back-compat with legacy keybindings and user settings.
 
-| Setting | Description | Default |
-|---------|-------------|---------|
-| `defaultTheme` | Background theme | `default` |
-| `defaultFontSize` | Terminal font size (8-22) | `11` |
-| `defaultFontFamily` | Terminal font family | `D2Coding, Consolas, monospace` |
-| `soundEnabled` | Task completion sound | `true` |
-| `particlesEnabled` | Background particle effects | `true` |
-| `customButtons` | Input panel shortcut buttons | `[]` |
-| `customSlashCommands` | Autocomplete slash commands | `[]` |
+| Setting | Default | Purpose |
+|---|---|---|
+| `claudeCodeLauncher.defaultTheme` | `default` | Background theme (7 choices) |
+| `claudeCodeLauncher.defaultFontSize` | `11` | Terminal font size (8–22) |
+| `claudeCodeLauncher.defaultFontFamily` | `D2Coding, Consolas, monospace` | Terminal font family |
+| `claudeCodeLauncher.soundEnabled` | `true` | Task completion sound |
+| `claudeCodeLauncher.particlesEnabled` | `true` | Background particle effects |
+| `claudeCodeLauncher.customButtons` | `[]` | Toolbar shortcut buttons |
+| `claudeCodeLauncher.customSlashCommands` | `[]` | Autocomplete entries |
+| `claudeCodeLauncher.orchestration.backend` | `auto` | `psmux` / `tmux` / `auto` |
+| `claudeCodeLauncher.orchestration.sessionFilter` | — | Filter saved sessions for the resume picker |
 
-### Custom Buttons Example
+### Custom Buttons
 
 ```json
 "claudeCodeLauncher.customButtons": [
@@ -86,7 +88,7 @@ Access settings via the **gear icon** in the toolbar or **right-click → Settin
 ]
 ```
 
-### Custom Slash Commands Example
+### Custom Slash Commands
 
 ```json
 "claudeCodeLauncher.customSlashCommands": [
@@ -97,21 +99,24 @@ Access settings via the **gear icon** in the toolbar or **right-click → Settin
 
 ### Share Settings
 
-Use **Export** button in Settings to copy all settings as JSON, then share with teammates. They can paste and **Import** to apply.
+Use **Export** in the Settings panel to copy your full configuration as JSON, then **Import** on another machine.
 
-## Keyboard Shortcuts
+## Keyboard shortcuts
 
 | Shortcut | Action |
-|----------|--------|
-| `Ctrl+Shift+;` | Open Claude Code |
-| `Ctrl+C` | Copy selection / Send interrupt |
-| `Ctrl+V` | Paste text / Paste image |
-| `Ctrl+F` | Search terminal |
-| `Ctrl+=` / `Ctrl+-` | Zoom in / out |
-| `Ctrl+0` | Reset zoom |
-| `Ctrl+Up/Down` | Input history |
+|---|---|
+| `Ctrl+Shift+;` | Open Podium (solo Claude Code tab) |
+| `Ctrl+C` | Copy selection / send interrupt if no selection |
+| `Ctrl+V` | Paste text / attach clipboard image |
+| `Ctrl+F` | Search terminal content |
+| `Ctrl+=` / `Ctrl+-` / `Ctrl+0` | Zoom in / out / reset |
+| `Ctrl+Up` / `Ctrl+Down` | Input history |
 | `Ctrl+Shift+Enter` | Toggle input panel |
 | `Ctrl+?` | Keyboard shortcuts help |
+
+## History
+
+Podium was rebranded from [`rockuen/cli-launcher-for-claude`](https://github.com/rockuen/cli-launcher-for-claude) (final release v2.7.33) on 2026-04-22 after the orchestration layer grew into the product's center of gravity. All prior v2.x history is preserved in this repository's `main` branch; the legacy repo is frozen at a v2.7.25 deprecation release.
 
 ## License
 
