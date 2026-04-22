@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.7.28] - 2026-04-22
+
+### Fixed
+- **Snapshot restore no longer re-executes prior-session routing directives** — During v2.7.27 verification, after `Open Saved Team...` restored a team and the user observed that `worker-1` answered the restored `안녕?` question **a second time** even though no new directive had been typed. Root cause: `--resume <uuid>` causes Claude CLI to replay its prior conversation into the alt-screen scrollback on leader spawn. As Ink repaints that scrollback, its pty stream contains the same `@worker-N: ...` directives that were already routed+executed in the original session. The freshly-attached orchestrator (empty `recentPayloads` Map, no dedupe state carried over) treats them as new directives and re-injects them into the just-restored worker panes, duplicating every prior command.
+
+  Restore now arms a **3-second grace window** (`OrchestratorAttachOptions.restoreGraceMs: 3000`) inside `PodiumOrchestrator.route()`. Any routing directive parsed during the window is dropped with `[orch.restoreGrace] dropped routing to "worker-N" (Nms left in grace): <payload>` and a summary `[orch.restoreGrace] window closed — dropped N directive(s) from scrollback replay; live routing active` fires when the window expires. Fresh orchestrate (no `--resume`) omits the option and the code path is zero-cost.
+
+  The window only affects parser → route dispatch. IdleDetector feeds, transcript accumulation, leader-notify commits, and snapshot auto-save continue to see the replayed bytes so idle detection and autosave behavior stay correct.
+
+### Internal
+- `PodiumOrchestrator.attach()` gains the `restoreGraceMs` option. Stored as `restoreGraceEndsAt` (nowFn-relative deadline) + `restoreGraceDroppedCount` (for the closing summary log). Both null/zeroed on fresh orchestrate.
+- `index.ts` snapshot.load handler passes `restoreGraceMs: 3000` in its `orch.attach(...)` opts. Other entry points (`orchestrate`, `orchestrate.resume`) omit it — orchestrate.resume resumes the leader but spawns fresh workers, so the scrollback replay issue doesn't meaningfully apply (no prior worker routing to replay).
+
+### Tests
+- 3 new cases in `podiumOrchestratorWorkerMgmt.test.ts`: directives dropped during grace window (no worker write), directives routed normally after window expires, grace disarms after first post-window route with summary log.
+
 ## [2.7.27] - 2026-04-22
 
 ### Fixed

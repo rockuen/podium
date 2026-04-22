@@ -896,3 +896,87 @@ test('v2.7.27: listWorkers empty after dispose (registry cleanup invariant)', ()
   assert.equal(orch.listWorkers().length, 0, 'workers cleared on dispose');
   assert.equal(orch.isDisposed, true);
 });
+
+test('v2.7.28: restoreGraceMs drops routing directives emitted inside grace window (scrollback replay)', () => {
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude' }],
+    skipAutoTick: true,
+    now: clock.now,
+    restoreGraceMs: 3000,
+  });
+
+  // Simulate Ink repaint of the leader's resumed scrollback:
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: hello-from-past\n' });
+
+  // Within the grace window — must NOT write to worker-1's pty.
+  clock.advance(1000);
+  orch.tick();
+  const writes = ctl.writes.filter((w) => w.paneId === 'W1');
+  assert.equal(writes.length, 0, 'no worker-1 write inside grace window');
+  // stats.dropped bumps via the restoreGrace branch.
+  assert.ok(orch.snapshot.stats.dropped >= 1, 'at least one directive dropped by grace');
+
+  orch.dispose();
+});
+
+test('v2.7.28: grace window state transitions correctly (armed → disarmed after expiry)', () => {
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude' }],
+    skipAutoTick: true,
+    now: clock.now,
+    restoreGraceMs: 3000,
+  });
+
+  // Armed: directive inside window is dropped.
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: inside-grace\n' });
+  const droppedDuringGrace = orch.snapshot.stats.dropped;
+  assert.ok(droppedDuringGrace >= 1, 'at least one drop occurred during grace');
+
+  // Advance past the window.
+  clock.advance(3500);
+
+  // New directive post-window: even if routing doesn't immediately commit
+  // (depends on idle+debounce), stats.dropped from the restoreGrace branch
+  // must NOT keep increasing — the window closed and "[orch.restoreGrace]
+  // window closed" logged exactly once.
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: after-grace\n' });
+  const graceLogs = out.log.filter((l) => l.includes('[orch.restoreGrace] window closed'));
+  assert.equal(graceLogs.length, 1, 'window-closed summary logged exactly once on first post-grace dispatch');
+
+  orch.dispose();
+});
+
+test('v2.7.28: restoreGraceMs=0 leaves grace disarmed (isDisposed invariant sanity)', () => {
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude' }],
+    skipAutoTick: true,
+    now: clock.now,
+    restoreGraceMs: 0,
+  });
+
+  // With grace disarmed, stats.dropped must remain 0 even when the leader
+  // emits a chunk that would have been replay-filtered in a restore context.
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: no-grace\n' });
+  assert.equal(
+    orch.snapshot.stats.dropped,
+    0,
+    'grace=0 never touches stats.dropped via restoreGrace branch',
+  );
+
+  orch.dispose();
+});

@@ -125,6 +125,28 @@ export interface OrchestratorAttachOptions {
    * `teamSnapshot.saveSnapshot`. Absent in tests.
    */
   onAutoSnapshot?: (snapshot: CapturedSnapshot, source: 'dissolve' | 'pane-exit') => void;
+  /**
+   * v2.7.28 · Restore grace window. When set, any routing directive parsed
+   * from the leader within `restoreGraceMs` of `attach()` is dropped with a
+   * log line. Rationale: on `snapshot.load`, the leader pane spawns with
+   * `--resume <uuid>`, which causes Claude CLI to replay its prior
+   * conversation into the alt-screen scrollback. As Ink repaints that
+   * scrollback, its stream contains `@worker-N: ...` directives that were
+   * already routed+executed in the ORIGINAL session. Without a grace
+   * window the fresh orchestrator (empty `recentPayloads`) treats them as
+   * new directives and re-injects them into the just-restored worker
+   * panes, causing unwanted re-execution.
+   *
+   * The window only affects the parser → route dispatch path. IdleDetector,
+   * transcript accumulation, and leader-notify commits are unaffected —
+   * they need to see the replayed bytes so the orchestrator's "is leader
+   * idle?" answer stays correct.
+   *
+   * Set to 0 or omit for fresh orchestrate (no scrollback to replay).
+   * `index.ts` snapshot.load passes 3000 (3s), empirically long enough for
+   * Ink to settle after the resume-driven repaint.
+   */
+  restoreGraceMs?: number;
 }
 
 /** Minimal snapshot payload surfaced by `PodiumOrchestrator.captureSnapshot`. */
@@ -230,6 +252,13 @@ export class PodiumOrchestrator implements vscode.Disposable {
   /** v2.7.19 · Guard so the first pane exit only triggers one snapshot. */
   private autoSnapshotFired = false;
   /**
+   * v2.7.28 · Restore grace bookkeeping. `restoreGraceEndsAt === null` means
+   * the window has closed or was never opened; otherwise it's the
+   * `nowFn()`-relative timestamp at which routing resumes.
+   */
+  private restoreGraceEndsAt: number | null = null;
+  private restoreGraceDroppedCount = 0;
+  /**
    * v2.7.25 · Per-worker timestamp of last `addWorker` return. Used only
    * for the race-window observability log in `route()` when a
    * `leader referenced unknown` would otherwise drop silently.
@@ -255,6 +284,17 @@ export class PodiumOrchestrator implements vscode.Disposable {
     this.attachedCwd = opts.cwd ?? process.cwd();
     this.onAutoSnapshot = opts.onAutoSnapshot ?? null;
     this.autoSnapshotFired = false;
+    // v2.7.28: arm the restore grace window if caller requested one.
+    if (opts.restoreGraceMs && opts.restoreGraceMs > 0) {
+      this.restoreGraceEndsAt = this.nowFn() + opts.restoreGraceMs;
+      this.restoreGraceDroppedCount = 0;
+      this.output.appendLine(
+        `[orch.restoreGrace] armed for ${opts.restoreGraceMs}ms — routing directives from leader scrollback replay will be dropped`,
+      );
+    } else {
+      this.restoreGraceEndsAt = null;
+      this.restoreGraceDroppedCount = 0;
+    }
     this.leaderIdle = new IdleDetector({
       agent: opts.leader.agent,
       silenceMs: 500,
@@ -740,6 +780,30 @@ export class PodiumOrchestrator implements vscode.Disposable {
 
   private route(msg: RoutedMessage): void {
     this.stats.routed += 1;
+
+    // v2.7.28: restore grace window. Drop routing directives replayed from
+    // the leader's --resume scrollback instead of re-executing them against
+    // just-spawned worker panes. Window is small (3s in production) so a
+    // user-typed directive typed immediately after restore may get caught
+    // too, but that's strictly better than re-executing every prior-session
+    // command silently. See `OrchestratorAttachOptions.restoreGraceMs`.
+    if (this.restoreGraceEndsAt !== null) {
+      const now = this.nowFn();
+      if (now < this.restoreGraceEndsAt) {
+        this.stats.dropped += 1;
+        this.restoreGraceDroppedCount += 1;
+        const remaining = this.restoreGraceEndsAt - now;
+        this.output.appendLine(
+          `[orch.restoreGrace] dropped routing to "${msg.workerId}" (${remaining}ms left in grace): ${preview(msg.payload)}`,
+        );
+        return;
+      }
+      this.output.appendLine(
+        `[orch.restoreGrace] window closed — dropped ${this.restoreGraceDroppedCount} directive(s) from scrollback replay; live routing active`,
+      );
+      this.restoreGraceEndsAt = null;
+    }
+
     const w = this.workers.get(msg.workerId);
     if (!w) {
       this.output.appendLine(
