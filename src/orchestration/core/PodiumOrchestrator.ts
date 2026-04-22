@@ -1054,40 +1054,42 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * Exposed (not private) so tests can step the engine without real time.
    */
   tick(): void {
-    // v2.7.31: restore grace state machine. Close the window when the leader
-    // has reached `leaderIdle.isIdle` — a prompt pattern is visible in the
-    // rolling tail (`>`, `[OMC#...]`, `╰──`, or equivalent) AND the leader
-    // has been silent for ≥500ms. That combination signals the `--resume`
-    // scrollback replay actually finished painting, not merely that
-    // Claude CLI is still loading the session and hasn't started emitting.
+    // v2.7.32: restore grace closes on wall-clock deadline ONLY.
     //
-    // Why this replaced v2.7.29's raw `msSinceOutput >= 1s` check
-    // ------------------------------------------------------------
-    // Field report on 2026-04-22: after snapshot restore, the grace window
-    // closed with `dropped 0` BEFORE any `@worker-N:` directives reached
-    // route(), and worker panes re-executed the replayed directives.
-    // `IdleDetector.lastOutputAt` is seeded at construction time, so the raw
-    // `msSinceOutput` monotonically grows from zero even when the leader has
-    // never emitted a single byte — the 1s idle threshold was hit during
-    // Claude CLI's post-spawn session-loading silence, well before the
-    // scrollback burst arrived. `isIdle` requires a prompt pattern which is
-    // only painted at the end of the replay, so it can't fire during the
-    // loading gap.
+    // History — why the idle-gate was removed
+    // ----------------------------------------
+    // v2.7.29 added `leaderIdle.msSinceOutput >= 1000ms` as an early-close
+    // signal. Broken: `IdleDetector.lastOutputAt` is seeded at construction,
+    // so silence accumulated during Claude CLI's post-spawn session-loading
+    // gap and closed grace with `dropped 0` before scrollback arrived.
     //
-    // Also closes via the hard wall-clock cap (`restoreGraceEndsAt`, 15s
-    // default) as a safety net for a wedged leader that never paints a
-    // prompt. Lives in tick() not route() because `leaderIdle.feed()` bumps
-    // `lastOutputAt` to `now` in the same onPaneData call that feeds route(),
-    // so `isIdle` would always return false inside route(). tick() runs
-    // every 250ms between pane data events, which is where the leader's
-    // settled state becomes observable.
-    if (this.restoreGraceEndsAt !== null && this.leaderIdle) {
-      const leaderSettled = this.leaderIdle.isIdle;
-      const pastDeadline = this.nowFn() >= this.restoreGraceEndsAt;
-      if (leaderSettled || pastDeadline) {
-        const reason = pastDeadline ? 'deadline' : 'leader-idle';
+    // v2.7.31 tried `leaderIdle.isIdle` (prompt pattern + ≥500ms silence)
+    // thinking the prompt appears only at the END of replay. Also broken:
+    // Claude CLI paints its input box (`>` + `[OMC#x.y.z] | ...` + `⏵⏵ bypass
+    // permissions on`) IMMEDIATELY on spawn as part of the welcome UI,
+    // before session load even starts. `hasPromptPattern()` therefore
+    // returned true from t=0, and `isIdle` fired as soon as the welcome
+    // banner stopped printing (~500ms post-spawn) — again before the
+    // scrollback replay burst landed. Field log 2026-04-22 showed:
+    //   [orch.restoreGrace] window closed (leader-idle) — dropped 0
+    //   ...
+    //   [orch.trace] parser yielded 2 msg(s): worker-1=..., worker-2=...
+    //   [orch] → worker-1: ...   <- replayed directive routed live
+    //
+    // Conclusion: there is no leader-side signal that reliably indicates
+    // "scrollback replay finished." The prompt pattern exists before
+    // replay starts, silence exists before replay starts, and the
+    // `● @worker-N:` bullet that actually signals end-of-replay is
+    // indistinguishable from a live leader response. The only safe gate
+    // is wall-clock — wait the full `restoreGraceMs` window (default 15s),
+    // drop everything the parser yields during it. Tradeoff: the first
+    // 15s after restore drops ALL parser directives, including any the
+    // user might type. Acceptable because restore UX naturally has a
+    // settle period, and re-execution of prior turns is a much worse bug.
+    if (this.restoreGraceEndsAt !== null) {
+      if (this.nowFn() >= this.restoreGraceEndsAt) {
         this.output.appendLine(
-          `[orch.restoreGrace] window closed (${reason}) — dropped ${this.restoreGraceDroppedCount} directive(s) from scrollback replay; live routing active`,
+          `[orch.restoreGrace] window closed (deadline) — dropped ${this.restoreGraceDroppedCount} directive(s) from scrollback replay; live routing active`,
         );
         this.restoreGraceEndsAt = null;
       }

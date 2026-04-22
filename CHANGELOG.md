@@ -1,5 +1,30 @@
 # Changelog
 
+## [2.7.32] - 2026-04-22
+
+### Fixed
+- **Snapshot restore grace no longer closes prematurely during Claude CLI's post-spawn welcome UI** — v2.7.31 field log on 2026-04-22 showed the regression was still live: `[orch.restoreGrace] window closed (leader-idle) — dropped 0` still fired before the scrollback `● @worker-N:` burst arrived, and both workers re-executed the prior turn's directives.
+
+  Root cause of the v2.7.31 failure: `IdleDetector.hasPromptPattern()` matches `>`, `[OMC#x.y.z] |`, `⏵⏵ bypass permissions on`, and `╰──` rows in the rolling tail. Claude CLI v2.1+ paints those rows as part of its **initial welcome screen** — immediately on spawn, BEFORE `--resume` starts loading the session and long before scrollback replay begins. So `hasPromptPattern()` returns true from t=0, and `isIdle` fires as soon as the welcome banner finishes printing (~500 ms). v2.7.31's "prompt + silence" gate was no better than v2.7.29's raw silence; both sit entirely in the pre-replay window.
+
+  Conclusion: **no leader-side signal reliably marks "scrollback replay finished."** The prompt pattern exists before replay starts, silence exists before replay starts, and the replayed `● @worker-N:` bullets are indistinguishable from a live leader response.
+
+  Fix: remove the idle-gate entirely. Grace now closes **only when the wall-clock deadline expires** (`restoreGraceMs`, default 15000 ms unchanged from v2.7.29). During the full window, ALL parser-yielded directives are dropped with `[orch.restoreGrace] dropped routing to "<worker>": ...`. Tradeoff: anything the user types in the first 15 s after restore also gets dropped. Acceptable because (a) restore UX has a natural settle pause, (b) re-execution of prior turns is a much worse bug, (c) `restoreGraceMs` is configurable via the attach option for callers that can guarantee an earlier quiescent point.
+
+### Internal
+- `PodiumOrchestrator.tick()` in [PodiumOrchestrator.ts](src/orchestration/core/PodiumOrchestrator.ts) — grace close condition simplified to `this.nowFn() >= this.restoreGraceEndsAt`. The `leaderIdle.isIdle` check and the `reason` branch (`leader-idle` vs `deadline`) are gone; close log always reads `window closed (deadline)`.
+- No changes to `leaderIdle` itself — still used for parser-flush-on-idle elsewhere in tick(). Only the grace path stopped consuming it.
+- State fields unchanged: `restoreGraceEndsAt`, `restoreGraceDroppedCount`.
+
+### Tests
+- Removed `v2.7.31: grace closes via leader-idle gate (prompt pattern + silence)` and `v2.7.31: grace stays open during post-spawn silence before any leader output` — both encoded the broken idle-gate contract.
+- Added v2.7.32 `grace holds through leader silence + prompt pattern until wall-clock deadline`: feeds a realistic Claude welcome row (`>`, `[OMC#...]`, `⏵⏵ bypass permissions on`), advances 10 s of silence, verifies grace does NOT close; then fires scrollback directive (verified dropped), advances past the 15 s deadline, verifies close log reads `(deadline)`.
+- Renamed previous v2.7.29 deadline test to v2.7.32 (`closes via wall-clock deadline even when leader is actively emitting`); comment updated to reflect single-path close.
+- 141/141 pass (142 prior - 2 deleted + 1 new = 141).
+
+### Known tradeoff
+- The first `restoreGraceMs` (15 s default) after restore drops any `@worker-N:` directive the leader emits — INCLUDING ones the user typed live. Don't type directives immediately after restore; wait for `[orch.restoreGrace] window closed (deadline)` in the orchestration output channel.
+
 ## [2.7.31] - 2026-04-22
 
 ### Fixed

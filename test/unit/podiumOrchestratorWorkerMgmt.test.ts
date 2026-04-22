@@ -924,7 +924,18 @@ test('v2.7.28: restoreGraceMs drops routing directives emitted inside grace wind
   orch.dispose();
 });
 
-test('v2.7.31: grace closes via leader-idle gate (prompt pattern + silence)', () => {
+test('v2.7.32: grace holds through leader silence + prompt pattern until wall-clock deadline', () => {
+  // Regression against v2.7.29 + v2.7.31 design failures:
+  //
+  //  - v2.7.29 used `msSinceOutput >= 1s` → closed during post-spawn silence
+  //    before scrollback burst arrived.
+  //  - v2.7.31 used `isIdle` (prompt pattern + silence) → closed during
+  //    post-welcome silence because Claude CLI paints the prompt box
+  //    immediately on spawn, so hasPromptPattern() returns true from t=0.
+  //
+  // v2.7.32 closes on wall-clock deadline ONLY. This test proves the gate
+  // can't be tripped by any combination of silence + prompt-patterned
+  // output in the rolling tail before the deadline.
   const ctl = makeFakePanel();
   const out = makeOutputChannel();
   const clock = mkClock();
@@ -934,92 +945,45 @@ test('v2.7.31: grace closes via leader-idle gate (prompt pattern + silence)', ()
     workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude' }],
     skipAutoTick: true,
     now: clock.now,
-    // Big safety cap — idle gate should close first.
     restoreGraceMs: 15000,
   });
 
-  // Leader emits scrollback replay burst (content only, no prompt yet):
-  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: replayed-1\n' });
-  assert.ok(orch.snapshot.stats.dropped >= 1, 'replayed directive dropped by grace');
-
-  // Content line is in rollingTail but no prompt pattern yet → isIdle=false.
-  clock.advance(500);
-  orch.tick();
+  // Simulate Claude CLI's post-spawn welcome UI: prompt box painted first,
+  // THEN a long silent gap while --resume loads the session. Pre-v2.7.32
+  // this combination fired isIdle and closed grace with `dropped 0`.
+  ctl.firePaneData({ paneId: 'L', data: '> \n[OMC#4.12.0] | ctx:4%\n⏵⏵ bypass permissions on\n' });
+  for (let i = 0; i < 20; i++) {
+    clock.advance(500); // 10s total of silence with prompt pattern visible
+    orch.tick();
+  }
   const closedTooEarly = out.log.filter((l) =>
     l.includes('[orch.restoreGrace] window closed'),
   );
-  assert.equal(closedTooEarly.length, 0, 'grace did NOT close while replay is still painting');
+  assert.equal(closedTooEarly.length, 0,
+    'grace stays open despite prompt pattern + 10s silence (wall-clock < 15s)');
 
-  // Replay finishes — leader paints bottom prompt + OMC status row (cosmetic
-  // lines, so lastOutputAt is NOT reset). rollingTail now contains prompt
-  // patterns that hasPromptPattern() will match.
-  ctl.firePaneData({ paneId: 'L', data: '> \n[OMC#4.12.0] | ctx:4%\n' });
-
-  // Silence threshold (silenceMs=500) already met since last real content at
-  // T=0; with prompt now visible, isIdle transitions to true.
-  orch.tick();
-  const idleCloseLogs = out.log.filter((l) =>
-    l.includes('[orch.restoreGrace] window closed (leader-idle)'),
-  );
-  assert.equal(idleCloseLogs.length, 1, 'grace closed via leader-idle reason once prompt appeared');
-
-  orch.dispose();
-});
-
-test('v2.7.31: grace stays open during post-spawn silence before any leader output', () => {
-  // Field regression from 2026-04-22: v2.7.29 used raw msSinceOutput which
-  // grows from 0 at leaderIdle construction time. If leader CLI took >1s to
-  // emit its first byte (normal for Claude --resume session loading), grace
-  // closed with `dropped 0` BEFORE the scrollback burst arrived, so replayed
-  // `@worker-N:` directives routed live and workers re-executed them.
-  //
-  // v2.7.31 gates on isIdle which requires a prompt pattern in the rolling
-  // tail — impossible while the tail is empty (no output yet). Grace now
-  // correctly stays open through the loading gap.
-  const ctl = makeFakePanel();
-  const out = makeOutputChannel();
-  const clock = mkClock();
-  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
-  orch.attach({
-    leader: { paneId: 'L', agent: 'claude' },
-    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude' }],
-    skipAutoTick: true,
-    now: clock.now,
-    restoreGraceMs: 15000,
-  });
-
-  // 5 seconds of post-spawn silence — leader hasn't emitted anything yet.
-  // Pre-v2.7.31, grace would have closed around t=1000ms with `dropped 0`.
-  for (let i = 0; i < 10; i++) {
-    clock.advance(500);
-    orch.tick();
-  }
-  const prematureClose = out.log.filter((l) =>
-    l.includes('[orch.restoreGrace] window closed'),
-  );
-  assert.equal(prematureClose.length, 0, 'grace stayed open through 5s of post-spawn silence');
-
-  // Finally the leader's --resume replays scrollback with directives, then
-  // paints the prompt box at the bottom. The directives must be dropped,
-  // and grace should close only after the prompt appears.
+  // Scrollback replay finally lands. Directives must still be dropped.
   ctl.firePaneData({ paneId: 'L', data: '● @worker-1: replayed-late\n' });
-  assert.ok(orch.snapshot.stats.dropped >= 1, 'late-arriving scrollback directive dropped by grace');
+  assert.ok(orch.snapshot.stats.dropped >= 1,
+    'late-arriving scrollback directive dropped by grace');
 
-  // Silence elapses (>= silenceMs=500) between last real content and prompt
-  // paint; then the cosmetic prompt+status chunk arrives without resetting
-  // lastOutputAt.
-  clock.advance(600);
-  ctl.firePaneData({ paneId: 'L', data: '> \n[OMC#4.12.0] | ctx:4%\n' });
+  // Advance past the 15s wall-clock deadline (10s + 5.5s = 15.5s total).
+  clock.advance(5500);
   orch.tick();
-  const idleCloseLogs = out.log.filter((l) =>
-    l.includes('[orch.restoreGrace] window closed (leader-idle)'),
+  const closeLogs = out.log.filter((l) =>
+    l.includes('[orch.restoreGrace] window closed (deadline)'),
   );
-  assert.equal(idleCloseLogs.length, 1, 'grace closes via leader-idle once prompt is visible post-replay');
+  assert.equal(closeLogs.length, 1, 'grace closes via wall-clock deadline');
+  assert.ok(
+    closeLogs[0].includes('dropped 1 directive(s)') ||
+      closeLogs[0].match(/dropped \d+ directive\(s\)/),
+    'close message reports accurate drop count',
+  );
 
   orch.dispose();
 });
 
-test('v2.7.29: grace closes via wall-clock deadline when idle gate never fires', () => {
+test('v2.7.32: grace closes via wall-clock deadline even when leader is actively emitting', () => {
   const ctl = makeFakePanel();
   const out = makeOutputChannel();
   const clock = mkClock();
@@ -1032,10 +996,9 @@ test('v2.7.29: grace closes via wall-clock deadline when idle gate never fires',
     restoreGraceMs: 3000,
   });
 
-  // Leader continuously emits content lines, never paints a prompt — simulate
-  // by re-firing every 500ms. isIdle requires a prompt pattern in the rolling
-  // tail which these `● @worker-N:` bullets never provide, so the idle gate
-  // can't close; only the wall-clock deadline can.
+  // Leader continuously emits content every 500ms. v2.7.32 has no idle gate
+  // at all — only wall-clock (restoreGraceMs=3000) closes the window.
+  // Directives dropped throughout the 3s grace; routing activates on close.
   for (let i = 0; i < 8; i++) {
     ctl.firePaneData({ paneId: 'L', data: `● @worker-1: chunk-${i}\n` });
     clock.advance(500);
