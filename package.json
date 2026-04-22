@@ -2,7 +2,7 @@
   "name": "podium",
   "displayName": "Podium — Multi-Agent Stage for Claude Code",
   "description": "Orchestrate multi-agent Claude teams from one stage — leader + worker panes with structured routing, idle detection, team snapshots, and dissolve-with-summary. Or run a solo Claude Code session in a rich Webview tab. No external multiplexer required.",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "keywords": [
     "claude",
     "claude-code",
@@ -210,17 +210,6 @@
         "icon": "$(edit)"
       },
       {
-        "command": "claudeCodeLauncher.team.missions.focus",
-        "title": "Show Missions",
-        "category": "Claude"
-      },
-      {
-        "command": "claudeCodeLauncher.team.missions.refresh",
-        "title": "Refresh Missions",
-        "icon": "$(refresh)",
-        "category": "Claude"
-      },
-      {
         "command": "claudeCodeLauncher.podium.enter",
         "title": "Enter Podium Mode",
         "category": "Claude"
@@ -349,11 +338,6 @@
         {
           "id": "claudeCodeLauncher.hudPanel",
           "name": "HUD",
-          "when": "claudeCodeLauncher.podiumModeActive"
-        },
-        {
-          "id": "claudeCodeLauncher.missionsPanel",
-          "name": "Missions",
           "when": "claudeCodeLauncher.podiumModeActive"
         },
         {
@@ -518,11 +502,6 @@
           "command": "claudeCodeLauncher.hud.refresh",
           "group": "navigation@2",
           "when": "view == claudeCodeLauncher.hudPanel"
-        },
-        {
-          "command": "claudeCodeLauncher.team.missions.refresh",
-          "group": "navigation@1",
-          "when": "view == claudeCodeLauncher.missionsPanel"
         },
         {
           "command": "claudeCodeLauncher.history.refresh",

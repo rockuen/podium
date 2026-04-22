@@ -7,7 +7,6 @@
 //   podium.<xxx>             (config)   -> claudeCodeLauncher.orchestration.<xxx>
 //   podium.sessionTree       (view)     -> claudeCodeLauncher.teamsOrchestration
 //   podium.hudPanel          (view)     -> claudeCodeLauncher.hudPanel
-//   podium.missionsPanel     (view)     -> claudeCodeLauncher.missionsPanel
 //   podium.historyPanel      (view)     -> claudeCodeLauncher.historyPanel
 //   CCG                                 -> deferred to M3 (CcgTreeProvider /
 //                                          CcgArtifactWatcher / CcgViewerPanel
@@ -25,7 +24,6 @@ import { OMCRuntime } from './core/OMCRuntime';
 import { PodiumManager } from './core/PodiumManager';
 import { ProviderHealthChecker } from './core/ProviderHealthChecker';
 import { StateWatcher } from './core/StateWatcher';
-import { MissionWatcher } from './core/MissionWatcher';
 import { SessionHistoryWatcher } from './core/SessionHistoryWatcher';
 import { HookReceiver } from './core/HookReceiver';
 import { TokenStore } from './core/TokenStore';
@@ -58,7 +56,6 @@ import type { CapturedSnapshot } from './core/PodiumOrchestrator';
 import { HUDStatusBarItem } from './ui/HUDStatusBarItem';
 import { HUDTreeProvider } from './ui/HUDTreeProvider';
 import { HUDDashboardPanel } from './ui/HUDDashboardPanel';
-import { MissionsTreeProvider } from './ui/MissionsTreeProvider';
 import { SessionHistoryProvider } from './ui/SessionHistoryProvider';
 import { TeamConversationPanel } from './ui/TeamConversationPanel';
 
@@ -66,7 +63,6 @@ import { CcgArtifactWatcher } from './core/CcgArtifactWatcher';
 import { CcgTreeProvider } from './ui/CcgTreeProvider';
 import { CcgViewerPanel } from './ui/CcgViewerPanel';
 
-import type { MissionSnapshot } from './core/MissionWatcher';
 import type { SessionHistorySnapshot } from './types/history';
 import type { HUDStdinCache } from './types/hud';
 import type { OMCOpenClawPayload } from './types/events';
@@ -179,19 +175,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   const initialRoot = currentCwd();
   stateWatcher.start(initialRoot);
 
-  // ─── Missions ───
-  const missionProvider = new MissionsTreeProvider();
-  const missionView = vscode.window.createTreeView('claudeCodeLauncher.missionsPanel', {
-    treeDataProvider: missionProvider,
-  });
-  ctx.subscriptions.push(missionView);
-  const missionWatcher = new MissionWatcher((msg) => output.appendLine(msg));
-  missionWatcher.on('snapshot', (snap: MissionSnapshot) => {
-    missionProvider.update(snap);
-  });
-  ctx.subscriptions.push({ dispose: () => missionWatcher.stop() });
-  missionWatcher.start(initialRoot);
-
   // ─── Session History ───
   const historyProvider = new SessionHistoryProvider();
   const historyView = vscode.window.createTreeView('claudeCodeLauncher.historyPanel', {
@@ -303,17 +286,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         return;
       }
       await vscode.commands.executeCommand('revealFileInOS', vscode.Uri.file(entry.directory));
-    }),
-  );
-
-  // ─── Missions view ───
-  ctx.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.team.missions.focus', async () => {
-      await vscode.commands.executeCommand('workbench.view.extension.claude-code-launcher');
-      await vscode.commands.executeCommand('claudeCodeLauncher.missionsPanel.focus');
-    }),
-    vscode.commands.registerCommand('claudeCodeLauncher.team.missions.refresh', () => {
-      missionWatcher.forceRefresh();
     }),
   );
 
@@ -1287,7 +1259,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       const next = currentCwd();
       output.appendLine(`[orch] workspace changed -> ${next}`);
       stateWatcher.start(next);
-      missionWatcher.start(next);
       historyWatcher.start(next);
       ccgWatcher.start(next);
       providerHealth.setCwd(next);
@@ -1309,8 +1280,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       ['podium.spawnTeamWebview',           'claudeCodeLauncher.team.create'],
       ['podium.spawnTeamIntegrated',        'claudeCodeLauncher.team.createIntegrated'],
       ['podium.spawnTeam',                  'claudeCodeLauncher.team.quickCreate'],
-      ['podium.showMissions',               'claudeCodeLauncher.team.missions.focus'],
-      ['podium.refreshMissions',            'claudeCodeLauncher.team.missions.refresh'],
       ['podium.viewAllPanes',               'claudeCodeLauncher.podium.grid'],
       ['podium.showHudDashboard',           'claudeCodeLauncher.podium.dashboard'],
       ['podium.showHud',                    'claudeCodeLauncher.hud.focus'],
