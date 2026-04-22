@@ -2,7 +2,7 @@
   "name": "podium",
   "displayName": "Podium — Multi-Agent Stage for Claude Code",
   "description": "Orchestrate multi-agent Claude teams from one stage — leader + worker panes with structured routing, idle detection, team snapshots, and dissolve-with-summary. Or run a solo Claude Code session in a rich Webview tab. No external multiplexer required.",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "keywords": [
     "claude",
     "claude-code",
@@ -461,6 +461,16 @@
           "command": "claudeCodeLauncher.podium.worker.rename",
           "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumWorker",
           "group": "inline@2"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.snapshot.save",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.dissolve",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "inline@3"
         }
       ],
       "view/title": [
@@ -475,8 +485,28 @@
           "when": "view == claudeCodeLauncher.sessionList"
         },
         {
-          "command": "claudeCodeLauncher.session.filter",
+          "command": "claudeCodeLauncher.podium.orchestrate",
+          "group": "navigation@0",
+          "when": "view == claudeCodeLauncher.teamsOrchestration"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.orchestrate.resume",
           "group": "navigation@1",
+          "when": "view == claudeCodeLauncher.teamsOrchestration"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.snapshot.load",
+          "group": "navigation@2",
+          "when": "view == claudeCodeLauncher.teamsOrchestration"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.snapshot.rename",
+          "group": "navigation@3",
+          "when": "view == claudeCodeLauncher.teamsOrchestration"
+        },
+        {
+          "command": "claudeCodeLauncher.session.filter",
+          "group": "navigation@9",
           "when": "view == claudeCodeLauncher.teamsOrchestration"
         },
         {

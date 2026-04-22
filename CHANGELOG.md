@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.2.1] - 2026-04-23
+
+### Teams Orchestration view — buttons
+
+The Teams Orchestration sidebar view now surfaces every Podium team action as a clickable button, eliminating the need to memorize Command Palette entries for common workflows.
+
+**Title-bar buttons** (visible when the view is focused):
+
+- `$(organization)` **Orchestrated Team** → `podium.orchestrate` — start a new leader + 2 workers team
+- `$(history)` **Resume Leader Session** → `podium.orchestrate.resume` — pick from saved leader sessions
+- `$(folder-opened)` **Open Saved Team** → `podium.snapshot.load` — restore a snapshot (workers `--resume`'d)
+- `$(edit)` **Rename Saved Team** → `podium.snapshot.rename` — rename a snapshot in place
+- `$(filter)` **Filter Sessions** → `session.filter` (existing, pushed to rightmost slot)
+
+**Inline node buttons** on a live team:
+
+- `$(add)` Add Worker (already present)
+- `$(save)` **Save Snapshot** → `podium.snapshot.save` — targets this specific team (was: "most recent team" only)
+- `$(close-all)` **Dissolve** → `podium.dissolve` — targets this specific team
+
+**Inline node buttons** on a worker row (unchanged):
+
+- `$(close)` Remove
+- `$(edit)` Rename
+
+### Handler updates (no breaking change)
+
+`podium.snapshot.save` and `podium.dissolve` now accept an optional `PodiumLiveTeamNode` argument. When invoked from the inline button the handler resolves the orchestrator by that node's `sessionKey`; when invoked from the Command Palette (no arg) the existing "most recent active team" fallback kicks in exactly as before.
+
+Consistent with the existing pattern used by `podium.worker.add`, `podium.worker.remove`, and `podium.worker.rename`.
+
+---
+
 ## [0.2.0] - 2026-04-23
 
 ### Remove psmux / tmux dependency

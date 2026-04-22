@@ -568,15 +568,21 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   // OneDrive-synced claudeTeams.json so the user can reopen it later via
   // `podium.snapshot.load`. Auto-save also runs on dissolve / pane-exit.
   ctx.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.podium.snapshot.save', async () => {
-      const active = [...orchestratorRegistry.values()];
-      if (active.length === 0) {
-        vscode.window.showInformationMessage(
-          'Podium: no active team to snapshot. Start a team first.',
-        );
-        return;
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.snapshot.save', async (arg?: unknown) => {
+      let target: PodiumOrchestrator | undefined;
+      if (arg instanceof PodiumLiveTeamNode) {
+        target = lookupOrchestratorByKey(arg.sessionKey);
       }
-      const target = active[active.length - 1];
+      if (!target) {
+        const active = [...orchestratorRegistry.values()];
+        if (active.length === 0) {
+          vscode.window.showInformationMessage(
+            'Podium: no active team to snapshot. Start a team first.',
+          );
+          return;
+        }
+        target = active[active.length - 1];
+      }
       let snap: CapturedSnapshot;
       try {
         snap = target.captureSnapshot();
@@ -974,16 +980,21 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   // short summary of their transcripts, then injects that summary into the
   // leader's stdin. The leader stays alive and continues the conversation.
   ctx.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.podium.dissolve', async () => {
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.dissolve', async (arg?: unknown) => {
       output.appendLine('[orch.dissolve-cmd] invoked');
-      const active = [...orchestratorRegistry.values()];
-      if (active.length === 0) {
-        vscode.window.showInformationMessage('Podium: no active orchestrator to dissolve.');
-        return;
+      let target: PodiumOrchestrator | undefined;
+      if (arg instanceof PodiumLiveTeamNode) {
+        target = lookupOrchestratorByKey(arg.sessionKey);
       }
-      // If multiple sessions exist (e.g. user ran Orchestrate twice), dissolve
-      // the most recent one by insertion order. Rare case; MVP behavior.
-      const target = active[active.length - 1];
+      if (!target) {
+        const active = [...orchestratorRegistry.values()];
+        if (active.length === 0) {
+          vscode.window.showInformationMessage('Podium: no active orchestrator to dissolve.');
+          return;
+        }
+        // No tree-node context → dissolve the most recent team.
+        target = active[active.length - 1];
+      }
 
       // v2.7.21 · Warn before summarizing workers that haven't gone idle.
       // Dissolve captures the transcript tail — if a worker is still emitting
