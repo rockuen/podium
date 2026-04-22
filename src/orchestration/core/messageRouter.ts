@@ -141,7 +141,24 @@ export class ClaudeLeaderRoutingProjector {
     if (kind === 'assistant-cont' || kind === 'blank') {
       return line + newline;
     }
-    this.inAssistantBlock = false;
+    // v2.7.30 — Ink-repaint tolerance
+    // -------------------------------
+    // Claude Code v2.1+'s Ink TUI continuously repaints the bottom input-box
+    // prompt, status bar, and box chrome in the same PTY stream as the
+    // assistant's streaming response. Pre-v2.7.30, the projector closed the
+    // assistant block on any `prompt`/`status`/`chrome` line — which is
+    // wrong, because those are cosmetic UI frames, not content boundaries.
+    // When leader's response was long enough for Ink to sneak a repaint of
+    // `> @worker-1: ...` between the `●` bullet and a later continuation
+    // row, the block closed prematurely and the continuation `@worker-N:`
+    // directive was stripped. Route silently failed.
+    //
+    // Fix: drop those cosmetic lines (return empty) but keep the assistant
+    // block open. Only genuinely unknown 'other' content (model output that
+    // doesn't match any recognized UI element) marks the block as ended.
+    if (kind === 'other') {
+      this.inAssistantBlock = false;
+    }
     return '';
   }
 

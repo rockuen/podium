@@ -1,5 +1,21 @@
 # Changelog
 
+## [2.7.30] - 2026-04-22
+
+### Fixed
+- **Claude assistant projector no longer closes the block on Ink UI repaints** — v2.7.29 field test showed `worker-1` receiving no directive even though the leader's response visibly ended with `@worker-1: 안녕?`. Output log showed `[orch.trace] leader @worker chunk suppressed by Claude assistant projector` for the legitimate directive. Root cause: Claude Code v2.1+'s Ink TUI continuously repaints the bottom input-box prompt (`> @worker-1: 안녕?<padding>`), the `[OMC#...]` status row, and `────` box-chrome into the same PTY stream as the streaming assistant response. The v2.7.6-era projector classified those three line kinds as "non-assistant" and closed `inAssistantBlock`. When leader's response was long enough for Ink to sneak a repaint between the `●` bullet and a later continuation row (common for multi-sentence responses with a blank line), the assistant block closed prematurely and the continuation `@worker-N:` directive was stripped silently.
+
+  Fix: `prompt` / `status` / `chrome` lines are still dropped from the projector's output (they never route), but they no longer close the block. Only genuinely unknown `other` content — i.e. model output that doesn't match any recognized UI element — marks the assistant turn as ended. `assistant-start` (`●` bullet) still opens/re-opens the block as before.
+
+### Internal
+- `ClaudeLeaderRoutingProjector.processLine` in [messageRouter.ts](src/orchestration/core/messageRouter.ts) — the `this.inAssistantBlock = false` sink now sits behind a `kind === 'other'` check. Pre-fix, any of {`prompt`, `status`, `chrome`, `other`} closed the block; post-fix, only `other` does. No state-machine shape change; no new fields.
+
+### Tests
+- 2 new cases in [test/unit/messageRouter.test.ts](test/unit/messageRouter.test.ts):
+  - `projector: Ink input-box repaint mid-stream does not close assistant block (v2.7.30)` — reproduces the exact v2.7.29 failure (assistant bullet → cont line → blank → `> @worker-1: 안녕?<padding>` repaint → `  @worker-1: 안녕?` cont). Pre-fix the post-repaint cont was stripped; post-fix it survives.
+  - `projector: status/chrome mid-stream also does not close assistant block (v2.7.30)` — similar but with `[OMC#...]`, `────`, and `⏵⏵ bypass permissions` interleaved.
+- All 141/141 pass (139 prior + 2 new).
+
 ## [2.7.29] - 2026-04-22
 
 ### Fixed

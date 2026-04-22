@@ -171,6 +171,50 @@ test('router: blank line terminates single-line directive even with later indent
   assert.equal(msgs[0].payload, 'first task.');
 });
 
+test('projector: Ink input-box repaint mid-stream does not close assistant block (v2.7.30)', () => {
+  // Real regression from v2.7.29 field testing: leader responded with
+  //   ● <narration...>
+  //     <narration cont...>
+  //     (blank)
+  //     @worker-1: 안녕?
+  // While the response was streaming, Ink's Ink TUI repainted the bottom
+  // input-box echo `> @worker-1: 안녕?                      ` in the same
+  // PTY stream. Pre-v2.7.30, that `>` line classified as `prompt` and closed
+  // the assistant block, so the legitimate continuation `  @worker-1: 안녕?`
+  // that arrived after was stripped and never routed.
+  const projector = new ClaudeLeaderRoutingProjector();
+  const projected = projector.feed(
+    '● Podium 팀 프로토콜 확인했습니다. 네 알겠습니다.\n' +
+    '  전달해주시면 받겠습니다.\n' +
+    '\n' +
+    '> @worker-1: 안녕?                                                    \n' +
+    '  @worker-1: 안녕?\n',
+  );
+  // Both the pre-repaint narration and the post-repaint continuation must
+  // survive. Only the `> ...` repaint line should be dropped.
+  assert.ok(projected.includes('Podium 팀 프로토콜 확인했습니다.'), `pre-repaint stripped: ${JSON.stringify(projected)}`);
+  assert.ok(projected.includes('  @worker-1: 안녕?'), `post-repaint stripped: ${JSON.stringify(projected)}`);
+  assert.ok(!projected.includes('> @worker-1'), `prompt echo leaked: ${JSON.stringify(projected)}`);
+});
+
+test('projector: status/chrome mid-stream also does not close assistant block (v2.7.30)', () => {
+  const projector = new ClaudeLeaderRoutingProjector();
+  const projected = projector.feed(
+    '● assistant opens\n' +
+    '  first cont line\n' +
+    '[OMC#4.12.0] | 5h:53% | ctx:0%\n' +
+    '────────────────────────────────────\n' +
+    '⏵⏵ bypass permissions on (shift+tab to cycle)\n' +
+    '  @worker-1: late continuation\n',
+  );
+  assert.ok(projected.includes('assistant opens'));
+  assert.ok(projected.includes('first cont line'));
+  assert.ok(projected.includes('@worker-1: late continuation'));
+  assert.ok(!projected.includes('[OMC#'));
+  assert.ok(!projected.includes('bypass permissions'));
+  assert.ok(!projected.includes('────'));
+});
+
 test('projector+parser: chunk-boundary split still dispatches both workers', () => {
   // End-to-end pipeline check: projector fix + parser together.
   const projector = new ClaudeLeaderRoutingProjector();
