@@ -322,7 +322,7 @@ function routeWebviewMessage(msg, ctx) {
       return;
 
     default:
-      console.warn('[Claude Launcher] [router] unknown message type:', msg.type);
+      console.warn('[Podium] [router] unknown message type:', msg.type);
   }
 }
 

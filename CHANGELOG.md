@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.0.1] - 2026-04-22
+
+### Rebrand
+- **Renamed to "Podium CLI Launcher for Claude"** — the product formerly shipped as `cli-launcher-for-claude` (v2.7.33 on the legacy slug) is now **Podium**. Version resets to `0.0.1` to mark the new product line.
+- Extension ID: `rockuen.cli-launcher-for-claude` → `rockuen.podium`. **Users of the old extension must install the new one manually** — VSCode has no upgrade path between different extension IDs.
+- Legacy `package.json.name` `cli-launcher-for-claude` → `podium`. Output channel `Claude Launcher - Orchestration` → `Podium - Orchestration`. Internal log prefix `[Claude Launcher]` → `[Podium]`.
+- Repository moved to `https://github.com/rockuen/podium`. The legacy `cli-launcher-for-claude` repo is frozen with a README pointer to the new home.
+- Code-level behavior is IDENTICAL to v2.7.33 of the legacy extension — this release is a pure string rename. All 142 tests pass unchanged.
+- History preserved: all prior commits (v2.7.28 scrollback-grace through v2.7.33 dedupe seed) are carried over.
+
+### Internal
+- Files touched: `package.json`, `package-lock.json`, `build.sh`, `README.md`, `src/activation.js`, `src/store/sessionStore.js`, `src/store/sessionManager.js`, `src/pty/contextParser.js`, `src/panel/restartPty.js`, `src/panel/createPanel.js`, `src/panel/messageRouter.js`, `src/orchestration/index.ts`.
+- VSCode command IDs (`claudeCodeLauncher.*`) and configuration keys (`claudeCodeLauncher.*`) intentionally retained to preserve keybindings and user settings across the rename.
+
+---
+
 ## [2.7.33] - 2026-04-22
 
 ### Fixed

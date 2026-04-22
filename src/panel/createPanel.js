@@ -153,7 +153,7 @@ function createPanel(context, extensionPath, session) {
       spawnShell = wrap.shell;
       spawnArgs = wrap.args;
       tmuxSessionName = wrap.tmuxName;
-      console.log('[Claude Launcher] Podium-ready spawn via', wrap.muxBin, '| tmux:', tmuxSessionName);
+      console.log('[Podium] Podium-ready spawn via', wrap.muxBin, '| tmux:', tmuxSessionName);
     } else {
       vscode.window.showWarningMessage(
         'Podium-ready session requested but tmux/psmux not found on PATH. Falling back to direct spawn (not team-capable).'
@@ -161,8 +161,8 @@ function createPanel(context, extensionPath, session) {
     }
   }
 
-  console.log('[Claude Launcher] Spawning:', spawnShell, spawnArgs.join(' '), '| cwd:', cwd);
-  console.log('[Claude Launcher] resolved shell:', spawnShell, '| podiumReady:', podiumReady);
+  console.log('[Podium] Spawning:', spawnShell, spawnArgs.join(' '), '| cwd:', cwd);
+  console.log('[Podium] resolved shell:', spawnShell, '| podiumReady:', podiumReady);
 
   let ptyProcess;
   try {
@@ -173,9 +173,9 @@ function createPanel(context, extensionPath, session) {
       cwd: cwd,
       env: { ...process.env, FORCE_COLOR: '1' }
     });
-    console.log('[Claude Launcher] PTY spawned OK, pid:', ptyProcess.pid);
+    console.log('[Podium] PTY spawned OK, pid:', ptyProcess.pid);
   } catch (e) {
-    console.error('[Claude Launcher] PTY spawn FAILED:', e.message, e.stack);
+    console.error('[Podium] PTY spawn FAILED:', e.message, e.stack);
     if (e.message && e.message.includes('posix_spawnp')) {
       const fix = 'Run npm rebuild';
       vscode.window.showErrorMessage(
@@ -246,7 +246,7 @@ function createPanel(context, extensionPath, session) {
   ptyProcess.onData(data => {
     if (entry.pty !== initialPty) return; // stale handler guard
     dataCount++;
-    if (dataCount <= 3) console.log('[Claude Launcher] PTY data #' + dataCount + ' (' + data.length + ' bytes):', data.substring(0, 100));
+    if (dataCount <= 3) console.log('[Podium] PTY data #' + dataCount + ' (' + data.length + ' bytes):', data.substring(0, 100));
     if (!webviewReady) {
       outputBuffer.push(data);
     } else {
@@ -345,7 +345,7 @@ function createPanel(context, extensionPath, session) {
   // PTY exit
   ptyProcess.onExit(({ exitCode }) => {
     if (entry.pty !== initialPty) return; // stale handler guard
-    console.log('[Claude Launcher] PTY exited, code:', exitCode, '| dataCount:', dataCount);
+    console.log('[Podium] PTY exited, code:', exitCode, '| dataCount:', dataCount);
     if (entry.idleTimer) clearTimeout(entry.idleTimer);
     const isSuccess = exitCode === 0 || exitCode === null || exitCode === undefined;
 
@@ -380,7 +380,7 @@ function createPanel(context, extensionPath, session) {
       createPanel,
       onWebviewReady: () => {
         webviewReady = true;
-        console.log('[Claude Launcher] Webview ready, flushing', outputBuffer.length, 'buffered chunks');
+        console.log('[Podium] Webview ready, flushing', outputBuffer.length, 'buffered chunks');
         for (const chunk of outputBuffer) {
           try { panel.webview.postMessage({ type: 'output', data: chunk }); } catch (_) {}
         }

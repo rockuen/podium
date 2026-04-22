@@ -1,13 +1,13 @@
 {
-  "name": "cli-launcher-for-claude",
-  "displayName": "CLI Launcher for Claude",
+  "name": "podium",
+  "displayName": "Podium CLI Launcher for Claude",
   "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
-  "version": "2.7.33",
+  "version": "0.0.1",
   "publisher": "rockuen",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/rockuen/cli-launcher-for-claude"
+    "url": "https://github.com/rockuen/podium"
   },
   "icon": "icons/icon-128.png",
   "engines": {
@@ -586,7 +586,7 @@
       ]
     },
     "configuration": {
-      "title": "CLI Launcher for Claude",
+      "title": "Podium CLI Launcher for Claude",
       "properties": {
         "claudeCodeLauncher.defaultTheme": {
           "type": "string",

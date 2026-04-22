@@ -53,9 +53,9 @@ function restartPty(entry, panel, context, extensionPath) {
       spawnShell = wrap.shell;
       spawnArgs = wrap.args;
       entry.tmuxSession = wrap.tmuxName;
-      console.log('[Claude Launcher] restart via Podium-ready tmux:', wrap.tmuxName);
+      console.log('[Podium] restart via Podium-ready tmux:', wrap.tmuxName);
     } else {
-      console.warn('[Claude Launcher] restart: tmux/psmux not found, falling back to direct spawn');
+      console.warn('[Podium] restart: tmux/psmux not found, falling back to direct spawn');
     }
   }
 

@@ -31,7 +31,7 @@ function createContextParser() {
     ctxBuf = (ctxBuf + strippedNow).slice(-300);
 
     if (!entry._ctxSampled && /(?:컨텍스트|context)/i.test(strippedNow)) {
-      console.log('[Claude Launcher] ctxBuf:', JSON.stringify(ctxBuf.slice(-200)));
+      console.log('[Podium] ctxBuf:', JSON.stringify(ctxBuf.slice(-200)));
       entry._ctxSampled = true;
     }
 

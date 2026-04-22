@@ -394,7 +394,7 @@ function deactivate() {
     try {
       saveSessions();
     } catch (e) {
-      console.warn('[Claude Launcher] deactivate saveSessions failed:', e?.message || e);
+      console.warn('[Podium] deactivate saveSessions failed:', e?.message || e);
     }
   }
 

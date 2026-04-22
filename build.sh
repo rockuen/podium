@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build .vsix package for CLI Launcher for Claude
+# Build .vsix package for Podium CLI Launcher for Claude
 # Usage: bash build.sh [--publish]
 
 set -e
@@ -7,7 +7,7 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-echo "=== CLI Launcher for Claude — Build ==="
+echo "=== Podium CLI Launcher for Claude — Build ==="
 
 # Check tools
 if ! command -v npx &>/dev/null; then

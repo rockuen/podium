@@ -88,7 +88,7 @@ export interface OrchestrationAPI {
 const CFG_NS = 'claudeCodeLauncher.orchestration';
 
 export async function activate(ctx: vscode.ExtensionContext): Promise<OrchestrationAPI> {
-  const output = vscode.window.createOutputChannel('Claude Launcher - Orchestration');
+  const output = vscode.window.createOutputChannel('Podium - Orchestration');
   ctx.subscriptions.push(output);
   output.appendLine('[orch] activating...');
 

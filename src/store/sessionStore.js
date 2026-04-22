@@ -77,7 +77,7 @@ function migrateFromWorkspaceState(context) {
   }
   if (migrated) {
     sessionStoreUpdate('_migrated', true);
-    console.log('[Claude Launcher] Migrated workspaceState to sessions.json');
+    console.log('[Podium] Migrated workspaceState to sessions.json');
   }
 }
 

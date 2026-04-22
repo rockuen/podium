@@ -56,7 +56,7 @@ function saveSessions() {
 // for correct viewColumn placement in split views.
 function restoreSessions(onRestore) {
   const sessions = sessionStoreGet('claudeSessions', []);
-  console.log('[Claude Launcher] restoreSessions called, found:', sessions.length, 'sessions');
+  console.log('[Podium] restoreSessions called, found:', sessions.length, 'sessions');
   if (sessions.length === 0) return;
 
   // Clear immediately to avoid double-restore on activate re-entry
@@ -65,7 +65,7 @@ function restoreSessions(onRestore) {
   const sorted = [...sessions].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
   sorted.forEach((session, i) => {
     setTimeout(() => {
-      console.log('[Claude Launcher] Restoring session:', session.title, session.sessionId);
+      console.log('[Podium] Restoring session:', session.title, session.sessionId);
       onRestore(session);
     }, i * 500);
   });

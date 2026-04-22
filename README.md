@@ -1,4 +1,4 @@
-# CLI Launcher for Claude
+# Podium CLI Launcher for Claude
 
 Run [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) inside a rich Webview terminal tab — with status icons, session management, and productivity features.
 
@@ -59,7 +59,7 @@ Run [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) i
 
 ## Installation
 
-1. Install from Open VSX or download `.vsix` from [Releases](https://github.com/rockuen/cli-launcher-for-claude/releases)
+1. Install from Open VSX or download `.vsix` from [Releases](https://github.com/rockuen/podium/releases)
 2. Open command palette: `Ctrl+Shift+P` → `Open Claude Code`
 3. Or use keyboard shortcut: `Ctrl+Shift+;` (`Cmd+Shift+;` on Mac)
 
