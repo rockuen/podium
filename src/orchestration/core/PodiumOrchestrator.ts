@@ -223,14 +223,18 @@ const NOTIFY_GATE_POLL_MS = 250;
 // commit log surfaces the race so production tuning can observe it.
 const ADD_WORKER_RACE_WINDOW_MS = 500;
 
-// v2.7.29: after a snapshot restore, the grace window stays open while the
-// leader has emitted any output in the last RESTORE_GRACE_IDLE_MS. Claude
-// CLI's `--resume` replays the prior conversation into the Ink alt-screen,
-// and the bytes trickle out in chunks. Once the leader stays silent for 1s,
-// we treat the replay as settled and re-enable live routing. Paired with
-// the attach option `restoreGraceMs` as a hard wall-clock cap (15s default
-// in production).
-const RESTORE_GRACE_IDLE_MS = 1000;
+// v2.7.31 (was v2.7.29): after a snapshot restore, the grace window stays
+// open until `leaderIdle.isIdle === true` — i.e. a prompt pattern is visible
+// in the rolling tail AND the leader has been silent for ≥500ms. Claude CLI's
+// `--resume` replays the prior conversation into the Ink alt-screen; the
+// prompt box is only painted at the end of that replay, so waiting for the
+// prompt reliably means the replay settled. v2.7.29 used raw silence
+// (`msSinceOutput >= 1000`) which mis-fired during the post-spawn session-
+// loading gap when leader hadn't emitted anything yet — grace closed with
+// `dropped 0` before scrollback arrived, and replayed directives routed
+// live. `isIdle` rejects that case because an empty rolling tail can never
+// match a prompt pattern. Paired with `restoreGraceMs` as a hard wall-clock
+// cap (15s default in production).
 
 export class PodiumOrchestrator implements vscode.Disposable {
   private readonly parser = new WorkerPatternParser();
@@ -1050,19 +1054,37 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * Exposed (not private) so tests can step the engine without real time.
    */
   tick(): void {
-    // v2.7.29: restore grace state machine. Close the window when the leader
-    // has been silent for >=RESTORE_GRACE_IDLE_MS (1s) — Ink repaint settled,
-    // live routing can resume. Also close via hard wall-clock cap
-    // (`restoreGraceEndsAt`, 15s default) if the idle signal never fires.
-    // This lives in tick() — not route() — because leaderIdle.feed() bumps
-    // `lastOutputAt` to `now` immediately before route() runs in the same
-    // onPaneData call, so msSinceOutput would always read 0 inside route().
-    // tick() runs every 250ms between pane data events, where the gap is
-    // observable.
+    // v2.7.31: restore grace state machine. Close the window when the leader
+    // has reached `leaderIdle.isIdle` — a prompt pattern is visible in the
+    // rolling tail (`>`, `[OMC#...]`, `╰──`, or equivalent) AND the leader
+    // has been silent for ≥500ms. That combination signals the `--resume`
+    // scrollback replay actually finished painting, not merely that
+    // Claude CLI is still loading the session and hasn't started emitting.
+    //
+    // Why this replaced v2.7.29's raw `msSinceOutput >= 1s` check
+    // ------------------------------------------------------------
+    // Field report on 2026-04-22: after snapshot restore, the grace window
+    // closed with `dropped 0` BEFORE any `@worker-N:` directives reached
+    // route(), and worker panes re-executed the replayed directives.
+    // `IdleDetector.lastOutputAt` is seeded at construction time, so the raw
+    // `msSinceOutput` monotonically grows from zero even when the leader has
+    // never emitted a single byte — the 1s idle threshold was hit during
+    // Claude CLI's post-spawn session-loading silence, well before the
+    // scrollback burst arrived. `isIdle` requires a prompt pattern which is
+    // only painted at the end of the replay, so it can't fire during the
+    // loading gap.
+    //
+    // Also closes via the hard wall-clock cap (`restoreGraceEndsAt`, 15s
+    // default) as a safety net for a wedged leader that never paints a
+    // prompt. Lives in tick() not route() because `leaderIdle.feed()` bumps
+    // `lastOutputAt` to `now` in the same onPaneData call that feeds route(),
+    // so `isIdle` would always return false inside route(). tick() runs
+    // every 250ms between pane data events, which is where the leader's
+    // settled state becomes observable.
     if (this.restoreGraceEndsAt !== null && this.leaderIdle) {
-      const msSinceOutput = this.leaderIdle.msSinceOutput;
+      const leaderSettled = this.leaderIdle.isIdle;
       const pastDeadline = this.nowFn() >= this.restoreGraceEndsAt;
-      if (msSinceOutput >= RESTORE_GRACE_IDLE_MS || pastDeadline) {
+      if (leaderSettled || pastDeadline) {
         const reason = pastDeadline ? 'deadline' : 'leader-idle';
         this.output.appendLine(
           `[orch.restoreGrace] window closed (${reason}) — dropped ${this.restoreGraceDroppedCount} directive(s) from scrollback replay; live routing active`,

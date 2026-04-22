@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.7.31] - 2026-04-22
+
+### Fixed
+- **Snapshot restore grace no longer closes during Claude CLI's post-spawn loading silence** — v2.7.30 field test on 2026-04-22: after `Open Saved Team...`, workers **re-executed the prior `"apple"을 한글로 번역해줘.` / `1부터 10까지 합` directives** replayed from scrollback, even though `[orch.restoreGrace] armed for 15000ms` logged correctly. The close message fired **before** the scrollback burst arrived: `[orch.restoreGrace] window closed (leader-idle) — dropped 0 directive(s)` came out, **then** `[orch.trace] parser yielded 2 msg(s)` routed them live.
+
+  Root cause: v2.7.29's idle-gate compared raw `leaderIdle.msSinceOutput >= 1000ms`. But `IdleDetector.lastOutputAt` is seeded at `this.now()` at construction time, so `msSinceOutput` grows monotonically from zero **even when the leader has never emitted a single byte**. Claude CLI's `--resume` takes >1s to load the session from disk before printing the scrollback burst, so the 1s silence threshold was easily crossed during the loading gap. Grace closed with `dropped 0`, scrollback replay routed live, workers re-executed.
+
+  Fix: gate on `leaderIdle.isIdle` instead of raw silence. `isIdle` requires BOTH silence (≥500ms) AND a recognized prompt pattern in the rolling tail (`>`, `[OMC#...]`, `╰──`, or older boxed variants). Claude paints the prompt box only at the END of scrollback replay, so `hasPromptPattern()` can't return true during the loading gap or mid-replay — no more premature close.
+
+### Internal
+- `PodiumOrchestrator.tick()` in [PodiumOrchestrator.ts](src/orchestration/core/PodiumOrchestrator.ts) — the grace idle-gate now reads `this.leaderIdle.isIdle` (public getter on `IdleDetector`) instead of `leaderIdle.msSinceOutput >= RESTORE_GRACE_IDLE_MS`. Deadline path (`this.nowFn() >= this.restoreGraceEndsAt`) unchanged — still the 15s safety cap.
+- `RESTORE_GRACE_IDLE_MS = 1000` constant removed (no longer referenced; `isIdle` uses `IdleDetector.silenceMs = 500` from construction).
+- No new state fields. `restoreGraceEndsAt`, `restoreGraceDroppedCount` unchanged.
+
+### Tests
+- v2.7.29 test `grace closes via leader-idle gate (1s silence after burst)` rewritten as v2.7.31 `grace closes via leader-idle gate (prompt pattern + silence)`: burst `● @worker-1: replayed-1` without prompt → verify grace stays open → then emit cosmetic `>` + `[OMC#...]` prompt row → verify grace closes via `leader-idle` reason.
+- New v2.7.31 regression test `grace stays open during post-spawn silence before any leader output`: attach → advance 5s of wall-clock silence with no leader output → verify grace does NOT close (pre-v2.7.31 would close at t≈1s with `dropped 0`) → then simulate late-arriving scrollback + prompt → verify grace finally closes.
+- v2.7.29 deadline test unchanged (continuous emission without prompt pattern → idle never fires → deadline trips).
+- 142/142 pass (141 prior + 1 net new).
+
 ## [2.7.30] - 2026-04-22
 
 ### Fixed
