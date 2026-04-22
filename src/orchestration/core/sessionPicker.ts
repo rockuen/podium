@@ -48,6 +48,36 @@ export function claudeProjectsDirForCwd(cwd: string, home = os.homedir()): strin
   return path.join(home, '.claude', 'projects', hashCwdForClaudeProjects(cwd));
 }
 
+/**
+ * v2.7.26 · Probe whether a Claude session UUID has an actual on-disk JSONL
+ * file under `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`.
+ *
+ * Why this exists
+ * ---------------
+ * Snapshot save (v2.7.19+) records pre-allocated session UUIDs for every
+ * pane. But Claude CLI only writes the JSONL file AFTER the first user
+ * message is submitted. Workers spawned but never used have a UUID the
+ * orchestrator knows about yet no file exists — passing `--resume <uuid>`
+ * to such a session fails with "No conversation found with session ID…"
+ * and the pane exits code=1. Callers use this probe to branch:
+ *   resumable  → `--resume <sid>` (preserve conversation)
+ *   not yet   → `--session-id <sid>` fresh spawn (preserve UUID so the
+ *               snapshot ledger stays consistent on re-save)
+ */
+export function isClaudeSessionResumable(
+  cwd: string,
+  sessionId: string,
+  home = os.homedir(),
+): boolean {
+  if (!sessionId) return false;
+  const filePath = path.join(claudeProjectsDirForCwd(cwd, home), `${sessionId}.jsonl`);
+  try {
+    return fs.existsSync(filePath);
+  } catch {
+    return false;
+  }
+}
+
 /** Scan all session JSONLs for `cwd`, newest first. Empty array if dir absent. */
 export async function listClaudeSessions(
   cwd: string,

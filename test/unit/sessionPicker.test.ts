@@ -7,6 +7,7 @@ import {
   hashCwdForClaudeProjects,
   claudeProjectsDirForCwd,
   listClaudeSessions,
+  isClaudeSessionResumable,
 } from '../../src/orchestration/core/sessionPicker';
 
 test('sessionPicker: cwd hash matches observed Claude Code encoding', () => {
@@ -87,4 +88,45 @@ test('sessionPicker: listClaudeSessions reads JSONL fixtures sorted newest-first
 
   // Cleanup.
   await fs.promises.rm(home, { recursive: true, force: true });
+});
+
+test('sessionPicker v2.7.26: isClaudeSessionResumable returns true when JSONL exists', async () => {
+  const home = path.join(os.tmpdir(), `podium-resumable-ok-${Date.now()}`);
+  const cwd = 'C:\\fake\\proj';
+  const sessionsDir = claudeProjectsDirForCwd(cwd, home);
+  await fs.promises.mkdir(sessionsDir, { recursive: true });
+  const sid = 'cccccccc-cccc-cccc-cccc-cccccccccccc';
+  await fs.promises.writeFile(path.join(sessionsDir, `${sid}.jsonl`), '{}\n');
+
+  assert.equal(isClaudeSessionResumable(cwd, sid, home), true);
+
+  await fs.promises.rm(home, { recursive: true, force: true });
+});
+
+test('sessionPicker v2.7.26: isClaudeSessionResumable returns false when JSONL missing (unused worker)', async () => {
+  const home = path.join(os.tmpdir(), `podium-resumable-miss-${Date.now()}`);
+  const cwd = 'C:\\fake\\proj';
+  const sessionsDir = claudeProjectsDirForCwd(cwd, home);
+  await fs.promises.mkdir(sessionsDir, { recursive: true });
+  // Only create one of two workers' JSONL; the other is "unused"
+  const usedSid = 'dddddddd-dddd-dddd-dddd-dddddddddddd';
+  const unusedSid = 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee';
+  await fs.promises.writeFile(path.join(sessionsDir, `${usedSid}.jsonl`), '{}\n');
+
+  assert.equal(isClaudeSessionResumable(cwd, usedSid, home), true);
+  assert.equal(isClaudeSessionResumable(cwd, unusedSid, home), false);
+
+  await fs.promises.rm(home, { recursive: true, force: true });
+});
+
+test('sessionPicker v2.7.26: isClaudeSessionResumable returns false for missing projects dir', () => {
+  const missingHome = path.join(os.tmpdir(), `podium-resumable-nohome-${Date.now()}`);
+  assert.equal(
+    isClaudeSessionResumable('C:\\anywhere', 'ffffffff-ffff-ffff-ffff-ffffffffffff', missingHome),
+    false,
+  );
+});
+
+test('sessionPicker v2.7.26: isClaudeSessionResumable rejects empty sessionId', () => {
+  assert.equal(isClaudeSessionResumable('C:\\x', '', '/anywhere'), false);
 });

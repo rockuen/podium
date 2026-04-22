@@ -1,5 +1,19 @@
 # Changelog
 
+## [2.7.26] - 2026-04-22
+
+### Fixed
+- **Snapshot restore no longer crashes panes whose workers were never used in the original session** — When `Podium: Save Team Snapshot` captures a team, every pane's pre-allocated session UUID is recorded. But Claude CLI only materializes `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` AFTER the first user message is submitted through that pane. A worker that was spawned but never routed to in the original session has a UUID the snapshot knows about yet no on-disk transcript. On restore, the previous `--resume <uuid>` flag would fail with "No conversation found with session ID …" and the pane exited with code=1 (observed in the v2.7.25 manual verification flow).
+
+  Restore now probes `isClaudeSessionResumable(cwd, sessionId)` for each pane before spawning. Resumable panes still use `--resume <uuid>` and inherit their prior conversation. Non-resumable panes (no JSONL yet) spawn fresh via `--session-id <uuid>`, preserving the pane's identity in the snapshot ledger so subsequent saves remain consistent. A log line `[orch.snapshot.load] worker <id> has no JSONL transcript (<sid8>); spawning fresh with same session-id` surfaces each fresh spawn for debugging, and a summary `workers: N resumed · M fresh (never used in original session)` lands at the end of the load flow.
+
+### Internal
+- `sessionPicker.ts`: new pure helper `isClaudeSessionResumable(cwd, sessionId, home?)` that checks `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` via `fs.existsSync`. Exposed alongside `hashCwdForClaudeProjects` / `claudeProjectsDirForCwd` / `listClaudeSessions` for future reuse (e.g. snapshot validators, orphan-cleanup utilities).
+- Leader restore path also gains the probe: an unused leader (rare — the protocol acknowledgement usually produces a first turn) spawns fresh with `buildLeaderExtraArgs()` + preserved `sessionId`. Labels switch from `leader (restored XXX)` to `leader (fresh XXX)` so users can tell which panes had prior context.
+
+### Tests
+- 4 new `sessionPicker.test.ts` cases cover the probe matrix (JSONL present → true, mixed used/unused pair, missing projects dir → false, empty sessionId → false).
+
 ## [2.7.25] - 2026-04-22
 
 ### Added

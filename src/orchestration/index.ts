@@ -54,7 +54,7 @@ import { MultiPaneTerminalPanel } from './ui/MultiPaneTerminalPanel';
 import { LiveMultiPanel } from './ui/LiveMultiPanel';
 import { MAX_RUNTIME_WORKERS, PodiumOrchestrator } from './core/PodiumOrchestrator';
 import { buildLeaderExtraArgs } from './core/leaderProtocol';
-import { pickClaudeSession } from './core/sessionPicker';
+import { pickClaudeSession, isClaudeSessionResumable } from './core/sessionPicker';
 import {
   makeSnapshotId,
   pickSnapshot,
@@ -848,24 +848,67 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         `Podium · Restored: ${snap.name}`,
       );
 
-      panel.addPane({
-        paneId: snap.leader.paneId,
-        label: `leader (restored ${snap.leader.sessionId.slice(0, 8)})`,
-        agent: snap.leader.agent,
-        cwd,
-        autoSessionId: false,
-        extraArgs: buildLeaderExtraArgs({ resumeSessionId: snap.leader.sessionId }),
-      });
-      for (const w of snap.workers) {
+      // v2.7.26 · per-pane resume probe. Claude CLI only writes a
+      // `~/.claude/projects/<cwd>/<uuid>.jsonl` AFTER the first user submit,
+      // so a pane that was spawned in the original session but never received
+      // a message has no file on disk. `--resume <uuid>` would then fail with
+      // "No conversation found with session ID …" and exit code=1. Instead,
+      // for non-resumable panes we spawn fresh with the same UUID via
+      // `--session-id` so the snapshot ledger keeps its pane identity intact.
+      const leaderResumable = isClaudeSessionResumable(cwd, snap.leader.sessionId);
+      if (leaderResumable) {
         panel.addPane({
-          paneId: w.paneId,
-          label: `${w.label ?? w.paneId} (restored ${w.sessionId.slice(0, 8)})`,
-          agent: w.agent,
+          paneId: snap.leader.paneId,
+          label: `leader (restored ${snap.leader.sessionId.slice(0, 8)})`,
+          agent: snap.leader.agent,
           cwd,
           autoSessionId: false,
-          extraArgs: ['--resume', w.sessionId],
+          extraArgs: buildLeaderExtraArgs({ resumeSessionId: snap.leader.sessionId }),
+        });
+      } else {
+        output.appendLine(
+          `[orch.snapshot.load] leader has no JSONL transcript (${snap.leader.sessionId.slice(0, 8)}); spawning fresh with same session-id + Podium protocol`,
+        );
+        panel.addPane({
+          paneId: snap.leader.paneId,
+          label: `leader (fresh ${snap.leader.sessionId.slice(0, 8)})`,
+          agent: snap.leader.agent,
+          cwd,
+          sessionId: snap.leader.sessionId,
+          extraArgs: buildLeaderExtraArgs(),
         });
       }
+      let resumedCount = 0;
+      let freshCount = 0;
+      for (const w of snap.workers) {
+        const resumable = isClaudeSessionResumable(cwd, w.sessionId);
+        if (resumable) {
+          resumedCount += 1;
+          panel.addPane({
+            paneId: w.paneId,
+            label: `${w.label ?? w.paneId} (restored ${w.sessionId.slice(0, 8)})`,
+            agent: w.agent,
+            cwd,
+            autoSessionId: false,
+            extraArgs: ['--resume', w.sessionId],
+          });
+        } else {
+          freshCount += 1;
+          output.appendLine(
+            `[orch.snapshot.load] worker ${w.paneId} has no JSONL transcript (${w.sessionId.slice(0, 8)}); spawning fresh with same session-id`,
+          );
+          panel.addPane({
+            paneId: w.paneId,
+            label: `${w.label ?? w.paneId} (fresh ${w.sessionId.slice(0, 8)})`,
+            agent: w.agent,
+            cwd,
+            sessionId: w.sessionId,
+          });
+        }
+      }
+      output.appendLine(
+        `[orch.snapshot.load] workers: ${resumedCount} resumed · ${freshCount} fresh (never used in original session)`,
+      );
 
       const orch = new PodiumOrchestrator(panel, output);
       orch.attach({
