@@ -223,6 +223,15 @@ const NOTIFY_GATE_POLL_MS = 250;
 // commit log surfaces the race so production tuning can observe it.
 const ADD_WORKER_RACE_WINDOW_MS = 500;
 
+// v2.7.29: after a snapshot restore, the grace window stays open while the
+// leader has emitted any output in the last RESTORE_GRACE_IDLE_MS. Claude
+// CLI's `--resume` replays the prior conversation into the Ink alt-screen,
+// and the bytes trickle out in chunks. Once the leader stays silent for 1s,
+// we treat the replay as settled and re-enable live routing. Paired with
+// the attach option `restoreGraceMs` as a hard wall-clock cap (15s default
+// in production).
+const RESTORE_GRACE_IDLE_MS = 1000;
+
 export class PodiumOrchestrator implements vscode.Disposable {
   private readonly parser = new WorkerPatternParser();
   private readonly workers = new Map<string, WorkerRuntime>();
@@ -781,27 +790,21 @@ export class PodiumOrchestrator implements vscode.Disposable {
   private route(msg: RoutedMessage): void {
     this.stats.routed += 1;
 
-    // v2.7.28: restore grace window. Drop routing directives replayed from
-    // the leader's --resume scrollback instead of re-executing them against
-    // just-spawned worker panes. Window is small (3s in production) so a
-    // user-typed directive typed immediately after restore may get caught
-    // too, but that's strictly better than re-executing every prior-session
-    // command silently. See `OrchestratorAttachOptions.restoreGraceMs`.
+    // v2.7.29: restore grace is idle-gated but the state transition lives in
+    // `tick()` (not here). Rationale: `onPaneData` calls `leaderIdle.feed`
+    // BEFORE `consumeLeaderOutput` → `route()`, so by the time route() runs
+    // the chunk that triggered it has already bumped `lastOutputAt` to now.
+    // `msSinceOutput` would always read 0 here. tick() runs every 250ms
+    // between pane data events, which is where `msSinceOutput` actually
+    // grows large enough to signal "leader settled". See `tick()` for the
+    // close logic. Here we just honor whichever state tick() set.
     if (this.restoreGraceEndsAt !== null) {
-      const now = this.nowFn();
-      if (now < this.restoreGraceEndsAt) {
-        this.stats.dropped += 1;
-        this.restoreGraceDroppedCount += 1;
-        const remaining = this.restoreGraceEndsAt - now;
-        this.output.appendLine(
-          `[orch.restoreGrace] dropped routing to "${msg.workerId}" (${remaining}ms left in grace): ${preview(msg.payload)}`,
-        );
-        return;
-      }
+      this.stats.dropped += 1;
+      this.restoreGraceDroppedCount += 1;
       this.output.appendLine(
-        `[orch.restoreGrace] window closed — dropped ${this.restoreGraceDroppedCount} directive(s) from scrollback replay; live routing active`,
+        `[orch.restoreGrace] dropped routing to "${msg.workerId}": ${preview(msg.payload)}`,
       );
-      this.restoreGraceEndsAt = null;
+      return;
     }
 
     const w = this.workers.get(msg.workerId);
@@ -1047,6 +1050,26 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * Exposed (not private) so tests can step the engine without real time.
    */
   tick(): void {
+    // v2.7.29: restore grace state machine. Close the window when the leader
+    // has been silent for >=RESTORE_GRACE_IDLE_MS (1s) — Ink repaint settled,
+    // live routing can resume. Also close via hard wall-clock cap
+    // (`restoreGraceEndsAt`, 15s default) if the idle signal never fires.
+    // This lives in tick() — not route() — because leaderIdle.feed() bumps
+    // `lastOutputAt` to `now` immediately before route() runs in the same
+    // onPaneData call, so msSinceOutput would always read 0 inside route().
+    // tick() runs every 250ms between pane data events, where the gap is
+    // observable.
+    if (this.restoreGraceEndsAt !== null && this.leaderIdle) {
+      const msSinceOutput = this.leaderIdle.msSinceOutput;
+      const pastDeadline = this.nowFn() >= this.restoreGraceEndsAt;
+      if (msSinceOutput >= RESTORE_GRACE_IDLE_MS || pastDeadline) {
+        const reason = pastDeadline ? 'deadline' : 'leader-idle';
+        this.output.appendLine(
+          `[orch.restoreGrace] window closed (${reason}) — dropped ${this.restoreGraceDroppedCount} directive(s) from scrollback replay; live routing active`,
+        );
+        this.restoreGraceEndsAt = null;
+      }
+    }
     // Leader idle edge: busy → idle transition flushes the parser.
     if (this.leaderIdle && this.leaderIdle.isIdle && !this.leaderWasIdle) {
       const pending = this.parser.flush();

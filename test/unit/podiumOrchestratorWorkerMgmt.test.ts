@@ -924,7 +924,44 @@ test('v2.7.28: restoreGraceMs drops routing directives emitted inside grace wind
   orch.dispose();
 });
 
-test('v2.7.28: grace window state transitions correctly (armed → disarmed after expiry)', () => {
+test('v2.7.29: grace closes via leader-idle gate (1s silence after burst)', () => {
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude' }],
+    skipAutoTick: true,
+    now: clock.now,
+    // Big safety cap — idle gate should close first.
+    restoreGraceMs: 15000,
+  });
+
+  // Leader emits scrollback replay burst:
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: replayed-1\n' });
+  assert.ok(orch.snapshot.stats.dropped >= 1, 'replayed directive dropped by grace');
+
+  // Leader still emitting within the 1s idle threshold:
+  clock.advance(500);
+  orch.tick();
+  const closedTooEarly = out.log.filter((l) =>
+    l.includes('[orch.restoreGrace] window closed'),
+  );
+  assert.equal(closedTooEarly.length, 0, 'grace did NOT close while leader is still busy');
+
+  // Leader has now been silent for >=1s — tick() should detect idle and close.
+  clock.advance(600); // total since last output: 1100ms
+  orch.tick();
+  const idleCloseLogs = out.log.filter((l) =>
+    l.includes('[orch.restoreGrace] window closed (leader-idle)'),
+  );
+  assert.equal(idleCloseLogs.length, 1, 'grace closed via leader-idle reason');
+
+  orch.dispose();
+});
+
+test('v2.7.29: grace closes via wall-clock deadline when idle gate never fires', () => {
   const ctl = makeFakePanel();
   const out = makeOutputChannel();
   const clock = mkClock();
@@ -937,21 +974,19 @@ test('v2.7.28: grace window state transitions correctly (armed → disarmed afte
     restoreGraceMs: 3000,
   });
 
-  // Armed: directive inside window is dropped.
-  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: inside-grace\n' });
-  const droppedDuringGrace = orch.snapshot.stats.dropped;
-  assert.ok(droppedDuringGrace >= 1, 'at least one drop occurred during grace');
+  // Leader continuously emits, never goes quiet — simulate by re-firing
+  // every 500ms (< RESTORE_GRACE_IDLE_MS=1000) so the idle gate can't close.
+  for (let i = 0; i < 8; i++) {
+    ctl.firePaneData({ paneId: 'L', data: `● @worker-1: chunk-${i}\n` });
+    clock.advance(500);
+    orch.tick();
+  }
 
-  // Advance past the window.
-  clock.advance(3500);
-
-  // New directive post-window: even if routing doesn't immediately commit
-  // (depends on idle+debounce), stats.dropped from the restoreGrace branch
-  // must NOT keep increasing — the window closed and "[orch.restoreGrace]
-  // window closed" logged exactly once.
-  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: after-grace\n' });
-  const graceLogs = out.log.filter((l) => l.includes('[orch.restoreGrace] window closed'));
-  assert.equal(graceLogs.length, 1, 'window-closed summary logged exactly once on first post-grace dispatch');
+  // By now ~4000ms elapsed — past the 3000ms deadline.
+  const deadlineCloseLogs = out.log.filter((l) =>
+    l.includes('[orch.restoreGrace] window closed (deadline)'),
+  );
+  assert.equal(deadlineCloseLogs.length, 1, 'grace closed via deadline reason (leader never settled)');
 
   orch.dispose();
 });

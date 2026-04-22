@@ -1,5 +1,20 @@
 # Changelog
 
+## [2.7.29] - 2026-04-22
+
+### Fixed
+- **Snapshot restore grace window is now idle-gated, not wall-clock** — v2.7.28 used a flat 3-second deadline on the restore grace window, intending to drop routing directives replayed from the leader's `--resume` scrollback. A user report on 2026-04-22 showed the window closing while Claude CLI was still repainting the prior assistant turn (scrollback + full `● Podium 팀 프로토콜 ... @worker-1: 안녕?` re-render takes >3s for a non-trivial session). The first parsed directive sailed past the (already-expired) window with `dropped 0 directive(s)` logged — and `worker-1` re-executed the replayed `안녕?` directive even though the user never typed a new one.
+
+  Grace is now held open while `leaderIdle.msSinceOutput < 1000` (leader has emitted output in the last 1s — indicating Ink is still mid-repaint). Grace closes as soon as the leader stays quiet for 1s (replay settled) OR the wall-clock safety cap (15s default, bumped from 3s) fires. Normal restores close via the idle gate in 2–4s; the safety cap only trips for a hung leader. `[orch.restoreGrace] window closed (leader-idle)` vs `window closed (deadline)` shows which path fired.
+
+### Internal
+- New `RESTORE_GRACE_IDLE_MS = 1000` module constant alongside `ADD_WORKER_RACE_WINDOW_MS`.
+- `PodiumOrchestrator.route()` grace branch now reads `this.leaderIdle.msSinceOutput` instead of comparing only `nowFn()` vs `restoreGraceEndsAt`. Still falls back to the wall-clock deadline when `leaderIdle` is unset (fresh-orchestrate path that never sets `restoreGraceEndsAt` — unchanged cost).
+- `index.ts` snapshot.load handler's `restoreGraceMs` bumped `3000 → 15000` (safety cap, not the expected close time).
+
+### Tests
+- 2 new cases in `podiumOrchestratorWorkerMgmt.test.ts`: directive dropped while leader emits within 1s; directive routed once leader stays silent for 1s+. Existing v2.7.28 test (grace=0 disarm) unchanged.
+
 ## [2.7.28] - 2026-04-22
 
 ### Fixed

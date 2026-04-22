@@ -973,13 +973,11 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         dispatchDebounceMs: 1200,
         cwd,
         onAutoSnapshot: makeAutoSnapshotHook(output, snap.name),
-        // v2.7.28: snapshot restore replays the leader's prior scrollback via
-        // --resume; without this grace window, the parser re-routes every
-        // prior `@worker-N:` directive into the freshly-spawned worker panes.
-        // 3s is empirically long enough for Ink to finish its initial
-        // repaint; shorter windows still miss directives emitted after
-        // Claude's first "Processing…" → response transition.
-        restoreGraceMs: 3000,
+        // v2.7.29: wall-clock SAFETY CAP only. The grace is primarily closed
+        // by `leaderIdle.msSinceOutput >= 1s` (Ink repaint settled) — see
+        // PodiumOrchestrator.route(). 15s protects against a broken or very
+        // slow leader; most restores close via the idle gate in 2–4s.
+        restoreGraceMs: 15000,
       });
 
       const sessionKey = `orch-restore-${Date.now()}`;
