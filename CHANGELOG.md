@@ -1,5 +1,28 @@
 # Changelog
 
+## [2.7.24] - 2026-04-22
+
+### Fixed
+- **Dissolve summary now reproduces worker answers verbatim** — The previous Haiku-based summarizer occasionally hallucinated "no answer found in transcript" responses even when workers had clearly printed their results, because the Claude CLI wraps assistant output with Ink frames, leader status lines, and long ANSI chrome that the model was asked to interpret in one pass. Added a deterministic first pass: `extractLastAssistantBullet()` scans the transcript for the `●` glyph that prefixes every finalized assistant reply and returns the text immediately after it (with multi-line indented continuations joined). When *every* worker produces a recognizable bullet line, `claudeBareSummarizer` skips the Haiku call entirely and emits the verbatim `- worker-N: <answer>` list. When at least one worker is missing a bullet, the Haiku fallback still runs, but with a strengthened prompt that explicitly describes the `●` convention ("the text after `●` IS the answer — copy it verbatim; never claim the answer is missing when a `●` line is present"). Verified live against an 8321ch / 3716ch transcript pair with two workers — summary returned in <100 ms (no LLM round-trip) and the leader received `- worker-1: red/blue/green translation - worker-2: 110` exactly as typed by the workers.
+
+### Internal
+- 6 new test cases in `test/unit/dissolve.test.ts` covering empty-bullet drop, whitespace-only bullet drop, multi-line indented continuation join, mixed hit/miss → Haiku fallback, all-hit → no-LLM path, and the 8321ch realistic-flood regression. 106/106 tests pass.
+
+## [2.7.23] - 2026-04-22
+
+### Changed
+- **Haiku fallback summarizer prompt hardened against "answer not in transcript" hallucinations** — Added an explicit preamble instructing the model that assistant replies are normally prefixed with the `●` glyph and that the text after `●` is the answer to copy verbatim. This was the bridge fix before the v2.7.24 deterministic extractor landed; the stricter prompt alone eliminated most but not all hallucinations, which motivated the structural fix in the next patch.
+
+## [2.7.22] - 2026-04-22
+
+### Fixed
+- **`Dissolve Team` command was not registered** — The dissolve command existed in the orchestrator but was never added to `orchestration/index.ts`'s `context.subscriptions` block, so the command palette entry resolved to "command not found" and the internal keybinding was a no-op. Added the missing registration so `claudeCodeLauncher.podium.dissolve` is now discoverable and invokable from the palette, the Teams view action, and programmatic callers.
+
+## [2.7.21] - 2026-04-22
+
+### Fixed
+- **Internal `dissolve-cmd` alias was not exposed** — The `PodiumOrchestrator.dissolveCmd` alias is used by a few internal call sites (tests and panel actions), but the orchestration layer only published the `dissolve` method. Exposed the alias on the public surface so those call sites resolve correctly. Combined with v2.7.22's registration fix, the dissolve path is wired end-to-end from command palette down to the orchestrator.
+
 ## [2.6.19] - 2026-04-20
 
 ### Fixed
