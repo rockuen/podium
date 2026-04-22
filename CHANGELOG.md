@@ -10,18 +10,23 @@
 
 ## [2.7.23] - 2026-04-22
 
-### Changed
-- **Haiku fallback summarizer prompt hardened against "answer not in transcript" hallucinations** — Added an explicit preamble instructing the model that assistant replies are normally prefixed with the `●` glyph and that the text after `●` is the answer to copy verbatim. This was the bridge fix before the v2.7.24 deterministic extractor landed; the stricter prompt alone eliminated most but not all hallucinations, which motivated the structural fix in the next patch.
+### Fixed
+- **Standalone-word spinner rows no longer bleed into dissolve summaries** — Claude CLI v2.1+ occasionally emits the Ink spinner label (`Processing…`, `Thinking…`, etc.) on its own line without the leading Braille glyph that v2.7.20's `SPINNER_RE` relied on. Those orphan-word rows slipped past the chrome filter and the summarizer treated them as worker content. Extended the chrome-filter so these standalone spinner-word rows are dropped too, alongside the existing glyph-prefixed form and the `(esc to interrupt · ctrl+t to show todos)` keyboard hint row.
 
 ## [2.7.22] - 2026-04-22
 
 ### Fixed
-- **`Dissolve Team` command was not registered** — The dissolve command existed in the orchestrator but was never added to `orchestration/index.ts`'s `context.subscriptions` block, so the command palette entry resolved to "command not found" and the internal keybinding was a no-op. Added the missing registration so `claudeCodeLauncher.podium.dissolve` is now discoverable and invokable from the palette, the Teams view action, and programmatic callers.
+- **IdleDetector no longer misses the Claude v2.1+ prompt when Ink leaves leading whitespace** — The prompt-row regexes (`>` alone and the `[OMC#<version>]` status line) required the line to start at column 0, but Ink's re-wrap pass sometimes emits them with a leading space. Prompt detection would silently miss, which cascaded into routing dispatch waiting forever for an idle signal that never came. All prompt-row patterns now accept leading whitespace, and the new `⏵⏵ bypass permissions` hint that Claude prints right below the prompt is matched too so the idle window closes promptly.
+- **`busyWorkers()` is no longer gated on `IdleDetector.isIdle`** — The pre-dissolve UX warning (introduced in v2.7.21) asked `IdleDetector` whether each worker was idle, but the detector's prompt-pattern eviction can flip `isIdle` to `true` the instant the prompt reappears even when fresh output is still arriving. That produced false "all idle" readings and skipped the warning. `busyWorkers()` now inspects the `msSinceLastOutput` timestamp directly, so a worker that has emitted output within the configurable busy threshold is still reported as busy regardless of the idle detector's view.
 
 ## [2.7.21] - 2026-04-22
 
+### Added
+- **Dissolve UX warning for busy workers** — Dissolving while a worker is still emitting output means the transcript tail the summarizer sees is incomplete, so the injected summary will miss the actual answer. The Dissolve command now calls `PodiumOrchestrator.busyWorkers()` before proceeding; if any worker has produced output within the configured busy threshold, a modal `showWarningMessage` appears listing each busy worker with its time-since-output and offers `Dissolve anyway` / `Cancel`. Both the cancel path and the "confirmed despite busy" path are logged to the Orchestration output channel for post-hoc diagnosis of rushed dissolves.
+- **Team Snapshot: rename** — Snapshot entries persisted in `claudeTeams.json` can now be renamed via the `Team Snapshot: rename` command. Complements the v2.7.19 snapshot save/load pair; a proper UI-level rename affordance in the snapshot list view is tracked for a later milestone.
+
 ### Fixed
-- **Internal `dissolve-cmd` alias was not exposed** — The `PodiumOrchestrator.dissolveCmd` alias is used by a few internal call sites (tests and panel actions), but the orchestration layer only published the `dissolve` method. Exposed the alias on the public surface so those call sites resolve correctly. Combined with v2.7.22's registration fix, the dissolve path is wired end-to-end from command palette down to the orchestrator.
+- **Ghost "leader referenced unknown worker-N" spam after dissolve is eliminated at the source** — After `dissolve()` clears the workers Map, the leader pane stays alive and Ink occasionally repaints scrollback rows that still contain old `@worker-N:` directives. The router had no target to deliver these to and logged a `leader referenced unknown "worker-N" — dropped` line for each ghost directive, which polluted the output channel with several lines per second during the post-dissolve repaint. `consumeLeaderOutput()` now short-circuits with an early return whenever `this.workers.size === 0`, so the projector never accumulates ghost state and the parser is never invoked; no log noise, no wasted cycles, and the leader's pty → webview rendering (handled by `LiveMultiPanel`, not this path) is unaffected.
 
 ## [2.6.19] - 2026-04-20
 
