@@ -1,5 +1,58 @@
 # Changelog
 
+## [0.2.0] - 2026-04-23
+
+### Remove psmux / tmux dependency
+
+Podium's orchestration layer no longer depends on an external multiplexer. Every pane — leader and workers — is now managed as a native `node-pty` process owned by the extension. The v2.6/2.7 era accumulated many psmux-specific fixes (mouse-mode scrollback, bracketed-paste LF escaping, send-keys paste-buffer quirks, kill-session zombie servers, win32-input-mode routing through send-keys); all of that surface is now gone.
+
+Primary Path A orchestration features are **unchanged**:
+
+- `Podium: Orchestrated Team (leader + 2 workers)`
+- `Podium: Orchestrated Team — Resume Leader Session`
+- `Podium: Save Team Snapshot` / `Open Saved Team...` / `Rename Saved Team...`
+- `Podium: Dissolve Team` (extract `●` bullet + Haiku fallback summarizer)
+- `Podium: Add / Remove / Rename Worker`
+
+### Removed (Path B features tied to the external multiplexer)
+
+- **`Open Claude Code` (Podium-ready variant)** — `createPodiumSession` command and its tmux/psmux wrapping (`src/pty/tmuxWrap.js`, `claudePodiumReadySessions` session-store key, ◆ badge + `organization` icon in the Sessions tree). Regular `Ctrl+Shift+;` open still works.
+- **External OMC team integration** — `team.create` (SpawnTeamPanel), `team.createIntegrated` (integrated terminal with OMC_OPENCLAW=1), `team.quickCreate`, `team.attach`, `team.kill`, `team.rename`, and the psmux-scan-based "external sessions" section of the Teams tree (SessionDetector + omcSession tree items).
+- **`Kill All Orchestration Sessions (Emergency Reset)`** — the 3-stage psmux kill-session → kill-pane → kill-server escalation. Internal orchestrator teardown is now handled entirely by `LiveMultiPanel.disposeAll()` + orchestrator registry cleanup (already landed in v2.7.27).
+- **Legacy `Show Multi-pane` (`podium.grid`)** — the psmux-polling `MultiPaneTerminalPanel` view. `LiveMultiPanel` (the v2.7.0 node-pty direct variant) is now the only multi-pane surface.
+- **Config keys**: `claudeCodeLauncher.orchestration.backend`, `claudeCodeLauncher.orchestration.sessionPrefix`, `claudeCodeLauncher.orchestration.sessionFilter`.
+- **Deleted modules** (11 files): `src/orchestration/backends/` (IMultiplexerBackend, PsmuxBackend, TmuxBackend), `src/orchestration/core/{SessionDetector,InlineTeamSpawner,OmcCoordinator,PsmuxSetup}.ts`, `src/orchestration/ui/{MultiPaneTerminalPanel,SpawnTeamPanel,TerminalPanel}.ts`, `src/orchestration/webview/multipane-main.ts`, `src/pty/tmuxWrap.js`.
+
+### Simplified
+
+- `src/panel/createPanel.js` — single direct node-pty spawn path; `podiumReady` / `tmuxSession` metadata removed from the `entry` object.
+- `src/panel/restartPty.js` — drops the `buildTmuxSpawnArgs` branch.
+- `src/pty/autoSend.js` — reduced from 97 lines (psmux send-keys + Win32 KEY_EVENT Shift+Enter chain + fallback) to 11 lines of direct `pty.write(body + '\r')`.
+- `src/store/sessionStore.js` — `listPodiumReadySessionsForCwd` removed.
+- `src/store/sessionManager.js` — `saveSessions` no longer persists `podiumReady` / `tmuxSession` / `claudePodiumReadySessions`.
+- `src/tree/SessionTreeDataProvider.js` — Podium-ready ◆ badge and `organization` icon removed.
+- `src/orchestration/index.ts` — `~350 lines` of helpers removed (`resolveBackend`, `binaryFor`, `stripDeprecationWarnings`, `runKillAll`, `LAUNCHER_PODIUM_PREFIX`, `readPodiumLabels`, `enrichFuzzyPodiumLabels`, `PodiumLabel`, `promptTeamSpec`). `TeamsTreeProvider` constructor reduced from `(detector, registry)` to `(registry)`.
+- `src/orchestration/ui/TeamsTreeProvider.ts` — rewritten from 239 lines to 90 lines; `SessionNode`, `PaneNode`, `EmptyNode` (psmux-variant), `ErrorNode` removed; now renders only live `PodiumLiveTeamNode` + `WorkerTreeItem`.
+
+### Preserved
+
+- `LiveMultiPanel` (Phase 1 · v2.7.0) — already used node-pty directly; its `addPane` / `writeToPane` / `removePane` interface is untouched.
+- `PodiumOrchestrator` routing, idle detection, dispatch debounce (1200 ms), snapshot/restore grace window, deterministic bullet-extraction summarizer — all unchanged.
+- File-based observers: `MissionWatcher`, `SessionHistoryWatcher`, `StateWatcher`, `CcgArtifactWatcher`, `TeamConversationPanel` (read-only over `.omc/state/` artifacts when OMC CLI is used externally).
+- Solo Launcher features (status icons, session save/restore, 7 themes, context usage bar, smart Ctrl+C, image paste, desktop notifications) are behavior-identical.
+- `claudeCodeLauncher.*` command IDs retained for back-compat with existing keybindings and user settings.
+
+### Known cosmetic debt (v0.2.x follow-up)
+
+- Several code comments and i18n entries still reference "tmux-wrapped sessions" or "psmux send-keys" historically. These have no functional effect (the code paths they refer to are gone) but will be scrubbed in a follow-up pass.
+- `TeamConversationPanel.sendToLeader` reads `tmux_session` from `.omc/state/.../config.json` for the "inject into leader pane" feature; when the OMC CLI is not used externally the field will be empty and the inject gracefully fails. Full removal deferred until the `.omc/state/` observer layer is re-scoped.
+
+### Tests
+
+- **142/142 tests pass.** No test file touched — all tests cover Path A functionality (orchestrator, routing, idle detection, summarizer, snapshot, worker management) which was not modified. `tsc -p . --noEmit` clean, `tsc -p . --noEmit --noUnusedLocals` reduced unused-locals surface by ~18 entries.
+
+---
+
 ## [0.1.0] - 2026-04-22
 
 ### Brand identity refresh

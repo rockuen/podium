@@ -43,14 +43,6 @@ function activate(context) {
     })
   );
 
-  // v2.6.12: Podium-ready session — wraps Claude in a tmux/psmux session so
-  // `omc team` can use this pane as leader. Opt-in only; default stays direct.
-  context.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.createPodiumSession', () => {
-      createPanel(context, extensionPath, { podiumReady: true });
-    })
-  );
-
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.renameTab', async () => {
       let activeEntry = null;
@@ -106,13 +98,7 @@ function activate(context) {
       if (filtered.length !== saved.length) {
         sessionStoreUpdate('claudeSavedSessions', filtered);
       }
-      // v2.6.12: re-apply Podium-ready flag when resuming a previously-wrapped
-      // session so the restart spawns back into its tmux session.
-      const podiumMap = sessionStoreGet('claudePodiumReadySessions', {});
-      const podiumInfo = podiumMap[sessionId];
-      const seed = { sessionId, title };
-      if (podiumInfo) seed.podiumReady = true;
-      createPanel(context, extensionPath, seed);
+      createPanel(context, extensionPath, { sessionId, title });
     })
   );
 
@@ -385,11 +371,8 @@ function activate(context) {
 function deactivate() {
   state.isDeactivating = true;
 
-  // v2.6.32: reuse saveSessions() so podiumReady / tmuxSession / titleMap /
-  // claudePodiumReadySessions all get persisted identically to the in-flight
-  // path (rename-tab etc). Previously this block hand-rolled the entry object
-  // and dropped the podium fields, so psmux-wrapped sessions restored as
-  // plain pty after VSCode reload.
+  // Persist session metadata (titles, sessionIds) before shutdown so
+  // Reload Window can restore tabs.
   if (state.context && state.panels.size > 0) {
     try {
       saveSessions();

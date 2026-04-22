@@ -21,8 +21,7 @@ import { randomUUID } from 'crypto';
 import * as path from 'path';
 import * as fs from 'fs';
 
-import { OMCRuntime, summarizeSlots, type TeamSpec, type AgentModel } from './core/OMCRuntime';
-import { SessionDetector } from './core/SessionDetector';
+import { OMCRuntime } from './core/OMCRuntime';
 import { PodiumManager } from './core/PodiumManager';
 import { ProviderHealthChecker } from './core/ProviderHealthChecker';
 import { StateWatcher } from './core/StateWatcher';
@@ -38,19 +37,11 @@ import {
 import { ensureTeamWorkerPermissions } from './core/PermissionsSetup';
 import { installGeminiAutoApprove } from './core/GeminiAutoApprove';
 
-import type { IMultiplexerBackend } from './backends/IMultiplexerBackend';
-import { TmuxBackend } from './backends/TmuxBackend';
-import { PsmuxBackend } from './backends/PsmuxBackend';
-
 import {
-  SessionNode,
   SessionTreeProvider as TeamsTreeProvider,
   PodiumLiveTeamNode,
   WorkerTreeItem,
 } from './ui/TeamsTreeProvider';
-import { TerminalPanel } from './ui/TerminalPanel';
-import { SpawnTeamPanel } from './ui/SpawnTeamPanel';
-import { MultiPaneTerminalPanel } from './ui/MultiPaneTerminalPanel';
 import { LiveMultiPanel } from './ui/LiveMultiPanel';
 import { MAX_RUNTIME_WORKERS, PodiumOrchestrator } from './core/PodiumOrchestrator';
 import { buildLeaderExtraArgs } from './core/leaderProtocol';
@@ -93,13 +84,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   output.appendLine('[orch] activating...');
 
   const config = vscode.workspace.getConfiguration(CFG_NS);
-  const prefix = config.get<string>('sessionPrefix', 'omc-team-');
   const claudeOverride = config.get<string>('claudeCommand', '') || undefined;
-
-  const backend = await resolveBackend(config.get<string>('backend', 'auto'), output);
-  const detector = new SessionDetector(backend, prefix);
-  const initialFilter = config.get<string>('sessionFilter', '') || '';
-  if (initialFilter) detector.setNameFilter(initialFilter);
 
   const runtime = new OMCRuntime(claudeOverride);
   const manager = new PodiumManager();
@@ -124,7 +109,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   });
 
   // ─── Teams tree ───
-  const teamsProvider = new TeamsTreeProvider(detector, orchestratorRegistry);
+  const teamsProvider = new TeamsTreeProvider(orchestratorRegistry);
   const teamsView = vscode.window.createTreeView('claudeCodeLauncher.teamsOrchestration', {
     treeDataProvider: teamsProvider,
     showCollapseAll: true,
@@ -287,26 +272,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         'claudeCodeLauncher.podiumModeActive',
         true,
       );
-      try {
-        const sessions = await detector.detect();
-        await vscode.commands.executeCommand(
-          'setContext',
-          'claudeCodeLauncher.hasAnyTeam',
-          sessions.length > 0,
-        );
-        output.appendLine(`[orch] podium mode ENTER (${sessions.length} team(s) detected)`);
-        vscode.window.showInformationMessage(
-          sessions.length > 0
-            ? `Podium Mode activated — ${sessions.length} team(s) detected.`
-            : 'Podium Mode activated — no teams found yet.',
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        output.appendLine(`[orch] detect error: ${msg}`);
-        vscode.window.showWarningMessage(
-          'Podium Mode activated but backend unavailable. Install tmux or psmux.',
-        );
-      }
+      output.appendLine('[orch] podium mode ENTER');
+      vscode.window.showInformationMessage('Podium Mode activated.');
     }),
     vscode.commands.registerCommand('claudeCodeLauncher.podium.exit', async () => {
       await vscode.commands.executeCommand(
@@ -325,30 +292,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
 
   // ─── Session commands ───
   ctx.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.session.filter', async () => {
-      const cfg = vscode.workspace.getConfiguration(CFG_NS);
-      const current = cfg.get<string>('sessionFilter', '') || '';
-      const next = await vscode.window.showInputBox({
-        prompt: 'Filter orchestration sessions by name substring (empty = show all)',
-        value: current,
-        placeHolder: 'e.g. haiku, codex, ui-redesign',
-      });
-      if (next === undefined) return;
-      await cfg.update('sessionFilter', next, vscode.ConfigurationTarget.Workspace);
-      detector.setNameFilter(next);
-      teamsProvider.refresh();
-      vscode.window.showInformationMessage(
-        next ? `Orchestration: filtering by "${next}"` : 'Orchestration: filter cleared',
-      );
-    }),
-    vscode.commands.registerCommand('claudeCodeLauncher.session.clearFilter', async () => {
-      await vscode.workspace
-        .getConfiguration(CFG_NS)
-        .update('sessionFilter', '', vscode.ConfigurationTarget.Workspace);
-      detector.setNameFilter('');
-      teamsProvider.refresh();
-      vscode.window.showInformationMessage('Orchestration: session filter cleared');
-    }),
     vscode.commands.registerCommand('claudeCodeLauncher.session.openDir', async (item: unknown) => {
       const snap = historyProvider.getSnapshot();
       if (!snap) return;
@@ -363,205 +306,14 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     }),
   );
 
-  // ─── Team commands ───
+  // ─── Missions view ───
   ctx.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.team.create', () => {
-      output.appendLine('[orch] team.create invoked');
-      SpawnTeamPanel.show(ctx, runtime, manager, output, providerHealth, backend);
-    }),
-    vscode.commands.registerCommand('claudeCodeLauncher.team.createIntegrated', async () => {
-      output.appendLine('[orch] team.createIntegrated invoked');
-      const spec = await promptTeamSpec();
-      if (!spec) return;
-      const resolved = runtime.resolveClaudeCli();
-      const sessionId = randomUUID();
-      const shellArgs = [...resolved.args, '--session-id', sessionId];
-      const cwd = currentCwd();
-      const term = vscode.window.createTerminal({
-        name: `Podium · ${summarizeSlots(spec.slots)}`,
-        shellPath: resolved.shell,
-        shellArgs,
-        cwd,
-        env: { FORCE_COLOR: '1', OMC_OPENCLAW: '1' },
-      });
-      term.show();
-      const delay = vscode.workspace
-        .getConfiguration(CFG_NS)
-        .get<number>('teamDispatchDelayMs', 1500);
-      setTimeout(() => {
-        const cmd = runtime.formatTeamCommand(spec);
-        term.sendText(cmd, true);
-      }, Math.max(0, delay));
-    }),
-    vscode.commands.registerCommand('claudeCodeLauncher.team.quickCreate', async () => {
-      output.appendLine('[orch] team.quickCreate invoked');
-      const spec = await promptTeamSpec();
-      if (!spec) return;
-      const cwd = currentCwd();
-      const title = `claude · ${summarizeSlots(spec.slots)}`;
-      const delay = vscode.workspace
-        .getConfiguration(CFG_NS)
-        .get<number>('teamDispatchDelayMs', 1500);
-      await TerminalPanel.openClaude(ctx, runtime, manager, output, {
-        title,
-        cwd,
-        teamSpec: spec,
-        dispatchDelayMs: delay,
-      });
-    }),
-    vscode.commands.registerCommand('claudeCodeLauncher.team.attach', async (item: unknown) => {
-      if (!(item instanceof SessionNode)) {
-        vscode.window.showWarningMessage(
-          'Claude: right-click a session in the Teams view to attach.',
-        );
-        return;
-      }
-      const sessionName = item.detected.session.name;
-      await TerminalPanel.attach(ctx, runtime, manager, output, {
-        sessionName,
-        cwd: currentCwd(),
-        multiplexerBinary: binaryFor(backend),
-      });
-    }),
-    vscode.commands.registerCommand('claudeCodeLauncher.team.rename', async (item: unknown) => {
-      let teamName: string | undefined;
-      if (item instanceof SessionNode) {
-        const sessionName = item.detected.session.name;
-        const stripped = sessionName.replace(/^omc-team-/, '');
-        const canonical = stripped.replace(/-[a-z0-9]{8}$/, '');
-        const canonicalDir = path.join(currentCwd(), '.omc', 'state', 'team', canonical);
-        const suffixedDir = path.join(currentCwd(), '.omc', 'state', 'team', stripped);
-        teamName = canonical;
-        if (!fs.existsSync(canonicalDir) && fs.existsSync(suffixedDir)) teamName = stripped;
-      } else {
-        const teamsDir = path.join(currentCwd(), '.omc', 'state', 'team');
-        if (!fs.existsSync(teamsDir)) {
-          vscode.window.showInformationMessage('Podium: no team state dirs found.');
-          return;
-        }
-        const entries = fs
-          .readdirSync(teamsDir)
-          .map((name: string) => {
-            const full = path.join(teamsDir, name);
-            try {
-              const stat = fs.statSync(full);
-              return stat.isDirectory() ? { name, mtime: stat.mtimeMs } : null;
-            } catch {
-              return null;
-            }
-          })
-          .filter((e): e is { name: string; mtime: number } => e !== null)
-          .sort((a, b) => b.mtime - a.mtime);
-        if (entries.length === 0) {
-          vscode.window.showInformationMessage('Podium: no teams to rename.');
-          return;
-        }
-        const picked = await vscode.window.showQuickPick(
-          entries.map((e) => ({
-            label: e.name,
-            description: new Date(e.mtime).toLocaleString(),
-          })),
-          { placeHolder: 'Pick a team to rename' },
-        );
-        if (!picked) return;
-        teamName = picked.label;
-      }
-      if (!teamName) return;
-      await TeamConversationPanel.renameTeam(ctx, output, currentCwd(), teamName);
-      teamsProvider.refresh();
-    }),
-    vscode.commands.registerCommand('claudeCodeLauncher.team.kill', async (item: unknown) => {
-      if (!(item instanceof SessionNode)) {
-        vscode.window.showWarningMessage(
-          'Claude: right-click a session in the Teams view to kill it.',
-        );
-        return;
-      }
-      const name = item.detected.session.name;
-      const answer = await vscode.window.showWarningMessage(
-        `Kill session "${name}"? This will also call "omc team shutdown" to release OMC state.`,
-        { modal: true },
-        'Kill',
-      );
-      if (answer !== 'Kill') return;
-
-      const teamName = name.replace(/^omc-team-/, '');
-      const canonical = teamName.replace(/-[a-z0-9]{8}$/, '');
-      const targets = canonical !== teamName ? [teamName, canonical] : [teamName];
-      output.appendLine(
-        `[orch.kill] shutdown candidates: ${targets.map((t) => `"${t}"`).join(', ')}`,
-      );
-      let anyOk = false;
-      for (const target of targets) {
-        const r = await runtime.shutdownOmcTeam(target, currentCwd());
-        const stdoutTail = (r.stdout ?? '').trim().slice(-200);
-        const stderrTail = stripDeprecationWarnings(r.stderr ?? '').trim().slice(-200);
-        if (r.ok) {
-          anyOk = true;
-          output.appendLine(
-            `[orch.kill] "${target}" -> ok${stdoutTail ? ` · ${stdoutTail}` : ''}`,
-          );
-        } else {
-          output.appendLine(
-            `[orch.kill] "${target}" -> non-fatal (exit=${r.exitCode ?? '?'})${r.errMessage ? ` err=${r.errMessage.slice(0, 160)}` : ''}${stdoutTail ? ` stdout=${stdoutTail}` : ''}${stderrTail ? ` stderr=${stderrTail}` : ''}`,
-          );
-        }
-      }
-      const omcOk = anyOk;
-      try {
-        await detector.killSession(name);
-        vscode.window.showInformationMessage(
-          omcOk
-            ? `Claude: killed session ${name} (omc team shutdown + backend kill)`
-            : `Claude: killed session ${name} (backend kill; omc shutdown skipped)`,
-        );
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        if (omcOk && /no server|not found|can't find session/i.test(msg)) {
-          vscode.window.showInformationMessage(
-            `Claude: killed session ${name} (already cleaned up by omc)`,
-          );
-        } else {
-          output.appendLine(`[orch.kill] backend kill failed: ${msg}`);
-          vscode.window.showErrorMessage(`Claude: failed to kill ${name} — ${msg}`);
-        }
-      }
-      teamsProvider.refresh();
-    }),
     vscode.commands.registerCommand('claudeCodeLauncher.team.missions.focus', async () => {
       await vscode.commands.executeCommand('workbench.view.extension.claude-code-launcher');
       await vscode.commands.executeCommand('claudeCodeLauncher.missionsPanel.focus');
     }),
     vscode.commands.registerCommand('claudeCodeLauncher.team.missions.refresh', () => {
       missionWatcher.forceRefresh();
-    }),
-  );
-
-  // ─── Emergency Reset (P0.1) ───
-  ctx.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.orchestration.killAll', async () => {
-      output.appendLine('[orch.killAll] invoked');
-      // v2.7.27: tear down in-memory orchestrators BEFORE touching the
-      // tmux/psmux session list. The runtime orchestrators are the thing
-      // the Teams tree actually reflects; leaving them behind meant the tree
-      // kept showing "ghost" teams even after a user clicked Kill All
-      // (observed 2026-04-22 — the user accumulated three stale orch entries
-      // because killAll only touched tmux, not the registry).
-      const orchCount = orchestratorRegistry.size;
-      if (orchCount > 0) {
-        for (const [key, orch] of orchestratorRegistry) {
-          try {
-            orch.dispose();
-            output.appendLine(`[orch.killAll] disposed orchestrator ${key}`);
-          } catch (err) {
-            output.appendLine(`[orch.killAll] dispose ${key} failed: ${describeErr(err)}`);
-          }
-        }
-        orchestratorRegistry.clear();
-        teamsProvider.refresh();
-        output.appendLine(`[orch.killAll] cleared ${orchCount} orchestrator registry entr${orchCount === 1 ? 'y' : 'ies'}`);
-      }
-      await runKillAll(backend, detector, teamsProvider, output, prefix);
     }),
   );
 
@@ -1278,35 +1030,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     }),
   );
 
-  // ─── Podium Mode multi-pane + dashboard ───
+  // ─── Podium Mode dashboard ───
   ctx.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.podium.grid', async (item: unknown) => {
-      let sessionName: string | undefined;
-      if (item instanceof SessionNode) {
-        sessionName = item.detected.session.name;
-      } else {
-        const all = await backend.listSessions();
-        const filtered = all.filter((s) => s.name.startsWith(prefix));
-        if (filtered.length === 0) {
-          vscode.window.showInformationMessage('Claude: no OMC sessions found. Spawn a team first.');
-          return;
-        }
-        const picked = await vscode.window.showQuickPick(
-          filtered.map((s) => ({
-            label: s.name,
-            description: `${s.windowCount} window(s)${s.attached ? ' · attached' : ''}`,
-          })),
-          { placeHolder: 'Select a session to view all panes' },
-        );
-        if (!picked) return;
-        sessionName = picked.label;
-      }
-      if (!sessionName) return;
-      const poll = vscode.workspace
-        .getConfiguration(CFG_NS)
-        .get<number>('multipane.pollIntervalMs', 1000);
-      await MultiPaneTerminalPanel.open(ctx, backend, output, sessionName, poll);
-    }),
     vscode.commands.registerCommand('claudeCodeLauncher.podium.dashboard', () => {
       output.appendLine('[orch] podium.dashboard invoked');
       HUDDashboardPanel.show(ctx, output, {
@@ -1328,36 +1053,39 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     }),
     vscode.commands.registerCommand(
       'claudeCodeLauncher.conversation.focus',
-      async (item: unknown) => {
-        let sessionName: string | undefined;
-        if (item instanceof SessionNode) {
-          sessionName = item.detected.session.name;
-        } else {
-          const all = await backend.listSessions();
-          const filtered = all.filter((s) => s.name.startsWith(prefix));
-          if (filtered.length === 0) {
-            vscode.window.showInformationMessage('Claude: no OMC team sessions found.');
-            return;
-          }
-          const picked = await vscode.window.showQuickPick(
-            filtered.map((s) => ({
-              label: s.name,
-              description: `${s.windowCount} window(s)${s.attached ? ' · attached' : ''}`,
-            })),
-            { placeHolder: 'Pick a team to inspect messages' },
-          );
-          if (!picked) return;
-          sessionName = picked.label;
-        }
-        if (!sessionName) return;
+      async () => {
         const cwd = currentCwd();
-        const stripped = sessionName.replace(/^omc-team-/, '');
-        const canonical = stripped.replace(/-[a-z0-9]{8}$/, '');
-        const canonicalDir = path.join(cwd, '.omc', 'state', 'team', canonical);
-        const suffixedDir = path.join(cwd, '.omc', 'state', 'team', stripped);
-        let teamName = canonical;
-        if (!fs.existsSync(canonicalDir) && fs.existsSync(suffixedDir)) teamName = stripped;
-        TeamConversationPanel.show(ctx, output, cwd, teamName);
+        const teamsDir = path.join(cwd, '.omc', 'state', 'team');
+        if (!fs.existsSync(teamsDir)) {
+          vscode.window.showInformationMessage('Claude: no .omc/state/team directory found.');
+          return;
+        }
+        const entries = fs
+          .readdirSync(teamsDir)
+          .map((name: string) => {
+            const full = path.join(teamsDir, name);
+            try {
+              const stat = fs.statSync(full);
+              return stat.isDirectory() ? { name, mtime: stat.mtimeMs } : null;
+            } catch {
+              return null;
+            }
+          })
+          .filter((e): e is { name: string; mtime: number } => e !== null)
+          .sort((a, b) => b.mtime - a.mtime);
+        if (entries.length === 0) {
+          vscode.window.showInformationMessage('Claude: no team directories to inspect.');
+          return;
+        }
+        const picked = await vscode.window.showQuickPick(
+          entries.map((e) => ({
+            label: e.name,
+            description: new Date(e.mtime).toLocaleString(),
+          })),
+          { placeHolder: 'Pick a team to inspect messages' },
+        );
+        if (!picked) return;
+        TeamConversationPanel.show(ctx, output, cwd, picked.label);
       },
     ),
     vscode.commands.registerCommand('claudeCodeLauncher.conversation.openLatest', () => {
@@ -1538,19 +1266,6 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   // ─── Config change + workspace folder listeners ───
   ctx.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration(`${CFG_NS}.sessionPrefix`)) {
-        const next = vscode.workspace
-          .getConfiguration(CFG_NS)
-          .get<string>('sessionPrefix', 'omc-team-');
-        detector.setPrefix(next);
-        teamsProvider.refresh();
-      }
-      if (e.affectsConfiguration(`${CFG_NS}.sessionFilter`)) {
-        const next =
-          vscode.workspace.getConfiguration(CFG_NS).get<string>('sessionFilter', '') || '';
-        detector.setNameFilter(next);
-        teamsProvider.refresh();
-      }
       if (e.affectsConfiguration(`${CFG_NS}.claudeCommand`)) {
         const next =
           vscode.workspace.getConfiguration(CFG_NS).get<string>('claudeCommand', '') || undefined;
@@ -1621,9 +1336,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     output.appendLine('[orch] rockuen.podium detected; podium.* shim skipped');
   }
 
-  output.appendLine(
-    `[orch] ready (backend=${backend.name}, prefix="${prefix}", pollingMs=${pollingMs})`,
-  );
+  output.appendLine(`[orch] ready (pollingMs=${pollingMs})`);
 
   return {
     dispose: () => {
@@ -1633,357 +1346,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
 }
 
 // ─── Helpers ───
-async function resolveBackend(
-  choice: string,
-  output: vscode.OutputChannel,
-): Promise<IMultiplexerBackend> {
-  const isWindows = process.platform === 'win32';
-  if (choice === 'tmux') return new TmuxBackend();
-  if (choice === 'psmux') return new PsmuxBackend();
-  const primary: IMultiplexerBackend = isWindows ? new PsmuxBackend() : new TmuxBackend();
-  try {
-    if (await primary.isAvailable()) {
-      output.appendLine(`[orch] backend: ${primary.name} (auto)`);
-      return primary;
-    }
-  } catch {
-    /* ignore */
-  }
-  output.appendLine(`[orch] primary backend "${primary.name}" unavailable; trying fallback`);
-  const fallback: IMultiplexerBackend = isWindows ? new TmuxBackend() : new PsmuxBackend();
-  try {
-    if (await fallback.isAvailable()) {
-      output.appendLine(`[orch] backend: ${fallback.name} (fallback)`);
-      return fallback;
-    }
-  } catch {
-    /* ignore */
-  }
-  output.appendLine('[orch] no multiplexer binary found; commands will fail until installed');
-  return primary;
-}
-
-function binaryFor(b: IMultiplexerBackend): string {
-  return b.name === 'psmux' ? 'psmux' : 'tmux';
-}
-
 function currentCwd(): string {
   const folders = vscode.workspace.workspaceFolders;
   if (folders && folders.length > 0) return folders[0].uri.fsPath;
   return process.cwd();
-}
-
-function stripDeprecationWarnings(text: string): string {
-  return text
-    .split(/\r?\n/)
-    .filter((line) => !/DeprecationWarning|trace-deprecation/i.test(line))
-    .join('\n');
-}
-
-// P0.1 Emergency Reset implementation. Lists all prefix-matching sessions,
-// confirms with the user, then attempts a 3-stage kill:
-//   1. kill-session per name (batch)
-//   2. if any remain → kill-pane per lingering pane
-//   3. if any still remain → offer kill-server as last resort
-// Finally, GC `.omc/state/sessions/<name>/` for each session we destroyed.
-//
-// Two orchestration-owned name spaces exist today:
-//   - OMC team sessions  → configurable prefix (default "omc-team-")
-//   - Launcher podium    → hardcoded "podium-leader-<sid8>" from
-//                          src/pty/tmuxWrap.js; single-Claude wrapper
-// Both are our responsibility, so the reset includes them. When P0.4 lands
-// the self-owned registry (`.claude-launcher/sessions.json → claudeTeams`)
-// will become the source of truth and this heuristic can step aside.
-const LAUNCHER_PODIUM_PREFIX = 'podium-leader-';
-
-async function runKillAll(
-  backend: IMultiplexerBackend,
-  detector: SessionDetector,
-  teamsProvider: TeamsTreeProvider,
-  output: vscode.OutputChannel,
-  prefix: string,
-): Promise<void> {
-  const initial = (await backend.listSessions().catch((err) => {
-    output.appendLine(`[orch.killAll] listSessions failed: ${describeErr(err)}`);
-    return [];
-  }));
-  const matches = (name: string) =>
-    (!!prefix && name.startsWith(prefix)) || name.startsWith(LAUNCHER_PODIUM_PREFIX);
-  const targets = initial.filter((s) => matches(s.name));
-  if (targets.length === 0) {
-    const label = prefix ? `"${prefix}" or "${LAUNCHER_PODIUM_PREFIX}"` : `"${LAUNCHER_PODIUM_PREFIX}"`;
-    vscode.window.showInformationMessage(
-      `Podium: no sessions starting with ${label} to kill.`,
-    );
-    return;
-  }
-
-  // v2.6.35: cross-reference launcher sessionStore so the modal shows WHICH
-  // Claude session each `podium-leader-*` belongs to. Reads workspace-scoped
-  // `.claude-launcher/sessions.json` (written by store/sessionManager.js) and
-  // builds tmuxSession → {sessionId, title, memo, cwd}. Unknown names stay
-  // bare. Fuzzy fallback: match the 8-char suffix against titleMap keys to
-  // rescue orphan sessions that pre-date the v2.6.32 deactivate fix.
-  const labelBy = readPodiumLabels(currentCwd(), output);
-  enrichFuzzyPodiumLabels(labelBy, currentCwd(), targets.map((t) => t.name));
-
-  // v2.6.36: multi-select QuickPick replaces the modal confirm so the user can
-  // uncheck sessions they want to keep. All candidates preselected — hitting
-  // OK with no changes preserves the original "Kill All" behavior, but now
-  // power users can de-select individual entries too. Cancel (Esc) aborts.
-  type KillPick = vscode.QuickPickItem & { name: string };
-  const picks: KillPick[] = targets.map((s) => {
-    const info = labelBy.get(s.name);
-    const detailBits: string[] = [];
-    if (info?.memo) {
-      detailBits.push(`memo="${info.memo.slice(0, 60)}${info.memo.length > 60 ? '…' : ''}"`);
-    }
-    if (info?.cwd) detailBits.push(`cwd=${path.basename(info.cwd)}`);
-    return {
-      name: s.name,
-      label: s.name,
-      description: info?.title ? `"${info.title}"` : undefined,
-      detail: detailBits.length > 0 ? detailBits.join(' · ') : undefined,
-      picked: true,
-    };
-  });
-  const chosen = (await vscode.window.showQuickPick(picks, {
-    canPickMany: true,
-    title: `Kill orchestration sessions (${targets.length} found · unchecking keeps them alive)`,
-    placeHolder: 'Uncheck any session you want to keep · Enter to kill selected · Esc to cancel',
-    ignoreFocusOut: true,
-  })) as KillPick[] | undefined;
-  if (!chosen) {
-    output.appendLine('[orch.killAll] user cancelled (Esc)');
-    return;
-  }
-  if (chosen.length === 0) {
-    output.appendLine('[orch.killAll] user de-selected every session; nothing to kill');
-    vscode.window.showInformationMessage('Podium: nothing selected, no sessions killed.');
-    return;
-  }
-  const selected = targets.filter((t) => chosen.some((c) => c.name === t.name));
-  output.appendLine(
-    `[orch.killAll] user picked ${selected.length}/${targets.length}: ${selected.map((s) => s.name).join(', ')}`,
-  );
-
-  // Stage 1 — batch kill-session
-  const killResults: { name: string; ok: boolean; err?: string }[] = [];
-  for (const s of selected) {
-    try {
-      await backend.killSession(s.name);
-      killResults.push({ name: s.name, ok: true });
-      output.appendLine(`[orch.killAll] kill-session "${s.name}" -> ok`);
-    } catch (err) {
-      const msg = describeErr(err);
-      killResults.push({ name: s.name, ok: false, err: msg });
-      output.appendLine(`[orch.killAll] kill-session "${s.name}" -> fail: ${msg}`);
-    }
-  }
-
-  // Stage 2 — re-list, escalate any lingering sessions to kill-pane
-  const afterStage1 = await backend.listSessions().catch(() => []);
-  const lingering = afterStage1.filter((s) => selected.some((t) => t.name === s.name));
-  let paneKilled = 0;
-  if (lingering.length > 0) {
-    output.appendLine(
-      `[orch.killAll] stage-2: ${lingering.length} session(s) still alive, escalating to kill-pane`,
-    );
-    for (const s of lingering) {
-      const panes = await backend.listPanes(s.name).catch(() => []);
-      for (const p of panes) {
-        try {
-          await backend.killPane(p.paneId);
-          paneKilled++;
-          output.appendLine(`[orch.killAll] kill-pane "${p.paneId}" (${s.name}) -> ok`);
-        } catch (err) {
-          output.appendLine(
-            `[orch.killAll] kill-pane "${p.paneId}" (${s.name}) -> fail: ${describeErr(err)}`,
-          );
-        }
-      }
-    }
-  }
-
-  // Stage 3 — final re-check, offer kill-server
-  const afterStage2 = await backend.listSessions().catch(() => []);
-  const remaining = afterStage2.filter((s) => selected.some((t) => t.name === s.name));
-  if (remaining.length > 0) {
-    output.appendLine(
-      `[orch.killAll] stage-3: ${remaining.length} session(s) refuse to die`,
-    );
-    const ans = await vscode.window.showWarningMessage(
-      `Podium: ${remaining.length} session(s) still alive after kill-session + kill-pane. Kill the entire ${backend.name} server? This terminates every session in this ${backend.name} instance (including non-orchestration ones).`,
-      { modal: true },
-      'Kill Server',
-    );
-    if (ans === 'Kill Server') {
-      try {
-        await backend.killServer();
-        output.appendLine(`[orch.killAll] kill-server -> ok`);
-      } catch (err) {
-        output.appendLine(`[orch.killAll] kill-server -> fail: ${describeErr(err)}`);
-        vscode.window.showErrorMessage(
-          `Podium: kill-server failed — ${describeErr(err)}`,
-        );
-      }
-    } else {
-      output.appendLine('[orch.killAll] user declined kill-server');
-    }
-  }
-
-  // GC — remove `.omc/state/sessions/<name>/` for every session we meant to kill.
-  const cwd = currentCwd();
-  const sessionsDir = path.join(cwd, '.omc', 'state', 'sessions');
-  let gcCount = 0;
-  if (fs.existsSync(sessionsDir)) {
-    for (const s of selected) {
-      const dir = path.join(sessionsDir, s.name);
-      if (fs.existsSync(dir)) {
-        try {
-          fs.rmSync(dir, { recursive: true, force: true });
-          gcCount++;
-        } catch (err) {
-          output.appendLine(`[orch.killAll] gc "${dir}" -> fail: ${describeErr(err)}`);
-        }
-      }
-    }
-  }
-
-  teamsProvider.refresh();
-
-  const okCount = killResults.filter((r) => r.ok).length;
-  vscode.window.showInformationMessage(
-    `Podium: killed ${okCount}/${selected.length} session(s)` +
-      (paneKilled > 0 ? `, ${paneKilled} pane(s) force-killed` : '') +
-      (gcCount > 0 ? `, ${gcCount} state dir(s) GC'd` : '') +
-      '.',
-  );
-}
-
-function describeErr(err: unknown): string {
-  if (!err) return '(unknown)';
-  if (err instanceof Error) return err.message;
-  return String(err);
-}
-
-// Build a `tmuxSession → {sessionId, title, memo, cwd}` lookup from the
-// launcher's workspace-scoped JSON store so Kill All / other diagnostics can
-// resolve anonymous `podium-leader-<sid8>` names back to the Claude session
-// the user actually recognizes. Mirrors the shape that store/sessionManager.js
-// writes (`claudeSessions`, `claudeSessionTitles`, `claudePodiumReadySessions`).
-interface PodiumLabel {
-  sessionId?: string;
-  title?: string;
-  memo?: string;
-  cwd?: string;
-}
-
-function readPodiumLabels(cwd: string, output: vscode.OutputChannel): Map<string, PodiumLabel> {
-  const out = new Map<string, PodiumLabel>();
-  const storePath = path.join(cwd, '.claude-launcher', 'sessions.json');
-  if (!fs.existsSync(storePath)) return out;
-  let raw: unknown;
-  try {
-    raw = JSON.parse(fs.readFileSync(storePath, 'utf8'));
-  } catch (err) {
-    output.appendLine(`[orch.labels] sessions.json parse failed: ${describeErr(err)}`);
-    return out;
-  }
-  if (!raw || typeof raw !== 'object') return out;
-  const store = raw as Record<string, unknown>;
-  const titleMap = (store.claudeSessionTitles as Record<string, string>) ?? {};
-  const sessions = Array.isArray(store.claudeSessions) ? (store.claudeSessions as Array<Record<string, unknown>>) : [];
-  const podiumMap = (store.claudePodiumReadySessions as Record<string, { tmuxSession?: string }>) ?? {};
-
-  // Primary source: live claudeSessions entries (title/memo/cwd all authoritative)
-  for (const s of sessions) {
-    const tmuxSession = typeof s.tmuxSession === 'string' ? s.tmuxSession : undefined;
-    if (!tmuxSession) continue;
-    out.set(tmuxSession, {
-      sessionId: typeof s.sessionId === 'string' ? s.sessionId : undefined,
-      title: typeof s.title === 'string' ? s.title : undefined,
-      memo: typeof s.memo === 'string' && s.memo.length > 0 ? s.memo : undefined,
-      cwd: typeof s.cwd === 'string' ? s.cwd : undefined,
-    });
-  }
-  // Durable map: covers orphan sessions whose launcher tab is already closed.
-  for (const [sessionId, info] of Object.entries(podiumMap)) {
-    const tmuxSession = info?.tmuxSession;
-    if (!tmuxSession || out.has(tmuxSession)) continue;
-    out.set(tmuxSession, {
-      sessionId,
-      title: titleMap[sessionId],
-    });
-  }
-  // Last-resort fuzzy match: `podium-leader-<sid8>` → scan titleMap for any
-  // sessionId starting with those 8 chars. Rescues truly orphan psmux sessions
-  // that pre-date the v2.6.32 deactivate fix (ones that never got written to
-  // claudePodiumReadySessions).
-  return out;
-}
-
-function enrichFuzzyPodiumLabels(
-  labels: Map<string, PodiumLabel>,
-  cwd: string,
-  targetNames: string[],
-): void {
-  const storePath = path.join(cwd, '.claude-launcher', 'sessions.json');
-  if (!fs.existsSync(storePath)) return;
-  let titleMap: Record<string, string> = {};
-  try {
-    const raw = JSON.parse(fs.readFileSync(storePath, 'utf8')) as Record<string, unknown>;
-    titleMap = (raw.claudeSessionTitles as Record<string, string>) ?? {};
-  } catch {
-    return;
-  }
-  for (const name of targetNames) {
-    if (labels.has(name)) continue;
-    const m = name.match(/^podium-leader-([a-f0-9]{8})$/i);
-    if (!m) continue;
-    const sid8 = m[1].toLowerCase();
-    const match = Object.entries(titleMap).find(([sid]) => sid.toLowerCase().startsWith(sid8));
-    if (match) {
-      labels.set(name, { sessionId: match[0], title: match[1] });
-    }
-  }
-}
-
-async function promptTeamSpec(): Promise<TeamSpec | undefined> {
-  const model = (await vscode.window.showQuickPick(
-    [
-      { label: 'claude', description: 'Anthropic Claude' },
-      { label: 'codex', description: 'OpenAI Codex' },
-      { label: 'gemini', description: 'Google Gemini' },
-    ],
-    {
-      placeHolder: 'Select model for the team (mixed models: use Webview form)',
-      matchOnDescription: true,
-    },
-  )) as { label: AgentModel } | undefined;
-  if (!model) return undefined;
-
-  const countStr = await vscode.window.showInputBox({
-    prompt: 'Number of workers (1-10)',
-    value: '2',
-    validateInput: (v) => {
-      if (!/^\d+$/.test(v)) return 'Enter an integer';
-      const n = Number(v);
-      if (n < 1 || n > 10) return 'Range: 1-10';
-      return null;
-    },
-  });
-  if (!countStr) return undefined;
-
-  const prompt = await vscode.window.showInputBox({
-    prompt: `Prompt for the ${model.label}×${countStr} team`,
-    placeHolder: 'e.g., write a haiku about tmux',
-    ignoreFocusOut: true,
-  });
-  if (prompt === undefined || prompt.trim() === '') return undefined;
-
-  return {
-    slots: [{ model: model.label, count: Number(countStr) }],
-    prompt: prompt.trim(),
-  };
 }
