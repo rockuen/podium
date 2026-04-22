@@ -185,6 +185,15 @@ export class LiveMultiPanel {
     }
   }
 
+  /**
+   * v2.7.25 · Does a pane with this id currently exist?
+   * Used by `PodiumOrchestrator.addWorker` to verify that `addPane` succeeded
+   * before mutating the worker Map (pane-first rollback ordering, ADR-1).
+   */
+  hasPane(paneId: string): boolean {
+    return this.panes.has(paneId);
+  }
+
   removePane(paneId: string): void {
     const rt = this.panes.get(paneId);
     if (!rt) return;

@@ -2,8 +2,9 @@ import * as vscode from 'vscode';
 import { SessionDetector, DetectedSession } from '../core/SessionDetector';
 import type { TmuxPane } from '../backends/IMultiplexerBackend';
 import { agentThemeIcon, detectAgent, COLOR_IDS } from './colors';
+import type { PodiumOrchestrator, WorkerConfig } from '../core/PodiumOrchestrator';
 
-type Node = SessionNode | PaneNode | EmptyNode | ErrorNode;
+type Node = SessionNode | PaneNode | EmptyNode | ErrorNode | PodiumLiveTeamNode | WorkerTreeItem;
 
 export class SessionNode extends vscode.TreeItem {
   readonly kind = 'session' as const;
@@ -68,11 +69,65 @@ class ErrorNode extends vscode.TreeItem {
   }
 }
 
+/**
+ * v2.7.25 · Top-level node representing a running PodiumOrchestrator keyed by
+ * `sessionKey`. Children are the orchestrator's current workers. Exposes
+ * `sessionKey` + `orch` as public readonly fields so the Step 8 command
+ * handlers (Add/Remove/Rename) can route through the correct orchestrator
+ * when dispatched from a tree-item context menu. `contextValue` matches the
+ * `view/item/context` `when` clause introduced by Step 7's `package.json`.
+ */
+export class PodiumLiveTeamNode extends vscode.TreeItem {
+  readonly kind = 'podiumLiveTeam' as const;
+
+  constructor(
+    public readonly sessionKey: string,
+    public readonly orch: PodiumOrchestrator,
+  ) {
+    super(sessionKey, vscode.TreeItemCollapsibleState.Expanded);
+    this.iconPath = new vscode.ThemeIcon('organization');
+    this.contextValue = 'podiumLiveTeam';
+    this.tooltip = `sessionKey=${sessionKey} · workers=${orch.listWorkers().length}`;
+  }
+}
+
+/**
+ * v2.7.25 · Leaf node representing one worker under a `PodiumLiveTeamNode`.
+ * Carries `sessionKey` + `workerId` so the context-menu command handlers can
+ * look up the orchestrator and target worker without ambiguity when multiple
+ * orchestrators run concurrently. `contextValue` matches the Remove/Rename
+ * `view/item/context` clauses.
+ */
+export class WorkerTreeItem extends vscode.TreeItem {
+  readonly kind = 'podiumWorker' as const;
+
+  constructor(
+    public readonly sessionKey: string,
+    public readonly workerId: string,
+    public readonly cfg: WorkerConfig,
+  ) {
+    super(cfg.label ?? workerId, vscode.TreeItemCollapsibleState.None);
+    this.iconPath = new vscode.ThemeIcon('person');
+    this.contextValue = 'podiumWorker';
+    this.tooltip = `id=${cfg.id} paneId=${cfg.paneId} agent=${cfg.agent} session=${sessionKey}`;
+    // When the user renamed the worker (label differs from the raw id), show
+    // the raw id next to the label so routing keys remain visible.
+    this.description = workerId !== (cfg.label ?? workerId) ? workerId : undefined;
+  }
+}
+
 export class SessionTreeProvider implements vscode.TreeDataProvider<Node> {
   private readonly changeEmitter = new vscode.EventEmitter<Node | undefined | void>();
   readonly onDidChangeTreeData = this.changeEmitter.event;
 
-  constructor(private readonly detector: SessionDetector) {}
+  constructor(
+    private readonly detector: SessionDetector,
+    // v2.7.25 · Registry of active runtime orchestrators, keyed by sessionKey.
+    // Rendered as top-level `PodiumLiveTeamNode` entries ahead of the tmux
+    // `SessionNode` entries. Refresh is driven explicitly by the Step 8
+    // command handlers after each add/remove/rename mutation.
+    private readonly orchestratorRegistry: Map<string, PodiumOrchestrator>,
+  ) {}
 
   refresh(): void {
     this.changeEmitter.fire();
@@ -84,16 +139,28 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<Node> {
 
   async getChildren(element?: Node): Promise<Node[]> {
     if (!element) {
+      // v2.7.25 · Live Podium orchestrators render above the tmux session list.
+      const liveTeams: Node[] = [...this.orchestratorRegistry.entries()].map(
+        ([key, orch]) => new PodiumLiveTeamNode(key, orch),
+      );
       try {
         const detected = await this.detector.detect();
         if (detected.length === 0) {
-          return [new EmptyNode(this.detector.getPrefix(), this.detector.getNameFilter())];
+          // Preserve existing empty-state UX for the tmux section; any live
+          // Podium teams still show above it.
+          return [...liveTeams, new EmptyNode(this.detector.getPrefix(), this.detector.getNameFilter())];
         }
-        return detected.map((d) => new SessionNode(d));
+        const existingTmuxNodes = detected.map((d) => new SessionNode(d));
+        return [...liveTeams, ...existingTmuxNodes];
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        return [new ErrorNode(msg)];
+        return [...liveTeams, new ErrorNode(msg)];
       }
+    }
+    if (element instanceof PodiumLiveTeamNode) {
+      return element.orch
+        .listWorkers()
+        .map((w) => new WorkerTreeItem(element.sessionKey, w.cfg.id, w.cfg));
     }
     if (element.kind === 'session') {
       return element.detected.panes.map((p) => new PaneNode(p));
@@ -158,3 +225,10 @@ function buildSessionTooltip(d: DetectedSession): string {
     `panes: ${d.panes.length}`,
   ].join('\n');
 }
+
+/**
+ * v2.7.25 · Canonical export name matching the Phase 4.B plan terminology.
+ * `index.ts` currently imports `SessionTreeProvider as TeamsTreeProvider`;
+ * Step 8 updates that callsite to import `TeamsTreeProvider` directly.
+ */
+export { SessionTreeProvider as TeamsTreeProvider };

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "teams": [
+    {
+      "id": "snap_test_pre_v2_7_25",
+      "name": "pre-v2.7.25 fixture (2-worker legacy)",
+      "createdAt": "2026-04-15T09:00:00.000Z",
+      "source": "manual",
+      "cwd": "C:/fixture/repo",
+      "leader": {
+        "paneId": "leader",
+        "agent": "claude",
+        "sessionId": "00000000-0000-0000-0000-00000000aaaa"
+      },
+      "workers": [
+        {
+          "paneId": "worker-1",
+          "agent": "claude",
+          "sessionId": "00000000-0000-0000-0000-000000000001"
+        },
+        {
+          "paneId": "worker-2",
+          "agent": "claude",
+          "sessionId": "00000000-0000-0000-0000-000000000002"
+        }
+      ]
+    }
+  ]
+}

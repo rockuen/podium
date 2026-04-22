@@ -40,6 +40,7 @@
 // type-only lets us exercise the full class under `node --test` without a
 // VS Code runtime stub.
 import type * as vscode from 'vscode';
+import { randomUUID } from 'node:crypto';
 import { stripAnsi } from './ansi';
 import { IdleDetector } from './idleDetector';
 import {
@@ -49,7 +50,7 @@ import {
 } from './messageRouter';
 import { buildSubmitPayload, splitSubmitPayload, needsWin32KeyEvents } from './cliInput';
 import type { AgentKind } from './agentSpawn';
-import type { LiveMultiPanel } from '../ui/LiveMultiPanel';
+import type { LiveMultiPanel, LivePaneSpec } from '../ui/LiveMultiPanel';
 import { claudeBareSummarizer, type Summarizer } from './summarizer';
 
 export interface WorkerConfig {
@@ -66,6 +67,13 @@ export interface WorkerConfig {
    * session). Used by `captureSnapshot()` so the team can be reopened.
    */
   sessionId?: string;
+  /**
+   * v2.7.25 · Display-only label (runtime-renamable via `renameWorker`).
+   * Routing uses `id`, not `label` — the routing key is immutable.
+   * Mirrors `LeaderConfig.label`; propagated into `CapturedSnapshot.workers`
+   * so snapshot save/restore preserves user-assigned names.
+   */
+  label?: string;
 }
 
 export interface LeaderConfig {
@@ -123,10 +131,14 @@ export interface OrchestratorAttachOptions {
 export interface CapturedSnapshot {
   cwd: string;
   leader: { paneId: string; agent: AgentKind; sessionId?: string; label?: string };
-  workers: { paneId: string; id: string; agent: AgentKind; sessionId?: string }[];
+  workers: { paneId: string; id: string; agent: AgentKind; sessionId?: string; label?: string }[];
 }
 
-interface WorkerRuntime {
+/**
+ * v2.7.25 · Exported so `TeamsTreeProvider` (Step 6) can type its children
+ * off the array returned by `PodiumOrchestrator.listWorkers()`.
+ */
+export interface WorkerRuntime {
   cfg: WorkerConfig;
   idle: IdleDetector;
   queue: string[];
@@ -164,6 +176,31 @@ const DEFAULT_DISPATCH_DEBOUNCE_MS = 0;
 // still catching actively-emitting workers.
 const BUSY_WARN_MS = 2000;
 
+/**
+ * v2.7.25 · Runtime worker-count cap introduced for dynamic `addWorker`.
+ * Chosen to equal `MAX_SNAPSHOTS = 10` at `teamSnapshot.ts:33` so no team
+ * can exceed snapshot retention, and to mirror the prompt-level
+ * `totalWorkers > 10` guard at `SpawnTeamPanel.ts:200-202` so UX is
+ * consistent across spawn-time and runtime paths. The SpawnTeamPanel check
+ * is prompt-level (input-slot aggregation) only; this constant is the
+ * runtime invariant for the mutable worker Map.
+ */
+export const MAX_RUNTIME_WORKERS = 10;
+
+// v2.7.25: wall-clock deadline for the idle-gated leader notify. After this
+// many ms, `scheduleLeaderNotify` commits the write even if the leader is
+// still mid-assistant-turn. Bounds the worst-case UX latency between an
+// add/remove click and the leader-pane `[system] ...` notice.
+const NOTIFY_GATE_DEADLINE_MS = 2000;
+// v2.7.25: idle-poll interval inside `scheduleLeaderNotify`. Mirrors the
+// `DEFAULT_POLL_MS` cadence so we don't spin faster than the main tick loop.
+const NOTIFY_GATE_POLL_MS = 250;
+// v2.7.25: window (ms) after `addWorker` returns during which an
+// `@worker-N:` from the leader is still considered a race. If a
+// `leader referenced unknown` drop lands within this window, the notify-
+// commit log surfaces the race so production tuning can observe it.
+const ADD_WORKER_RACE_WINDOW_MS = 500;
+
 export class PodiumOrchestrator implements vscode.Disposable {
   private readonly parser = new WorkerPatternParser();
   private readonly workers = new Map<string, WorkerRuntime>();
@@ -192,6 +229,12 @@ export class PodiumOrchestrator implements vscode.Disposable {
   private onAutoSnapshot: ((s: CapturedSnapshot, source: 'dissolve' | 'pane-exit') => void) | null = null;
   /** v2.7.19 · Guard so the first pane exit only triggers one snapshot. */
   private autoSnapshotFired = false;
+  /**
+   * v2.7.25 · Per-worker timestamp of last `addWorker` return. Used only
+   * for the race-window observability log in `route()` when a
+   * `leader referenced unknown` would otherwise drop silently.
+   */
+  private readonly recentAdds = new Map<string, number>();
 
   constructor(
     private readonly panel: LiveMultiPanel,
@@ -268,6 +311,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
     for (const { timer } of this.pendingRoute.values()) clearTimeout(timer);
     this.pendingRoute.clear();
+    this.recentAdds.clear();
     for (const s of this.subscriptions) s.dispose();
     this.subscriptions.length = 0;
     this.output.appendLine(
@@ -277,6 +321,178 @@ export class PodiumOrchestrator implements vscode.Disposable {
     this.leaderProjector = null;
     this.leader = null;
     this.workers.clear();
+  }
+
+  /**
+   * v2.7.25 · Dynamically add a worker to the running orchestrator.
+   *
+   * Rollback-safe ordering (ADR-1, Option A1 · pane-first):
+   *   1. `panel.addPane(spec)` — may silently fail (addPane logs + returns
+   *      without throwing on spawn errors).
+   *   2. Verify via `panel.hasPane(id)` — if false, throw before any Map
+   *      mutation occurs. `workers` never observes a ghost entry.
+   *   3. Build `WorkerRuntime` with fresh IdleDetector + empty queue/
+   *      recentPayloads/transcript (mirrors `attach()`'s construction).
+   *   4. `workers.set(cfg.id, runtime)`.
+   *   5. Stamp `recentAdds` for race-window observability in `route()`.
+   *   6. `scheduleLeaderNotify` ("worker-N joined…") — idle-gated with 2s
+   *      deadline, so echoes don't extend pending route timers and Win32
+   *      Shift+Enter encoding doesn't merge into in-progress user typing.
+   *
+   * Guards:
+   *   - Not attached → throws `addWorker: not attached`.
+   *   - `workers.size >= MAX_RUNTIME_WORKERS` → throws with cap message.
+   *   - Duplicate `cfg.id` → throws.
+   */
+  async addWorker(cfg: WorkerConfig): Promise<void> {
+    if (!this.leader) {
+      throw new Error('addWorker: not attached');
+    }
+    if (this.workers.size >= MAX_RUNTIME_WORKERS) {
+      throw new Error(
+        `addWorker: workers.size (${this.workers.size}) has hit MAX_RUNTIME_WORKERS cap (${MAX_RUNTIME_WORKERS})`,
+      );
+    }
+    if (this.workers.has(cfg.id)) {
+      throw new Error(`addWorker: duplicate id "${cfg.id}"`);
+    }
+
+    const sessionId = cfg.sessionId ?? randomUUID();
+    const spec: LivePaneSpec = {
+      paneId: cfg.paneId,
+      label: cfg.label ?? cfg.id,
+      agent: cfg.agent,
+      sessionId,
+      cwd: this.attachedCwd ?? process.cwd(),
+    };
+
+    // Step 1 · pane-first
+    this.panel.addPane(spec);
+    // Step 2 · verify (addPane swallows spawn failures)
+    if (!this.panel.hasPane(cfg.paneId)) {
+      throw new Error(`addWorker: pane spawn failed for "${cfg.paneId}"`);
+    }
+
+    // Step 3-4 · runtime construction + map insertion. Preserve `cfg` but
+    // stamp the resolved sessionId so captureSnapshot() can serialize it.
+    const resolvedCfg: WorkerConfig = { ...cfg, sessionId };
+    const runtime: WorkerRuntime = {
+      cfg: resolvedCfg,
+      idle: new IdleDetector({
+        agent: cfg.agent,
+        silenceMs: cfg.silenceMs,
+        now: this.nowFn,
+      }),
+      queue: [],
+      recentPayloads: new Map(),
+      transcript: '',
+    };
+    this.workers.set(cfg.id, runtime);
+
+    // Step 5 · race-window stamp. Cleaned up after the window elapses so
+    // the Map doesn't grow unbounded on long sessions.
+    this.recentAdds.set(cfg.id, this.nowFn());
+    setTimeout(() => {
+      this.recentAdds.delete(cfg.id);
+    }, ADD_WORKER_RACE_WINDOW_MS + 50);
+
+    this.output.appendLine(
+      `[orch] addWorker ${cfg.id} → ${cfg.paneId} (${cfg.agent})`,
+    );
+
+    // Step 6 · idle-gated leader notify. No `@` in the body — the
+    // substring assertion inside scheduleLeaderNotify would throw.
+    const shortId = cfg.id.replace(/^worker-/, '');
+    this.scheduleLeaderNotify(
+      `worker-${shortId} joined. You can now route to it using the standard routing syntax.`,
+    );
+  }
+
+  /**
+   * v2.7.25 · Dynamically remove a worker from the running orchestrator.
+   *
+   * Cleanup order (spec §Remove Worker):
+   *   1. Clear any pending debounce timer + pendingRoute entry for this id.
+   *   2. Drain worker.queue and recentPayloads.
+   *   3. `workers.delete(id)`.
+   *   4. `panel.removePane(paneId)` — pane-kill last so subscribers see the
+   *      cleanup state before the pty exits.
+   *   5. `scheduleLeaderNotify` with drop count.
+   *
+   * No-op (warn-log) when id is unknown. Never throws for missing id —
+   * matches `renameWorker` semantics.
+   */
+  async removeWorker(id: string): Promise<void> {
+    const worker = this.workers.get(id);
+    if (!worker) {
+      this.output.appendLine(`[orch] removeWorker: no such worker "${id}"`);
+      return;
+    }
+
+    const droppedQueue = worker.queue.length;
+    const droppedPending = this.pendingRoute.has(id) ? 1 : 0;
+    const droppedCount = droppedQueue + droppedPending;
+
+    // Step 1 · pending debounce timer + entry
+    const pending = this.pendingRoute.get(id);
+    if (pending) {
+      clearTimeout(pending.timer);
+      this.pendingRoute.delete(id);
+    }
+    // Step 2 · runtime maps
+    worker.queue.length = 0;
+    worker.recentPayloads.clear();
+    // Step 3 · orchestrator map
+    this.workers.delete(id);
+    // Also drop any recent-add stamp so a same-id re-add starts clean.
+    this.recentAdds.delete(id);
+    // Step 4 · pane kill
+    this.panel.removePane(worker.cfg.paneId);
+
+    this.output.appendLine(
+      `[orch] removeWorker ${id} droppedCount=${droppedCount} (queue=${droppedQueue} pending=${droppedPending})`,
+    );
+
+    // Step 5 · notify
+    const shortId = id.replace(/^worker-/, '');
+    const notifyBody =
+      droppedCount > 0
+        ? `worker-${shortId} removed (${droppedCount} pending dropped)`
+        : `worker-${shortId} removed (no pending)`;
+    this.scheduleLeaderNotify(notifyBody);
+  }
+
+  /**
+   * v2.7.25 · Rename a worker's display label.
+   *
+   * Label-only: `cfg.id` (the routing key) is NEVER changed. `@worker-N:`
+   * routing continues to use the original id. Silent on missing worker
+   * (warn-log only) — matches `removeWorker` semantics. Throws on empty /
+   * whitespace-only label.
+   */
+  renameWorker(id: string, displayName: string): void {
+    if (displayName.trim().length === 0) {
+      throw new Error('renameWorker: label required');
+    }
+    const worker = this.workers.get(id);
+    if (!worker) {
+      this.output.appendLine(`[orch] renameWorker: no such worker "${id}"`);
+      return;
+    }
+    const trimmed = displayName.trim();
+    worker.cfg = { ...worker.cfg, label: trimmed };
+    this.output.appendLine(`[orch] renameWorker ${id} → "${trimmed}"`);
+  }
+
+  /**
+   * v2.7.25 · Public read-accessor for the worker map. Consumed by
+   * `TeamsTreeProvider` to render the Podium live-team children. Returns
+   * a snapshot array — internal Map mutation is not exposed. The test-only
+   * `snapshot` getter above remains for unit tests that inspect queue/idle
+   * state.
+   */
+  listWorkers(): WorkerRuntime[] {
+    return [...this.workers.values()];
   }
 
   /**
@@ -302,6 +518,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
         id: w.cfg.id,
         agent: w.cfg.agent,
         sessionId: w.cfg.sessionId,
+        label: w.cfg.label,
       })),
     };
   }
@@ -410,6 +627,13 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.panel.removePane(paneId);
     }
     this.workers.clear();
+    // v2.7.25: clear any pending debounce timers whose target workers just went
+    // away. Without this, the timers fire, land in tryDispatchPending, find no
+    // worker in the Map, and no-op — benign but leaks setTimeout handles until
+    // dispose(). removeWorker already clears per-worker; dissolve needs the
+    // bulk version.
+    for (const { timer } of this.pendingRoute.values()) clearTimeout(timer);
+    this.pendingRoute.clear();
     this.stats.dissolved += workerIds.length;
     this.output.appendLine(`[orch.dissolve] killed ${workerIds.length} worker pane(s)`);
 
@@ -511,6 +735,18 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.output.appendLine(
         `[orch] leader referenced unknown "${msg.workerId}" — dropped (payload: ${preview(msg.payload)})`,
       );
+      // v2.7.25: if this id was `addWorker`'d very recently, the leader may
+      // have referenced the new id before our `workers.set` landed. Surface
+      // the race window so production tuning can observe it.
+      const addedAt = this.recentAdds.get(msg.workerId);
+      if (addedAt !== undefined) {
+        const window = this.nowFn() - addedAt;
+        if (window <= ADD_WORKER_RACE_WINDOW_MS) {
+          this.output.appendLine(
+            `[orch] addWorker racing leader reference — window=${window}ms id=${msg.workerId}`,
+          );
+        }
+      }
       this.stats.dropped += 1;
       return;
     }
@@ -645,6 +881,89 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.output.appendLine(`[orch] inject → ${w.cfg.id} FAILED — ${msg}`);
       this.stats.dropped += 1;
     }
+  }
+
+  /**
+   * v2.7.25 · Idle-gated leader notification used by `addWorker` /
+   * `removeWorker` to inform the model that its routable worker set has
+   * changed. Writes `[system] ${text}` into the leader's pty stdin via the
+   * same Win32 split-write pattern as `inject()`.
+   *
+   * Why idle-gated (ADR-2 revised under Fix 1): writing to the leader pane
+   * echoes back through the output stream. `consumeLeaderOutput` feeds the
+   * projector; a non-empty projector chunk triggers `extendPendingTimers`,
+   * which re-arms every pending worker-route timer by one full debounce
+   * window. Fire-and-forget notify would delay legitimate `@worker-N:`
+   * routing. On Win32-Claude, `buildSubmitPayload` also encodes embedded
+   * `\n` into Shift+Enter keydown/keyup pairs; writing mid-typing would
+   * merge the notify into the user's in-progress input line.
+   *
+   * Substring assertion: `@worker-` is forbidden in the body so a notify
+   * can never self-route through `messageRouter` after echoing back.
+   * All internal callers use safe phrasings ("worker-N joined",
+   * "worker-N removed (k pending dropped)") — no `@`.
+   *
+   * The gate polls `leaderIdle.isIdle` every `NOTIFY_GATE_POLL_MS`. It
+   * commits on first idle OR when `(now - t0) >= NOTIFY_GATE_DEADLINE_MS`.
+   * Detach / dispose during the wait silently aborts. Notify failures are
+   * logged but never propagate back to the caller.
+   */
+  private scheduleLeaderNotify(text: string): void {
+    // Invariant: prevent self-routing via echo.
+    if (text.includes('@worker-')) {
+      throw new Error('[orch.leaderNotify] forbidden substring @worker- in notify body');
+    }
+    if (!this.leader) return;
+
+    const t0 = this.nowFn();
+    const body = `[system] ${text}`;
+
+    const commit = () => {
+      // Re-check attachment — dispose may have fired during the poll window.
+      if (!this.leader) return;
+      const agent = this.leader.agent;
+      const paneId = this.leader.paneId;
+      const opts = { agent };
+      try {
+        if (needsWin32KeyEvents(opts)) {
+          const { body: bytes, submit } = splitSubmitPayload(body, opts);
+          this.panel.writeToPane(paneId, bytes);
+          setTimeout(() => {
+            try {
+              this.panel.writeToPane(paneId, submit);
+            } catch (err) {
+              const m = err instanceof Error ? err.message : String(err);
+              this.output.appendLine(`[orch.leaderNotify] submit write FAILED — ${m}`);
+            }
+          }, INJECT_SUBMIT_DELAY_MS);
+        } else {
+          this.panel.writeToPane(paneId, buildSubmitPayload(body, opts));
+        }
+        const waited = this.nowFn() - t0;
+        this.output.appendLine(
+          `[orch.leaderNotify] committed waited=${waited}ms text=${preview(text)}`,
+        );
+      } catch (err) {
+        const m = err instanceof Error ? err.message : String(err);
+        this.output.appendLine(`[orch.leaderNotify] commit FAILED — ${m}`);
+      }
+    };
+
+    const arm = () => {
+      // Detach / dispose during the wait → silently abort.
+      if (!this.leader) return;
+      const elapsed = this.nowFn() - t0;
+      const idleReady = !this.leaderIdle || this.leaderIdle.isIdle;
+      if (idleReady || elapsed >= NOTIFY_GATE_DEADLINE_MS) {
+        commit();
+        return;
+      }
+      setTimeout(arm, NOTIFY_GATE_POLL_MS);
+    };
+
+    // First check is synchronous — if leader is already idle, commit
+    // without any timer jitter.
+    arm();
   }
 
   /**

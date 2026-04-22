@@ -1,5 +1,26 @@
 # Changelog
 
+## [2.7.25] - 2026-04-22
+
+### Added
+- **Runtime worker add/remove/rename via TeamsTreeProvider context menus with idle-gated leader notification** — New commands `Podium: Add Worker`, `Podium: Remove Worker`, `Podium: Rename Worker` are accessible from the Teams view context menu or Command Palette. Tree UI surfaces live Podium teams with per-worker children; rename updates the displayed label while keeping the routing key (`worker-N`) immutable.
+- Leader pane is auto-notified on add/remove via idle-gated writer with 2-second wall-clock deadline (mirrors existing `tryDispatchPending` pattern) — no interference with in-progress leader turns on Windows/Claude Win32 input mode.
+- Runtime cap: `MAX_RUNTIME_WORKERS = 10` per team (matches snapshot retention and SpawnTeamPanel prompt-level guard).
+
+### Fixed
+- **N-worker snapshot compatibility — existing 2-worker snapshots continue to load; new N-worker teams save/restore seamlessly** — Snapshot schema version remains unchanged (`SNAPSHOT_SCHEMA_VERSION = 1`); roundtrip tests cover N=0, 1, 3, 5 workers plus pre-v2.7.25 2-worker fixture regression.
+
+### Internal
+- `PodiumOrchestrator` gains `addWorker`, `removeWorker`, `renameWorker`, `scheduleLeaderNotify`, `listWorkers` methods.
+- Multi-orchestrator correctness: tree commands route via `sessionKey` rather than "last entry" lookup.
+- Pane-first rollback order in `addWorker` prevents orphan Map entries on spawn failure (via new `LiveMultiPanel.hasPane` probe).
+- Regression tests: 6 new test cases covering worker lifecycle mutations, snapshot load/save across worker counts, and dissolve × runtime-add/remove/roundtrip scenarios. All tests pass.
+
+### Out of scope for v2.7.25
+- Codex/Gemini mixed worker types — runtime Add UI surfaces Claude only.
+- Routing-key rename (immutable by design in this version).
+- Auxiliary UI label sync (TerminalPanel tabs, Conversation Panel heading text on rename) — tracked as OQ-5 for v2.7.26+.
+
 ## [2.7.24] - 2026-04-22
 
 ### Fixed

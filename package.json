@@ -2,7 +2,7 @@
   "name": "cli-launcher-for-claude",
   "displayName": "CLI Launcher for Claude",
   "description": "Run Claude Code CLI in a Webview tab with status icons, session management, and rich terminal features.",
-  "version": "2.7.24",
+  "version": "2.7.25",
   "publisher": "rockuen",
   "license": "MIT",
   "repository": {
@@ -223,6 +223,24 @@
         "title": "Rename Team Display Name",
         "icon": "$(edit)",
         "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.worker.add",
+        "title": "Podium: Add Worker",
+        "category": "Podium",
+        "icon": "$(add)"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.worker.remove",
+        "title": "Podium: Remove Worker",
+        "category": "Podium",
+        "icon": "$(close)"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.worker.rename",
+        "title": "Podium: Rename Worker",
+        "category": "Podium",
+        "icon": "$(edit)"
       },
       {
         "command": "claudeCodeLauncher.team.missions.focus",
@@ -492,6 +510,21 @@
           "command": "claudeCodeLauncher.session.openDir",
           "when": "view == claudeCodeLauncher.historyPanel && (viewItem == historyEntry || viewItem == historyEntryActive)",
           "group": "inline@1"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.worker.add",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.worker.remove",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumWorker",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.worker.rename",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumWorker",
+          "group": "inline@2"
         }
       ],
       "view/title": [

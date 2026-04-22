@@ -42,12 +42,17 @@ import type { IMultiplexerBackend } from './backends/IMultiplexerBackend';
 import { TmuxBackend } from './backends/TmuxBackend';
 import { PsmuxBackend } from './backends/PsmuxBackend';
 
-import { SessionNode, SessionTreeProvider as TeamsTreeProvider } from './ui/TeamsTreeProvider';
+import {
+  SessionNode,
+  SessionTreeProvider as TeamsTreeProvider,
+  PodiumLiveTeamNode,
+  WorkerTreeItem,
+} from './ui/TeamsTreeProvider';
 import { TerminalPanel } from './ui/TerminalPanel';
 import { SpawnTeamPanel } from './ui/SpawnTeamPanel';
 import { MultiPaneTerminalPanel } from './ui/MultiPaneTerminalPanel';
 import { LiveMultiPanel } from './ui/LiveMultiPanel';
-import { PodiumOrchestrator } from './core/PodiumOrchestrator';
+import { MAX_RUNTIME_WORKERS, PodiumOrchestrator } from './core/PodiumOrchestrator';
 import { buildLeaderExtraArgs } from './core/leaderProtocol';
 import { pickClaudeSession } from './core/sessionPicker';
 import {
@@ -105,8 +110,21 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   providerHealth.start();
   ctx.subscriptions.push({ dispose: () => providerHealth.stop() });
 
+  // ─── Podium orchestrator registry (hoisted for TeamsTreeProvider wiring) ───
+  // v2.7.25 · The registry needs to be constructed before `TeamsTreeProvider`
+  // so the tree can render live `PodiumLiveTeamNode`s. The dispose hook stays
+  // attached to `ctx.subscriptions` exactly as before; only the declaration
+  // site moved up.
+  const orchestratorRegistry = new Map<string, PodiumOrchestrator>();
+  ctx.subscriptions.push({
+    dispose() {
+      for (const o of orchestratorRegistry.values()) o.dispose();
+      orchestratorRegistry.clear();
+    },
+  });
+
   // ─── Teams tree ───
-  const teamsProvider = new TeamsTreeProvider(detector);
+  const teamsProvider = new TeamsTreeProvider(detector, orchestratorRegistry);
   const teamsView = vscode.window.createTreeView('claudeCodeLauncher.teamsOrchestration', {
     treeDataProvider: teamsProvider,
     showCollapseAll: true,
@@ -116,6 +134,46 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   const pollingMs = Math.max(1000, config.get<number>('pollingIntervalMs', 5000));
   const pollTimer = setInterval(() => teamsProvider.refresh(), pollingMs);
   ctx.subscriptions.push({ dispose: () => clearInterval(pollTimer) });
+
+  // ─── Step 8 helpers · sessionKey-routed orchestrator lookup ───
+  // v2.7.25 · Used by the 3 dynamic worker commands (add/remove/rename).
+  // `lookupOrchestratorByKey` is the primary path for tree-context invocations
+  // where the `sessionKey` is already known; `pickOrchestratorViaQuickPick`
+  // is the Command Palette fallback when no tree item was clicked.
+  function lookupOrchestratorByKey(sessionKey: string): PodiumOrchestrator | undefined {
+    return orchestratorRegistry.get(sessionKey);
+  }
+
+  function warnMissingTeam(sessionKey: string): void {
+    vscode.window.showWarningMessage(
+      `Podium: team ${sessionKey} is no longer running. Close and reopen the Teams view if it looks stale.`,
+    );
+  }
+
+  async function pickOrchestratorViaQuickPick(): Promise<
+    { sessionKey: string; orch: PodiumOrchestrator } | undefined
+  > {
+    const entries = [...orchestratorRegistry.entries()];
+    if (entries.length === 0) {
+      vscode.window.showInformationMessage('Podium: no running teams to select from.');
+      return undefined;
+    }
+    if (entries.length === 1) {
+      return { sessionKey: entries[0][0], orch: entries[0][1] };
+    }
+    const items = entries.map(([key, orch]) => ({
+      label: key,
+      description: `${orch.listWorkers().length} worker(s)`,
+      sessionKey: key,
+      orch,
+    }));
+    const picked = await vscode.window.showQuickPick(items, {
+      title: 'Podium: select team',
+      placeHolder: 'Multiple Podium teams are running — pick one',
+    });
+    if (!picked) return undefined;
+    return { sessionKey: picked.sessionKey, orch: picked.orch };
+  }
 
   // ─── HUD ───
   const hudProvider = new HUDTreeProvider();
@@ -519,13 +577,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   // typed into normally; whenever its stream contains `@worker-1: ...` or
   // `@worker-2: ...`, the orchestrator injects the payload into that worker
   // once the worker's prompt is visible and its output has gone quiet.
-  const orchestratorRegistry = new Map<string, PodiumOrchestrator>();
-  ctx.subscriptions.push({
-    dispose() {
-      for (const o of orchestratorRegistry.values()) o.dispose();
-      orchestratorRegistry.clear();
-    },
-  });
+  // v2.7.25: `orchestratorRegistry` now lives at the top of `activate()` so
+  // `TeamsTreeProvider` can render live worker nodes.
 
   // v2.7.19 · Auto-save snapshot hook factory.
   // Invoked by PodiumOrchestrator on dissolve or first pane-exit; writes a
@@ -878,6 +931,185 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         vscode.window.showErrorMessage(`Podium snapshot rename failed: ${msg}`);
       }
     }),
+  );
+
+  // ─── Phase 4.B · v2.7.25 — Dynamic worker: add ───
+  // Adds a `claude` worker to an already-attached PodiumOrchestrator at
+  // runtime. Resolves the target team from (a) a `PodiumLiveTeamNode` when
+  // invoked from the tree, (b) a string `sessionKey` when invoked with an
+  // explicit argument, or (c) a QuickPick over `orchestratorRegistry`.
+  // Scope-fenced to `claude` agent only in v2.7.25 per plan Principle 5.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand(
+      'claudeCodeLauncher.podium.worker.add',
+      async (arg?: unknown) => {
+        let sessionKey: string;
+        if (arg instanceof PodiumLiveTeamNode) {
+          sessionKey = arg.sessionKey;
+        } else if (typeof arg === 'string') {
+          sessionKey = arg;
+        } else {
+          const picked = await pickOrchestratorViaQuickPick();
+          if (!picked) return;
+          sessionKey = picked.sessionKey;
+        }
+        const orch = lookupOrchestratorByKey(sessionKey);
+        if (!orch) {
+          warnMissingTeam(sessionKey);
+          return;
+        }
+        // v2.7.25: runtime add UI surfaces claude only (codex/gemini deferred).
+        const currentWorkers = orch.listWorkers();
+        if (currentWorkers.length >= MAX_RUNTIME_WORKERS) {
+          vscode.window.showErrorMessage(
+            `Podium: team ${sessionKey} already at the ${MAX_RUNTIME_WORKERS}-worker cap.`,
+          );
+          return;
+        }
+        // Compute next free worker id (worker-1, worker-2, ... skipping taken ones).
+        const usedIds = new Set(currentWorkers.map((w) => w.cfg.id));
+        let n = 1;
+        while (usedIds.has(`worker-${n}`)) n += 1;
+        const id = `worker-${n}`;
+        const sessionId = randomUUID();
+        try {
+          await orch.addWorker({ id, paneId: id, agent: 'claude', sessionId });
+          output.appendLine(`[orch.cmd] addWorker ${id} → ${sessionKey} ok`);
+          teamsProvider.refresh();
+          vscode.window.showInformationMessage(
+            `Podium: ${id} added to ${sessionKey}. Route with @${id}: ...`,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          output.appendLine(`[orch.cmd] addWorker FAILED — ${msg}`);
+          vscode.window.showErrorMessage(`Podium: addWorker failed — ${msg}`);
+        }
+      },
+    ),
+  );
+
+  // ─── Phase 4.B · v2.7.25 — Dynamic worker: remove ───
+  // Drop + Notify (no modal confirm per plan Q2). Accepts a `WorkerTreeItem`
+  // from the tree context menu, or falls back to a two-step team+worker
+  // QuickPick from the Command Palette.
+  async function removeWorkerInternal(sessionKey: string, workerId: string): Promise<void> {
+    const orch = lookupOrchestratorByKey(sessionKey);
+    if (!orch) {
+      warnMissingTeam(sessionKey);
+      return;
+    }
+    try {
+      await orch.removeWorker(workerId);
+      output.appendLine(`[orch.cmd] removeWorker ${workerId} from ${sessionKey} ok`);
+      teamsProvider.refresh();
+      vscode.window.showInformationMessage(`Podium: ${workerId} removed from ${sessionKey}.`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      output.appendLine(`[orch.cmd] removeWorker FAILED — ${msg}`);
+      vscode.window.showErrorMessage(`Podium: removeWorker failed — ${msg}`);
+    }
+  }
+
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand(
+      'claudeCodeLauncher.podium.worker.remove',
+      async (arg?: unknown) => {
+        if (arg instanceof WorkerTreeItem) {
+          await removeWorkerInternal(arg.sessionKey, arg.workerId);
+          return;
+        }
+        // Command Palette entry: two-step picker.
+        const teamPicked = await pickOrchestratorViaQuickPick();
+        if (!teamPicked) return;
+        const workers = teamPicked.orch.listWorkers();
+        if (workers.length === 0) {
+          vscode.window.showInformationMessage(
+            `Podium: team ${teamPicked.sessionKey} has no workers.`,
+          );
+          return;
+        }
+        const workerPicked = await vscode.window.showQuickPick(
+          workers.map((w) => ({
+            label: w.cfg.label ?? w.cfg.id,
+            description: w.cfg.id,
+            workerId: w.cfg.id,
+          })),
+          { title: 'Podium: remove worker', placeHolder: 'Pick worker to remove' },
+        );
+        if (!workerPicked) return;
+        await removeWorkerInternal(teamPicked.sessionKey, workerPicked.workerId);
+      },
+    ),
+  );
+
+  // ─── Phase 4.B · v2.7.25 — Dynamic worker: rename ───
+  // Display-only rename — `worker.cfg.id` (routing key) is invariant.
+  // Accepts a `WorkerTreeItem` from the tree context menu, or falls back
+  // to a two-step team+worker QuickPick from the Command Palette.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand(
+      'claudeCodeLauncher.podium.worker.rename',
+      async (arg?: unknown) => {
+        let sessionKey: string;
+        let workerId: string;
+        let currentLabel: string;
+        if (arg instanceof WorkerTreeItem) {
+          sessionKey = arg.sessionKey;
+          workerId = arg.workerId;
+          currentLabel = arg.cfg.label ?? arg.cfg.id;
+        } else {
+          // Command Palette entry: team + worker picker.
+          const teamPicked = await pickOrchestratorViaQuickPick();
+          if (!teamPicked) return;
+          const workers = teamPicked.orch.listWorkers();
+          if (workers.length === 0) {
+            vscode.window.showInformationMessage(
+              `Podium: team ${teamPicked.sessionKey} has no workers.`,
+            );
+            return;
+          }
+          const workerPicked = await vscode.window.showQuickPick(
+            workers.map((w) => ({
+              label: w.cfg.label ?? w.cfg.id,
+              description: w.cfg.id,
+              workerId: w.cfg.id,
+              currentLabel: w.cfg.label ?? w.cfg.id,
+            })),
+            { title: 'Podium: rename worker', placeHolder: 'Pick worker to rename' },
+          );
+          if (!workerPicked) return;
+          sessionKey = teamPicked.sessionKey;
+          workerId = workerPicked.workerId;
+          currentLabel = workerPicked.currentLabel;
+        }
+        const newLabel = await vscode.window.showInputBox({
+          title: `Rename ${workerId}`,
+          prompt: 'Enter a new display name (routing key stays the same)',
+          value: currentLabel,
+          validateInput: (v) => (v.trim().length === 0 ? 'Name cannot be empty' : undefined),
+        });
+        if (newLabel === undefined) return;
+        const orch = lookupOrchestratorByKey(sessionKey);
+        if (!orch) {
+          warnMissingTeam(sessionKey);
+          return;
+        }
+        try {
+          orch.renameWorker(workerId, newLabel.trim());
+          output.appendLine(
+            `[orch.cmd] renameWorker ${workerId} → "${newLabel.trim()}" in ${sessionKey}`,
+          );
+          teamsProvider.refresh();
+          vscode.window.showInformationMessage(
+            `Podium: ${workerId} is now "${newLabel.trim()}".`,
+          );
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          output.appendLine(`[orch.cmd] renameWorker FAILED — ${msg}`);
+          vscode.window.showErrorMessage(`Podium: renameWorker failed — ${msg}`);
+        }
+      },
+    ),
   );
 
   // ─── Phase 3 · v2.7.8 — Dissolve the active orchestrator's workers ───
