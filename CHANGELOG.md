@@ -1,5 +1,25 @@
 # Changelog
 
+## [2.7.27] - 2026-04-22
+
+### Fixed
+- **Orchestrator team lifecycle: no more ghost teams after tab close or Kill All** — Three related lifecycle bugs surfaced during v2.7.26 verification:
+  1. Closing a team's webview tab left the `orchestratorRegistry` entry behind. The Teams tree kept showing the dead team as a live `PodiumLiveTeamNode`; right-clicking `Add Worker` on it routed to a disposed panel and crashed with `addWorker FAILED — Webview is disposed`, **but still spawned an orphan Claude pty process** (pid captured in logs, no owner).
+  2. `Kill All Orchestrations` only killed tmux/psmux sessions — `orchestratorRegistry` was never touched, so the tree view stayed cluttered with stale entries even after the nuclear option.
+  3. Invoking `Orchestrate Team` multiple times piled new orchestrators on top of old ones with no cleanup path, compounding both issues above.
+
+  Root cause: `LiveMultiPanel.disposeAll()` tore down its `paneExitEmitter` before `pty.kill()`'s `onExit` event could fire, making the `panel.onPaneExit` subscription unreachable on user-driven tab close. `killAll` never looped through `orchestratorRegistry`.
+
+### Internal
+- `LiveMultiPanel` gains an explicit `_disposed` flag, a public `isDisposed` getter, and a new `onDidDispose` event. `addPane` / `writeToPane` / `removePane` now early-return no-op on disposed panels so a stale orchestrator reference cannot spawn orphan pty processes. `disposeAll` fires `onDidDispose` before dismantling emitters so subscribers can clean up synchronously. A new public `dispose()` method lets `killAll` tear panels down programmatically.
+- `PodiumOrchestrator.isDisposed` getter (reads from the `leader === null` disposal invariant) lets the tree view skip stale entries as a safety net.
+- Three `podium.*` command handlers (`orchestrate`, `orchestrate.resume`, `snapshot.load`) now subscribe to `panel.onDidDispose` as a first-class lifecycle path. Both the existing `onPaneExit` path and the new `onDidDispose` path call `orchestratorRegistry.delete(sessionKey)` + `teamsProvider.refresh()` so Teams tree stays consistent under any teardown.
+- `claudeCodeLauncher.orchestration.killAll` now loops `orchestratorRegistry` BEFORE running tmux cleanup, disposing each entry, clearing the map, and refreshing the tree. Log line `[orch.killAll] cleared N orchestrator registry entries` surfaces exactly what got torn down.
+- `TeamsTreeProvider.getChildren` filters `orch.isDisposed === true` from the root list as belt-and-suspenders protection.
+
+### Tests
+- 3 new `liveMultiPanel.test.ts` cases cover the disposal contract: `isDisposed` starts false; `disposeAll` flips it true exactly once; post-dispose `addPane` is a no-op (no pty spawn); `onDidDispose` fires exactly once; `dispose()` is idempotent across repeated calls.
+
 ## [2.7.26] - 2026-04-22
 
 ### Fixed

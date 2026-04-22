@@ -501,6 +501,16 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * orchestrator is attached. Workers' sessionIds come from the attach
    * config — they're populated by the caller (index.ts) before spawn.
    */
+  /**
+   * v2.7.27 · Whether `dispose()` has been called (either by `killAll`, by
+   * the panel's `onDidDispose` handler, or by a consumer). The tree provider
+   * uses this to skip stale registry entries; the command handlers can also
+   * short-circuit on a disposed orchestrator instead of racing with cleanup.
+   */
+  get isDisposed(): boolean {
+    return this.leader === null;
+  }
+
   captureSnapshot(): CapturedSnapshot {
     if (!this.leader) {
       throw new Error('PodiumOrchestrator.captureSnapshot: not attached');

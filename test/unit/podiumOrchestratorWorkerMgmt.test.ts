@@ -841,3 +841,58 @@ test('dissolve v2.7.25: add×3 + remove×1 + dissolve passes exactly the remaini
 
   orch.dispose();
 });
+
+test('v2.7.27: isDisposed getter starts false after attach, flips true after dispose()', () => {
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude' }],
+    skipAutoTick: true,
+  });
+
+  assert.equal(orch.isDisposed, false, 'orchestrator attached — not disposed');
+
+  orch.dispose();
+
+  assert.equal(orch.isDisposed, true, 'after dispose() — isDisposed is true');
+});
+
+test('v2.7.27: dispose() is idempotent — second call is no-op', () => {
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude' }],
+    skipAutoTick: true,
+  });
+
+  orch.dispose();
+  assert.equal(orch.isDisposed, true);
+
+  assert.doesNotThrow(() => orch.dispose());
+  assert.equal(orch.isDisposed, true, 'second dispose is a no-op, state stays disposed');
+});
+
+test('v2.7.27: listWorkers empty after dispose (registry cleanup invariant)', () => {
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [
+      { id: 'worker-1', paneId: 'W1', agent: 'claude' },
+      { id: 'worker-2', paneId: 'W2', agent: 'claude' },
+    ],
+    skipAutoTick: true,
+  });
+
+  assert.equal(orch.listWorkers().length, 2, 'two workers registered');
+
+  orch.dispose();
+
+  assert.equal(orch.listWorkers().length, 0, 'workers cleared on dispose');
+  assert.equal(orch.isDisposed, true);
+});

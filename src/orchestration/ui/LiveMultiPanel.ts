@@ -69,13 +69,28 @@ export class LiveMultiPanel {
   private readonly panes = new Map<string, LivePaneRuntime>();
   private ready = false;
   private readonly pendingMessages: unknown[] = [];
+  // v2.7.27: Track lifecycle explicitly. Once `disposeAll()` runs (either from
+  // the VSCode tab close or from `killAll`), further `addPane`/`writeToPane`/
+  // `removePane` calls become no-ops and an `onDidDispose` consumer (the
+  // orchestrate commands) can clean up the registry. Without this flag,
+  // `addWorker` on a stale orchestrator would still spawn a pty process that
+  // nobody tracks and immediately orphan it.
+  private _disposed = false;
 
   // Orchestrator-facing events. Fired after the webview post, so subscribers
   // see raw pty output in order.
   private readonly paneDataEmitter = new vscode.EventEmitter<PaneDataEvent>();
   private readonly paneExitEmitter = new vscode.EventEmitter<PaneExitEvent>();
+  // v2.7.27: Fires exactly once when the webview is disposed (either via the
+  // tab close button or because `killAll` tore down the panel). Consumers
+  // MUST subscribe to this rather than `onPaneExit` to detect user-driven
+  // close — `disposeAll` intentionally dismantles `paneExitEmitter` before
+  // pty.kill()'s onExit can fire, so that event path is unreachable in the
+  // tab-close case.
+  private readonly disposeEmitter = new vscode.EventEmitter<void>();
   public readonly onPaneData = this.paneDataEmitter.event;
   public readonly onPaneExit = this.paneExitEmitter.event;
+  public readonly onDidDispose = this.disposeEmitter.event;
 
   private constructor(
     private readonly panel: vscode.WebviewPanel,
@@ -83,6 +98,11 @@ export class LiveMultiPanel {
   ) {
     panel.webview.onDidReceiveMessage((m) => this.onMessage(m));
     panel.onDidDispose(() => this.disposeAll());
+  }
+
+  /** v2.7.27 · Whether this panel's webview has been torn down. */
+  get isDisposed(): boolean {
+    return this._disposed;
   }
 
   static create(
@@ -106,6 +126,15 @@ export class LiveMultiPanel {
 
   /** Spawn a CLI pane and register it for live streaming. */
   addPane(spec: LivePaneSpec): void {
+    if (this._disposed) {
+      // v2.7.27 · The webview is gone; do NOT spawn a pty because nobody
+      // would reap its onExit event or route its output. Registry cleanup
+      // should have already removed any orchestrator pointing here — the
+      // `onDidDispose` subscription in the orchestrate command handler does
+      // that. If a caller still reaches this, their reference is stale.
+      this.output.appendLine(`[live] addPane "${spec.paneId}" ignored — panel disposed`);
+      return;
+    }
     if (this.panes.has(spec.paneId)) {
       this.output.appendLine(`[live] duplicate paneId "${spec.paneId}" — ignored`);
       return;
@@ -174,6 +203,7 @@ export class LiveMultiPanel {
 
   /** Inject text into a specific pane's pty stdin (orchestrator use). */
   writeToPane(paneId: string, data: string): void {
+    if (this._disposed) return;
     const rt = this.panes.get(paneId);
     if (!rt) return;
     try {
@@ -195,6 +225,7 @@ export class LiveMultiPanel {
   }
 
   removePane(paneId: string): void {
+    if (this._disposed) return;
     const rt = this.panes.get(paneId);
     if (!rt) return;
     try {
@@ -206,6 +237,23 @@ export class LiveMultiPanel {
     rt.onExitDisposable.dispose();
     this.panes.delete(paneId);
     this.postToWebview({ type: 'remove-pane', paneId });
+  }
+
+  /**
+   * v2.7.27 · Programmatic tear-down. Same effect as the user closing the
+   * webview tab (disposeAll runs via `onDidDispose`). Safe to call more than
+   * once — the `_disposed` guard makes subsequent calls no-op.
+   */
+  dispose(): void {
+    if (this._disposed) return;
+    try {
+      this.panel.dispose();
+    } catch {
+      // panel already disposed by VSCode; disposeAll still needs to run via
+      // our onDidDispose subscription — but if that subscription was lost,
+      // fall through to explicit cleanup below.
+    }
+    if (!this._disposed) this.disposeAll();
   }
 
   reveal(): void {
@@ -268,6 +316,8 @@ export class LiveMultiPanel {
   }
 
   private disposeAll(): void {
+    if (this._disposed) return;
+    this._disposed = true;
     for (const [, rt] of this.panes) {
       try {
         rt.pty.kill();
@@ -278,6 +328,16 @@ export class LiveMultiPanel {
       rt.onExitDisposable.dispose();
     }
     this.panes.clear();
+    // v2.7.27: fire onDidDispose BEFORE disposing the emitters so consumers
+    // (orchestrate command registry cleanup) can react synchronously.
+    try {
+      this.disposeEmitter.fire();
+    } catch (err) {
+      this.output.appendLine(
+        `[live] disposeEmitter.fire threw — ${err instanceof Error ? err.message : err}`,
+      );
+    }
+    this.disposeEmitter.dispose();
     this.paneDataEmitter.dispose();
     this.paneExitEmitter.dispose();
   }

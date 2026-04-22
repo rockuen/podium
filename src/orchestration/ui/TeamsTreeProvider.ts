@@ -140,9 +140,13 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<Node> {
   async getChildren(element?: Node): Promise<Node[]> {
     if (!element) {
       // v2.7.25 · Live Podium orchestrators render above the tmux session list.
-      const liveTeams: Node[] = [...this.orchestratorRegistry.entries()].map(
-        ([key, orch]) => new PodiumLiveTeamNode(key, orch),
-      );
+      // v2.7.27 · Skip entries whose orchestrator has already been torn down
+      // — the registry should get cleaned up via `panel.onDidDispose`, but
+      // this belt-and-suspenders filter keeps the tree sane even if an
+      // orchestrator dies without the cleanup subscription firing.
+      const liveTeams: Node[] = [...this.orchestratorRegistry.entries()]
+        .filter(([, orch]) => !orch.isDisposed)
+        .map(([key, orch]) => new PodiumLiveTeamNode(key, orch));
       try {
         const detected = await this.detector.detect();
         if (detected.length === 0) {

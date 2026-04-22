@@ -541,6 +541,26 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
   ctx.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.orchestration.killAll', async () => {
       output.appendLine('[orch.killAll] invoked');
+      // v2.7.27: tear down in-memory orchestrators BEFORE touching the
+      // tmux/psmux session list. The runtime orchestrators are the thing
+      // the Teams tree actually reflects; leaving them behind meant the tree
+      // kept showing "ghost" teams even after a user clicked Kill All
+      // (observed 2026-04-22 — the user accumulated three stale orch entries
+      // because killAll only touched tmux, not the registry).
+      const orchCount = orchestratorRegistry.size;
+      if (orchCount > 0) {
+        for (const [key, orch] of orchestratorRegistry) {
+          try {
+            orch.dispose();
+            output.appendLine(`[orch.killAll] disposed orchestrator ${key}`);
+          } catch (err) {
+            output.appendLine(`[orch.killAll] dispose ${key} failed: ${describeErr(err)}`);
+          }
+        }
+        orchestratorRegistry.clear();
+        teamsProvider.refresh();
+        output.appendLine(`[orch.killAll] cleared ${orchCount} orchestrator registry entr${orchCount === 1 ? 'y' : 'ies'}`);
+      }
       await runKillAll(backend, detector, teamsProvider, output, prefix);
     }),
   );
@@ -674,6 +694,21 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         if (existing) {
           existing.dispose();
           orchestratorRegistry.delete(sessionKey);
+          teamsProvider.refresh();
+        }
+      });
+      // v2.7.27: user-driven webview close path. disposeAll() tears down
+      // paneExitEmitter before pty.kill()'s onExit can fire, so the onPaneExit
+      // subscription above is unreachable for tab-close. This handler is the
+      // only path that keeps orchestratorRegistry + tree view consistent when
+      // the user closes the team tab manually.
+      panel.onDidDispose(() => {
+        const existing = orchestratorRegistry.get(sessionKey);
+        if (existing) {
+          existing.dispose();
+          orchestratorRegistry.delete(sessionKey);
+          teamsProvider.refresh();
+          output.appendLine(`[orch] panel disposed → ${sessionKey} removed from registry`);
         }
       });
 
@@ -755,6 +790,17 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         if (existing) {
           existing.dispose();
           orchestratorRegistry.delete(sessionKey);
+          teamsProvider.refresh();
+        }
+      });
+      // v2.7.27: webview close path — see orchestrate command's identical block.
+      panel.onDidDispose(() => {
+        const existing = orchestratorRegistry.get(sessionKey);
+        if (existing) {
+          existing.dispose();
+          orchestratorRegistry.delete(sessionKey);
+          teamsProvider.refresh();
+          output.appendLine(`[orch] panel disposed → ${sessionKey} removed from registry`);
         }
       });
 
@@ -937,6 +983,17 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         if (existing) {
           existing.dispose();
           orchestratorRegistry.delete(sessionKey);
+        }
+      });
+
+      // v2.7.27: webview close path — see orchestrate command's identical block.
+      panel.onDidDispose(() => {
+        const existing = orchestratorRegistry.get(sessionKey);
+        if (existing) {
+          existing.dispose();
+          orchestratorRegistry.delete(sessionKey);
+          teamsProvider.refresh();
+          output.appendLine(`[orch] panel disposed → ${sessionKey} removed from registry`);
         }
       });
 
