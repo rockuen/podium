@@ -983,6 +983,99 @@ test('v2.7.32: grace holds through leader silence + prompt pattern until wall-cl
   orch.dispose();
 });
 
+test('v2.7.33: grace-dropped directives are seeded into dedupe cache; post-close Ink redraws do NOT re-route', () => {
+  // Field log 2026-04-22 after v2.7.32 shipped the wall-clock-only grace:
+  //   [orch.restoreGrace] window closed (deadline) — dropped 2 directive(s)
+  //   [parser yielded 2 msg(s)] banana, 1-to-5  <- user's NEW leader turn
+  //   [orch] → worker-1: banana
+  //   [orch] → worker-2: 1부터 5
+  //   [parser yielded 4 msg(s)] apple, 1-to-10, banana, 1-to-5  <- Ink redraw
+  //   [orch] queue worker-1 (busy, queue=1): "apple"  <- OLD re-routes!
+  //   [orch] queue worker-2 (busy, queue=1): 1부터 10
+  //
+  // Root cause: Claude CLI's Ink UI repaints the full alt-screen on every
+  // keystroke. Each repaint restreams the entire visible buffer, including
+  // the PREVIOUS assistant response above the input box. The parser yields
+  // those replayed `@worker-N: X` lines as fresh directives; dedupe had no
+  // record of them (they were dropped, not routed), so they passed through
+  // and got queued behind the genuinely new directives.
+  //
+  // Fix: when grace drops a directive, also seed
+  // `worker.recentPayloads.set(payload, now)`. commitRoute() consults that
+  // map and silently dedupes any payload found within `dedupeWindowMs`
+  // (default 30s, well past the 15s grace window).
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [
+      { id: 'worker-1', paneId: 'W1', agent: 'claude' },
+      { id: 'worker-2', paneId: 'W2', agent: 'claude' },
+    ],
+    skipAutoTick: true,
+    now: clock.now,
+    restoreGraceMs: 1000,
+  });
+
+  // Scrollback replay: grace drops these.
+  ctl.firePaneData({
+    paneId: 'L',
+    data: '● @worker-1: "apple"을 한글로 번역해줘\n@worker-2: 1부터 10까지의 합을 구해줘\n',
+  });
+  assert.equal(orch.snapshot.stats.dropped, 2, 'both replayed directives dropped by grace');
+
+  // Close grace via wall-clock.
+  clock.advance(1100);
+  orch.tick();
+  const closeLogs = out.log.filter((l) =>
+    l.includes('[orch.restoreGrace] window closed (deadline)'),
+  );
+  assert.equal(closeLogs.length, 1, 'grace closed via deadline');
+
+  const droppedBefore = orch.snapshot.stats.dropped;
+  const dedupedBefore = orch.snapshot.stats.deduped ?? 0;
+  const injectedBefore = orch.snapshot.stats.injected;
+  const queuedBefore = orch.snapshot.stats.queued;
+
+  // Simulate Ink redraw re-emitting the same scrollback content after grace
+  // has closed (user typed a key, Ink repainted alt-screen which still
+  // contains the prior assistant turn above the input box).
+  ctl.firePaneData({
+    paneId: 'L',
+    data: '● @worker-1: "apple"을 한글로 번역해줘\n@worker-2: 1부터 10까지의 합을 구해줘\n',
+  });
+
+  const snap = orch.snapshot.stats;
+  assert.equal(
+    snap.injected,
+    injectedBefore,
+    'NO new injections after grace close (redraw must be deduped, not delivered)',
+  );
+  assert.equal(
+    snap.queued,
+    queuedBefore,
+    'NO new queue entries after grace close (redraw must be deduped, not queued)',
+  );
+  assert.equal(
+    snap.dropped,
+    droppedBefore,
+    'drop counter unchanged (grace is closed, drops stop)',
+  );
+  assert.ok(
+    (snap.deduped ?? 0) >= dedupedBefore + 2,
+    `deduped counter bumped by 2 for the redrawn directives (was ${dedupedBefore}, got ${snap.deduped})`,
+  );
+
+  const queueLogs = out.log.filter((l) =>
+    l.match(/\[orch\] queue worker-[12] \(busy/),
+  );
+  assert.equal(queueLogs.length, 0, 'no worker queued from a replayed scrollback redraw');
+
+  orch.dispose();
+});
+
 test('v2.7.32: grace closes via wall-clock deadline even when leader is actively emitting', () => {
   const ctl = makeFakePanel();
   const out = makeOutputChannel();

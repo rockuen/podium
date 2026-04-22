@@ -808,6 +808,29 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.output.appendLine(
         `[orch.restoreGrace] dropped routing to "${msg.workerId}": ${preview(msg.payload)}`,
       );
+      // v2.7.33: seed the worker's dedupe cache with the dropped payload so
+      // post-grace Ink redraws don't re-route it.
+      //
+      // Field log 2026-04-22 after v2.7.32: grace correctly dropped 2
+      // directives from scrollback replay, but when the user typed a NEW
+      // leader request (`worker-1한테는 바나나, worker-2는 1부터 5까지`),
+      // Claude's Ink UI repainted the whole alt-screen on every keystroke.
+      // The repaint stream contained BOTH the new response AND the previous
+      // session's response (`@worker-1: "apple"`, `@worker-2: 1부터 10까지`)
+      // because Ink alt-screen keeps scrollback above the input box. The
+      // parser yielded 4 msgs; the 2 live ones routed immediately, the 2
+      // replayed-from-scrollback ones queued behind them and executed once
+      // workers went idle — re-running the prior turn.
+      //
+      // Fix: when grace drops a directive, record it in the target worker's
+      // `recentPayloads` with the current timestamp. commitRoute() already
+      // consults this map and returns early with `stats.deduped += 1` when
+      // a payload is present. `dedupeWindowMs` defaults to 30_000ms and
+      // grace is 15_000ms, so the seeded entry survives ≥15s past grace
+      // close — well beyond the typical window in which Ink redraws the
+      // prior assistant turn.
+      const w = this.workers.get(msg.workerId);
+      if (w) w.recentPayloads.set(msg.payload, this.nowFn());
       return;
     }
 

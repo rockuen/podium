@@ -1,5 +1,31 @@
 # Changelog
 
+## [2.7.33] - 2026-04-22
+
+### Fixed
+- **Snapshot restore no longer re-runs prior turn when user issues a new leader request** — v2.7.32 field log 2026-04-22 showed grace correctly dropped 2 scrollback directives (`apple` / `1부터 10까지`), but the moment the user typed a NEW leader request (`worker-1한테는 바나나... worker-2는 1부터 5까지`), Claude's Ink UI repainted the alt-screen — which still contains the PREVIOUS assistant turn above the input box — and the repaint stream re-emitted the old `@worker-N:` directives to the parser. Dedupe didn't catch them (they had been dropped, not routed, so `recentPayloads` had no record), so they queued behind the new directives and re-executed once workers went idle.
+
+  Log sequence reproducing:
+  ```
+  [orch.restoreGrace] window closed (deadline) — dropped 2 directive(s)
+  [parser yielded 2 msg(s)] banana, 1-to-5   (user's new turn)
+  [orch] → worker-1: banana
+  [orch] → worker-2: 1부터 5
+  [parser yielded 4 msg(s)] apple, 1-to-10, banana, 1-to-5   (Ink redraw)
+  [orch] queue worker-1 (busy, queue=1): "apple"   ← re-execution
+  [orch] queue worker-2 (busy, queue=1): 1부터 10
+  ```
+
+  Fix: when `restoreGrace` drops a parser-yielded directive, also seed the target worker's `recentPayloads` dedupe cache with that payload at the current timestamp. `commitRoute` already consults `recentPayloads` and returns early with `stats.deduped += 1` when a match is found within `dedupeWindowMs`. Defaults give ≥15s of post-grace-close dedupe coverage (dedupe window 30_000 ms - grace window 15_000 ms = 15 s), which is well beyond the typical delay between restore and the first user-triggered Ink redraw.
+
+### Internal
+- `PodiumOrchestrator.route()` in [PodiumOrchestrator.ts](src/orchestration/core/PodiumOrchestrator.ts) — inside the `restoreGraceEndsAt !== null` branch, after logging the drop, look up the target worker and, if present, call `w.recentPayloads.set(msg.payload, this.nowFn())`. No other state paths touched.
+- Grace drops still only count into `stats.dropped`; the new dedupe seed does NOT increment `stats.deduped` (that counter only fires on actual `commitRoute` dedupe hits).
+
+### Tests
+- New v2.7.33 regression test `grace-dropped directives are seeded into dedupe cache; post-close Ink redraws do NOT re-route`: arm grace (1 s), fire scrollback chunk → assert `dropped=2`; advance 1100 ms → assert grace closed via `(deadline)`; fire the SAME scrollback chunk again (simulating Ink's post-close repaint) → assert `injected`/`queued` unchanged, `deduped` increased by 2, and no `[orch] queue worker-N (busy...)` log lines appeared.
+- 142/142 pass (141 prior + 1 new).
+
 ## [2.7.32] - 2026-04-22
 
 ### Fixed
