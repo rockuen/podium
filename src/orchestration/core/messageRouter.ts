@@ -70,6 +70,16 @@ const TOKEN_RE = /@(leader|worker-\d+):/g;
 const END_RE = /@end\b/;
 const CLAUDE_ASSISTANT_START_RE = /^\s*●(?:\s+|(?=@(?:worker-|leader:)))/;
 const CLAUDE_ASSISTANT_CONT_RE = /^(?:\s{2,}\S|@(?:worker-\d+|leader):|@end\b)/;
+// v0.3.6 · Bare routing directive at column 0 (no leading `●` bullet, no
+// indent). Claude's assistant output sometimes drops into a new paragraph
+// after a blank line, which classifies as 'other' and kicks the projector
+// out of its assistant block; a subsequent `@worker-N:` / `@leader:`
+// directive on its own line then gets suppressed. Treating such lines as
+// assistant-start lets them both re-enter the block and make it to the
+// WorkerPatternParser. Safe against prompt echo because prompt echoes
+// always carry a `>` or `│ >` prefix (see CLAUDE_PROMPT_RE), so they
+// never match a bare `@target:` start.
+const CLAUDE_BARE_DIRECTIVE_RE = /^@(?:worker-\d+|leader):/;
 const CLAUDE_PROMPT_RE = /^(?:>\s.*|>\s*$|│\s*>\s*.*)$/;
 const CLAUDE_STATUS_RE = /^(?:\[OMC#[\d.]+\].*|⏵⏵\s+bypass permissions.*)$/;
 const CLAUDE_CHROME_RE = /^[\s─━│┃╭╮╰╯┌┐└┘┏┓┗┛]+$/;
@@ -407,6 +417,12 @@ function classifyClaudeLine(
   line: string,
 ): 'assistant-start' | 'assistant-cont' | 'prompt' | 'status' | 'chrome' | 'blank' | 'other' {
   if (CLAUDE_ASSISTANT_START_RE.test(line)) return 'assistant-start';
+  // v0.3.6 · Bare directive line at column 0 — re-enter the assistant block
+  // so the projector emits it even if an earlier 'other' paragraph had
+  // closed the block. Checked before CLAUDE_PROMPT_RE et al, but after the
+  // bullet-prefixed CLAUDE_ASSISTANT_START_RE so the existing "start" path
+  // stays authoritative for normally-formatted leader responses.
+  if (CLAUDE_BARE_DIRECTIVE_RE.test(line)) return 'assistant-start';
   if (line.trim().length === 0) return 'blank';
   if (CLAUDE_PROMPT_RE.test(line)) return 'prompt';
   if (CLAUDE_STATUS_RE.test(line)) return 'status';

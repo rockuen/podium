@@ -234,3 +234,60 @@ test('projector+parser: chunk-boundary split still dispatches both workers', () 
   assert.equal(msgs[1].workerId, 'worker-2');
   assert.equal(msgs[1].payload, 'banana is the answer.');
 });
+
+test('projector v0.3.6: bare @worker-N: after plain paragraph is emitted', () => {
+  // Regression for v0.3.5 field log: leader opened with `●` bullet, wrote a
+  // multi-paragraph reply, then emitted a bare `@worker-1:` directive on
+  // its own line. Pre-fix, the plain-paragraph line ("먼저 worker-1에게…")
+  // classified as 'other' and kicked the projector out of its assistant
+  // block; the subsequent directive was dropped and never reached the
+  // parser. v0.3.6 classifies bare `@target:` lines as assistant-start so
+  // they re-enter the block.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '● 좋습니다. 이 볼트 환경과 관련된 작업입니다.\n' +
+    '  파일명 파서가 필요합니다.\n' +
+    '\n' +
+    '먼저 worker-1에게 초안을 맡기겠습니다.\n' +
+    '\n' +
+    '@worker-1: TypeScript 함수 초안을 작성해줘.\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 1, `expected 1 routed msg, got ${msgs.length}; projected=${JSON.stringify(projected)}`);
+  assert.equal(msgs[0].workerId, 'worker-1');
+  assert.ok(msgs[0].payload.startsWith('TypeScript 함수'));
+});
+
+test('projector v0.3.6: bare @leader: line from worker re-enters assistant block', () => {
+  // Symmetric case on the worker side. Worker's reply contains a plain
+  // paragraph followed by a `@leader:` reply directive — must not be
+  // suppressed.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '● 구현 완료했습니다. 함수 2개 작성함.\n' +
+    '\n' +
+    '결과를 리더에게 전달하겠습니다.\n' +
+    '\n' +
+    '@leader: 구현 완료, 함수 2개.\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 1, `expected 1 routed msg, got ${msgs.length}; projected=${JSON.stringify(projected)}`);
+  assert.equal(msgs[0].workerId, 'leader');
+  assert.ok(msgs[0].payload.startsWith('구현 완료'));
+});
+
+test('projector v0.3.6: prompt echo with bare @worker- still dropped', () => {
+  // Prompt echo ALWAYS carries a `>` prefix, so bare @worker-N at column 0
+  // can never be a pasted echo. The new bare-directive classifier must not
+  // accidentally admit prompt echoes.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '> @worker-1: I typed this as input, echo only.\n' +
+    '────────────\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 0, 'prompt echo must not route');
+});
