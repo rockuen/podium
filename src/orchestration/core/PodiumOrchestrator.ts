@@ -298,6 +298,37 @@ const DEFAULT_DEDUPE_WINDOW_MS = 1_800_000;
 const TURN_COOLDOWN_MS = 1500;
 
 /**
+ * v0.7.3 — Cross-turn dedupe window.
+ *
+ * B strategy (v0.5.0) dedupes same-turn repeats but allows legitimately
+ * different turns to re-route the same payload. Field logs from the
+ * v0.7.2 reverseString task chain showed that this opens a loophole
+ * for Ink alt-screen scrollback repaints: as the leader emits new
+ * delegations, Ink periodically re-emits the ENTIRE scrollback of past
+ * turns. Since those past `@worker-N:` lines now arrive in a later
+ * turnId, the B-only dedupe lets them through and the orchestrator
+ * re-routes a task that was already delivered and answered two turns
+ * ago.
+ *
+ * Fix: even across turns, if the exact same normalized key was routed
+ * within CROSS_TURN_DEDUPE_MS (2 min), suppress. Legitimate user
+ * re-delegations of identical text within 2 min are rare and almost
+ * always an explicit retry that the user can trivially rephrase.
+ */
+const CROSS_TURN_DEDUPE_MS = 120_000;
+
+/**
+ * v0.7.3 — Maximum time leader→worker / worker→leader injects wait for
+ * the leader to be idle before firing anyway. Claude's Ink TUI does
+ * not always honor the submit key (`\r`) while it is streaming a long
+ * response — the body lands in the bottom input box but stays
+ * unsubmitted until the user presses Enter manually. Holding the
+ * inject until leader idle sidesteps that. The upper bound prevents
+ * indefinite buildup if the leader is stuck.
+ */
+const LEADER_IDLE_WAIT_MAX_MS = 3000;
+
+/**
  * v0.6.0 — Spill threshold for worker replies.
  *
  * When a worker's current-turn transcript (bytes since its last busy→idle
@@ -442,7 +473,18 @@ export class PodiumOrchestrator implements vscode.Disposable {
    */
   private readonly pendingLeaderInject = new Map<
     string,
-    { payload: string; timer: ReturnType<typeof setTimeout> }
+    {
+      payload: string;
+      timer: ReturnType<typeof setTimeout>;
+      /**
+       * v0.7.3 — When the leader-idle gate first observes leader busy,
+       * stamp the time here. Subsequent re-arms compare against this to
+       * cap the total wait at LEADER_IDLE_WAIT_MAX_MS — after which the
+       * inject commits anyway so a never-idle leader does not strand
+       * worker replies indefinitely.
+       */
+      leaderGateStartedAt?: number;
+    }
   >();
   /** v2.7.19 · Captured cwd for team snapshot export. */
   private attachedCwd: string | null = null;
@@ -1347,12 +1389,26 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // already moved on to a new task.
     const key = this.dedupeKey(payload);
     const lastSeen = this.leaderRecentPayloads.get(key);
-    if (lastSeen !== undefined && lastSeen.turnId === this.leaderTurnId) {
-      this.stats.deduped += 1;
-      this.output.appendLine(
-        `[orch.commit] leader (from ${sourcePaneId}) deduped (same turn=${this.leaderTurnId}, key="${preview(key, 40)}")`,
-      );
-      return;
+    // v0.5.0 (B) + v0.7.3 cross-turn dedupe window — see commitRoute for
+    // rationale. Same-turn OR within-2-min across turns → drop. Worker
+    // panes also repaint scrollback and yield stale @leader: directives;
+    // this suppresses those ghosts without blocking legitimate re-uses
+    // after the window expires.
+    if (lastSeen !== undefined) {
+      if (lastSeen.turnId === this.leaderTurnId) {
+        this.stats.deduped += 1;
+        this.output.appendLine(
+          `[orch.commit] leader (from ${sourcePaneId}) deduped (same turn=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+        );
+        return;
+      }
+      if (nowMs - lastSeen.ts < CROSS_TURN_DEDUPE_MS) {
+        this.stats.deduped += 1;
+        this.output.appendLine(
+          `[orch.commit] leader (from ${sourcePaneId}) deduped (cross-turn within ${CROSS_TURN_DEDUPE_MS}ms: prior turn=${lastSeen.turnId}, cur=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+        );
+        return;
+      }
     }
     if (this.enforceRoundCap(`leader (from ${sourcePaneId})`, payload)) return;
     this.leaderRecentPayloads.set(key, { turnId: this.leaderTurnId, ts: nowMs });
@@ -1437,7 +1493,16 @@ export class PodiumOrchestrator implements vscode.Disposable {
       () => this.tryDispatchPendingLeader(sourcePaneId, payload),
       this.dispatchDebounceMs,
     );
-    this.pendingLeaderInject.set(sourcePaneId, { payload, timer });
+    // v0.7.3 — Preserve leaderGateStartedAt across re-arms so the
+    // cumulative wait toward LEADER_IDLE_WAIT_MAX_MS is honored. A
+    // re-arm is an extension of the same pending inject, not a fresh
+    // one; if we reset the stamp every debounce cycle the cap would
+    // never be reached.
+    this.pendingLeaderInject.set(sourcePaneId, {
+      payload,
+      timer,
+      leaderGateStartedAt: existing?.leaderGateStartedAt,
+    });
   }
 
   private tryDispatchPendingLeader(sourcePaneId: string, payload: string): void {
@@ -1450,6 +1515,28 @@ export class PodiumOrchestrator implements vscode.Disposable {
       const ms = source.idle.msSinceOutput;
       this.output.appendLine(
         `[orch.debounce] re-arm leader←${sourcePaneId} (source busy, msSinceOutput=${ms}ms): ${preview(payload)}`,
+      );
+      this.armLeaderDispatchTimer(sourcePaneId, payload);
+      return;
+    }
+    // v0.7.3 — Also gate on LEADER idle. Claude's Ink TUI sometimes
+    // does not honor the submit (`\r`) key while the leader is
+    // streaming its own response — the body bytes land in the bottom
+    // input box but the submit is eaten by the in-progress render, so
+    // the user has to press Enter manually. Waiting for leader idle
+    // sidesteps that. Bounded by LEADER_IDLE_WAIT_MAX_MS so we never
+    // lose an inject if the leader never settles.
+    const pending = this.pendingLeaderInject.get(sourcePaneId);
+    const waited = pending?.leaderGateStartedAt !== undefined
+      ? this.nowFn() - pending.leaderGateStartedAt
+      : 0;
+    if (this.leaderIdle && !this.leaderIdle.isIdle && waited < LEADER_IDLE_WAIT_MAX_MS) {
+      if (pending && pending.leaderGateStartedAt === undefined) {
+        pending.leaderGateStartedAt = this.nowFn();
+      }
+      const ms = this.leaderIdle.msSinceOutput;
+      this.output.appendLine(
+        `[orch.debounce] re-arm leader←${sourcePaneId} (leader busy, waited=${waited}ms/${LEADER_IDLE_WAIT_MAX_MS}ms, leader msSinceOutput=${ms}ms): ${preview(payload)}`,
       );
       this.armLeaderDispatchTimer(sourcePaneId, payload);
       return;
@@ -1512,18 +1599,26 @@ export class PodiumOrchestrator implements vscode.Disposable {
     this.pruneRecent(w, nowMs);
     const key = this.dedupeKey(payload);
     const lastSeen = w.recentPayloads.get(key);
-    // v0.5.0 · (B) Turn-based dedupe
-    // -------------------------------
-    // Same-turn repeat → drop. Different turn reusing the same key is
-    // allowed through so a later user prompt can legitimately re-delegate
-    // the same task text (e.g. "retry the failing test") without being
-    // silently suppressed. A+C still apply at the key level.
-    if (lastSeen !== undefined && lastSeen.turnId === this.leaderTurnId) {
-      this.stats.deduped += 1;
-      this.output.appendLine(
-        `[orch.commit] ${w.cfg.id} deduped (same turn=${this.leaderTurnId}, key="${preview(key, 40)}")`,
-      );
-      return;
+    // v0.5.0 (B) same-turn dedupe + v0.7.3 cross-turn dedupe window.
+    // Same-turn repeat → drop. Different turn with SAME key within
+    // CROSS_TURN_DEDUPE_MS → also drop (catches Ink scrollback repaints
+    // that span turn boundaries). Different turn older than the window
+    // → allowed through for legitimate re-delegation.
+    if (lastSeen !== undefined) {
+      if (lastSeen.turnId === this.leaderTurnId) {
+        this.stats.deduped += 1;
+        this.output.appendLine(
+          `[orch.commit] ${w.cfg.id} deduped (same turn=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+        );
+        return;
+      }
+      if (nowMs - lastSeen.ts < CROSS_TURN_DEDUPE_MS) {
+        this.stats.deduped += 1;
+        this.output.appendLine(
+          `[orch.commit] ${w.cfg.id} deduped (cross-turn within ${CROSS_TURN_DEDUPE_MS}ms: prior turn=${lastSeen.turnId}, cur=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+        );
+        return;
+      }
     }
     // v0.3.0: enforce round cap AFTER dedupe so Ink redraws of a single
     // commit don't exhaust the budget. Once the cap is hit the route is
