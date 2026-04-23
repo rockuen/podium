@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.8.6] - 2026-04-24
+
+### Fix · Sanitizer hotfix — asterisk spinner + bare counter
+
+Two `isInkNoise` test assertions failed the v0.8.5 release pipeline
+(the build still shipped, but the repo carried a red test):
+
+- `*      el in` — Claude's spinner rotation cycles through ASCII
+  `*` alongside the unicode glyphs. Line-start `*` followed by a
+  short letter/whitespace tail is the diagnostic fragment shape
+  drawn during `Channelling…` / `Pouncing…`.
+- `↑ 6` — bare arrow + digit that Ink paints mid-stream.
+
+Added `ASTERISK_FRAGMENT_RE` and `BARE_COUNTER_RE` so both match.
+Scope is narrow (short length, start-anchored) to avoid colliding
+with legitimate markdown list items or inline asterisks.
+
 ## [0.8.5] - 2026-04-24
 
 ### Fix · Drop sanitizer (P0-1 from 2026-04-24 retro)

@@ -95,6 +95,14 @@ export function isCosmeticLine(line: string): boolean {
 //   5. Tool-use chrome: "⎿ path", "● Reading 1 file…", "Found 1 settings
 //      issue · /doctor for details", "ctrl+g to edit in Notepad".
 const SPINNER_CHARS_RE = /[✻✶✢·✽]/;
+// v0.8.6 — Claude's spinner rotation also cycles through ASCII `*`. We
+// can't blanket-treat `*` as noise (markdown list items, regex, glob),
+// so catch it only when it stands alone at line-start with a short
+// letter/whitespace-only tail — the diagnostic shape of the rendering
+// fragment (e.g. "*      el in" drawn during "Channelling…").
+const ASTERISK_FRAGMENT_RE = /^\s*\*\s+[A-Za-z\s…]{1,12}\s*$/;
+// Bare arrow-and-digit status counters Ink paints during streaming.
+const BARE_COUNTER_RE = /^\s*[↑↓]\s*\d+\s*$/;
 const THINKING_VERB_RE = /^\s*[✻✶✢·✽]?\s*(Channelling|Pouncing|Saut[ée]ed|Cooked|Harmonizing|Manifesting|Thinking|Processing|Reticulating|Percolating|Distilling|Simmering|Brewing|Marinating|Rendering|Contemplating|Cogitating|Deliberating|Musing|Ruminating|Pondering|Reflecting|Noodling|Pouring|Whisking|Kneading|Braising|Poaching|Grilling|Roasting|Frying|Baking|Steaming|Broiling|Sizzling|Pickling|Curing|Aging|Fermenting|Smoking|Blending|Infusing|Reducing|Glazing|Searing)…?/i;
 const TIMING_MARKER_RE = /\(\s*\d+s\s*·|·\s*thinking\)/;
 const TOKEN_COUNTER_RE = /(?:^|\s)(?:↑|↓)?\s*\d+\s+tokens\b|\bthinking\b/;
@@ -128,6 +136,8 @@ export function isInkNoise(line: string): boolean {
   // 3. Timing / token markers.
   if (TIMING_MARKER_RE.test(t)) return true;
   if (TOKEN_COUNTER_RE.test(t) && t.length < 80) return true;
+  if (BARE_COUNTER_RE.test(t)) return true;
+  if (ASTERISK_FRAGMENT_RE.test(t)) return true;
 
   // 4. Box-drawing only, Claude logo art, or a bare logo row.
   if (BOX_RULE_RE.test(t)) return true;
