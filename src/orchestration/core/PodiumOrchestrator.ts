@@ -568,6 +568,20 @@ export class PodiumOrchestrator implements vscode.Disposable {
     if (opts.dedupeWindowMs !== undefined) this.dedupeWindowMs = opts.dedupeWindowMs;
     if (opts.dispatchDebounceMs !== undefined) this.dispatchDebounceMs = opts.dispatchDebounceMs;
     this.attachedCwd = opts.cwd ?? process.cwd();
+    // v0.9.0 · Archive orphan drops from prior sessions.
+    // Move any top-level `*.md` files in `<cwd>/.omc/team/drops/` to
+    // `<cwd>/.omc/team/drops/archive/<ISO>/`. Evidence: 2026-04-24
+    // parseCSV retrospective (Section G) — `turn1-seq1.md` from a prior
+    // reverseString session remained on disk and made turn numbering
+    // forensic analysis costly. Each fresh attach now clears the drops
+    // root into a timestamped archive so the new session owns a clean
+    // workspace. History is preserved, not deleted.
+    try {
+      this.archivePriorDrops(this.attachedCwd);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch.drops] archive on attach FAILED — ${msg}`);
+    }
     this.onAutoSnapshot = opts.onAutoSnapshot ?? null;
     this.autoSnapshotFired = false;
     // v0.3.0 bidirectional + round cap wiring
@@ -1776,6 +1790,42 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * File path: `<attachedCwd>/.omc/team/drops/<worker>-turn<N>-seq<S>.md`
    * (`.omc/` is already gitignored at the project root).
    */
+  /**
+   * v0.9.0 — Archive top-level `*.md` drops from a prior session.
+   *
+   * Called once per `attach()`. Moves any `.md` files directly inside
+   * `<cwd>/.omc/team/drops/` into `<cwd>/.omc/team/drops/archive/<ISO>/`
+   * so the new session starts with a clean drops root. Subdirectories
+   * (including `archive/`) are left alone — re-archiving is a no-op.
+   *
+   * Non-fatal: caller wraps in try/catch and logs. Archive failure
+   * never blocks attach.
+   */
+  private archivePriorDrops(cwd: string): void {
+    const dropsDir = path.join(cwd, '.omc', 'team', 'drops');
+    if (!fs.existsSync(dropsDir)) return;
+
+    const entries = fs.readdirSync(dropsDir, { withFileTypes: true });
+    const orphans = entries.filter((e) => e.isFile() && e.name.endsWith('.md'));
+    if (orphans.length === 0) return;
+
+    // Filesystem-safe ISO-ish stamp (no ':' or '.'; Windows-hostile).
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archiveDir = path.join(dropsDir, 'archive', stamp);
+    fs.mkdirSync(archiveDir, { recursive: true });
+
+    for (const f of orphans) {
+      const src = path.join(dropsDir, f.name);
+      const dst = path.join(archiveDir, f.name);
+      fs.renameSync(src, dst);
+    }
+
+    const archiveRel = path.posix.join('.omc', 'team', 'drops', 'archive', stamp);
+    this.output.appendLine(
+      `[orch.drops] archived ${orphans.length} prior drop(s) → ${archiveRel}`,
+    );
+  }
+
   private spillAndNotify(w: WorkerRuntime, turnBody: string): void {
     w.spillSeq += 1;
     const root = this.attachedCwd ?? process.cwd();
@@ -1787,8 +1837,10 @@ export class PodiumOrchestrator implements vscode.Disposable {
     try {
       fs.mkdirSync(dir, { recursive: true });
       const now = new Date().toISOString();
+      const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
       const header =
         `# Drop: ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
+        `session: ${session}\n` +
         `timestamp: ${now}\n` +
         `bytes: ${turnBody.length}\n` +
         `---\n\n`;
@@ -1958,9 +2010,11 @@ export class PodiumOrchestrator implements vscode.Disposable {
     try {
       fs.mkdirSync(dir, { recursive: true });
       const now = new Date().toISOString();
+      const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
       const header =
         `# Drop: leader → ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
         `direction: leader → ${w.cfg.id}\n` +
+        `session: ${session}\n` +
         `timestamp: ${now}\n` +
         `bytes: ${payload.length}\n` +
         `---\n\n`;

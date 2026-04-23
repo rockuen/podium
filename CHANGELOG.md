@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.9.0] - 2026-04-24
+
+### Feature · Drops forensics — archive on attach + session marker
+
+Closes N7 from the 2026-04-24 parseCSV retrospective (Section G).
+Field evidence: `to-worker-1-turn1-seq1.md` from a prior session's
+reverseString task remained on disk when the next session spawned,
+and the new session started writing from `turn2-seq1` onwards. Turn
+numbers across drop files no longer corresponded to conversation
+turns, and cross-session forensics had to disambiguate which drop
+belonged to which session by content inspection.
+
+On every `attach()`, any top-level `*.md` files in
+`<cwd>/.omc/team/drops/` are now moved into
+`<cwd>/.omc/team/drops/archive/<ISO-timestamp>/`. Subdirectories
+(including `archive/` itself) are preserved in place, so
+re-archiving is idempotent and prior archives are never
+double-moved. Failure is non-fatal and never blocks attach — the
+error is logged and the orchestrator continues with a clean-in-
+intent drops root.
+
+Drop file headers now include a `session: <first-8-chars>` field
+taken from `leader.sessionId`. Combined with the archive layout,
+any file found in `drops/` or `drops/archive/<ts>/` is
+self-identifying without cross-referencing filesystem timestamps.
+Missing `sessionId` falls back to `unknown` (e.g., tests that don't
+inject one).
+
+### Tests
+
+Five new v0.9.0 cases in `test/unit/dropsArchive.test.ts`:
+
+- `no pre-existing drops → nothing happens` — idempotent entry.
+- `pre-existing drops are moved to archive/<ISO>/` — core behavior.
+- `existing archive/ subdir is NOT moved into itself` — re-attach
+  idempotency.
+- `non-.md files are ignored (left at root)` — `.gitkeep`, stray
+  text files remain; only drops move.
+- `archive folder name is filesystem-safe` — ISO timestamp with
+  `:` and `.` stripped, so Windows paths are valid.
+
+All 214 tests green. No regressions in parser, idle detection,
+projector, or orchestrator suites.
+
+### Deferred to later releases
+
+2026-04-24 parseCSV retrospective also flagged seven other items
+(N1–N6, N8). This release intentionally takes only N7 — the
+smallest well-specified forensic improvement that can ship
+without architectural change. Larger items (ACK protocol builtin
+— N3, recovery-round exclusion — N6, redelivery metadata — N2,
+auto-file flip — N4) need dedicated design passes and will land
+in subsequent releases.
+
 ## [0.8.9] - 2026-04-24
 
 ### Fix · Parser folds Ink wraps that arrive with no 2-space indent
