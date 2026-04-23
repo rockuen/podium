@@ -127,6 +127,107 @@ test('router v0.8.7: held partial is released by flush on leader idle', () => {
   assert.match(flushed[0].payload, /Intl\.Segmenter/);
 });
 
+// ─────────────────────────────────────────────────────────────────────
+// v0.8.9 — indent-less wrap continuation.
+//
+// Field evidence (2026-04-23 session, drop `to-worker-2-turn4-seq1.md`,
+// 60B): leader emitted
+//     @worker-2: .omc/team/artifacts/reverseString.js의 구현을 리뷰해줘. 체크할 포인트: (1)\nIntl.Seg...
+// in a SINGLE pty chunk. The `\n` after "(1)" was an Ink visual wrap,
+// but the wrapped row `Intl.Seg...` had NO 2-space indent. v0.8.7's
+// continuation rule required indent AND end-of-buffer hold only fires
+// when `\n` is buffer-last — neither matched, so parser yielded the
+// truncated "체크할 포인트: (1)" payload. Worker-2 received unusable
+// instructions and had to reconstruct from context.
+//
+// Fix: when (a) payload-so-far is wrap-suspect (≥30 chars, no terminal
+// punctuation), and (b) next line is not a new `@target:` / `@end` /
+// blank, fold into the directive even without the 2-space indent. The
+// legitimate leader-multi-line-prose case is handled by the terminal-
+// punctuation guard (v0.4.2) and the blank-line guard.
+//
+// Pairs with `normalize()` update: single-line folded `\n` (with any
+// or no indent) collapses to a single space.
+// ─────────────────────────────────────────────────────────────────────
+
+test('router v0.8.9: indent-less wrap continuation in same chunk folds', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-2: .omc/team/artifacts/reverseString.js의 구현을 리뷰해줘. 체크할 포인트: (1)\nIntl.Segmenter fallback을 확인해줘.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].workerId, 'worker-2');
+  assert.match(msgs[0].payload, /체크할 포인트: \(1\)/);
+  assert.match(msgs[0].payload, /Intl\.Segmenter fallback/);
+});
+
+test('router v0.8.9: indent-less wrap across two pty chunks folds', () => {
+  // Stronger form: the v0.8.7 chunk-split fix required indent on the
+  // continuation. This asserts no-indent continuation also works.
+  const p = new WorkerPatternParser();
+  const msgs1 = p.feed(
+    '@worker-2: .omc/team/artifacts/reverseString.js의 구현을 리뷰해줘. 체크할 포인트: (1)\n',
+  );
+  assert.equal(msgs1.length, 0, 'v0.8.7 end-of-buffer hold must fire');
+  const msgs2 = p.feed('Intl.Segmenter fallback을 확인해줘.\n');
+  assert.equal(msgs2.length, 1);
+  assert.match(msgs2[0].payload, /체크할 포인트: \(1\)/);
+  assert.match(msgs2[0].payload, /Intl\.Segmenter fallback/);
+});
+
+test('router v0.8.9: short payload without terminal punct does NOT force-fold', () => {
+  // Guard against over-holding. "apple" is too short to be mid-wrap —
+  // a real wrap only happens when the line is long enough for Ink to
+  // break it. Threshold = 30 chars (consistent with v0.8.7).
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: apple\nother text\n');
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload, 'apple');
+});
+
+test('router v0.8.9: terminal punct ends directive even with long no-indent follow', () => {
+  // Payload ends with `.` — clearly complete. Follow-up line must NOT
+  // be folded regardless of length.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: this is a long enough directive ending with a period.\nseparate narrative that should not be folded in.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(
+    msgs[0].payload,
+    'this is a long enough directive ending with a period.',
+  );
+});
+
+test('router v0.8.9: next @target directive terminates a long no-punct payload', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: long directive without terminal punct but another target follows\n@worker-2: second task.\n',
+  );
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0].workerId, 'worker-1');
+  assert.equal(
+    msgs[0].payload,
+    'long directive without terminal punct but another target follows',
+  );
+  assert.equal(msgs[1].workerId, 'worker-2');
+  assert.equal(msgs[1].payload, 'second task.');
+});
+
+test('router v0.8.9: blank line after long no-punct payload still terminates', () => {
+  // Blank line is a stronger signal than absence of terminal punct —
+  // it says "paragraph ended here". Do not fold across blank lines.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: long directive without terminal punct that keeps going\n\nfollowing paragraph is separate.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(
+    msgs[0].payload,
+    'long directive without terminal punct that keeps going',
+  );
+});
+
 // ─── Claude leader projector ───
 
 test('projector: ignores user prompt echo and input-box chrome', () => {

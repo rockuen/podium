@@ -1,5 +1,59 @@
 # Changelog
 
+## [0.8.9] - 2026-04-24
+
+### Fix · Parser folds Ink wraps that arrive with no 2-space indent
+
+Companion to v0.8.8 — addresses the second P0 from the 2026-04-24
+retrospective. Field evidence (drop `to-worker-2-turn4-seq1.md`,
+60B, session 2026-04-23): leader emitted
+    `@worker-2: .omc/team/artifacts/reverseString.js의 구현을 리뷰해줘. 체크할 포인트: (1)\nIntl.Segmenter...`
+in a single pty chunk. The `\n` after `"(1)"` was an Ink visual
+wrap, but the wrapped row arrived WITHOUT the 2-space indent that
+v2.7.15's continuation rule required. v0.8.7's end-of-buffer hold
+didn't fire either (the `\n` was not the last byte — `Intl.Seg...`
+followed in the same chunk). Parser terminated at `\n`, yielded
+`"체크할 포인트: (1)"`, and worker-2 had to reconstruct the intent
+from surrounding context.
+
+Fix: `findSingleLineTerminator` treats a non-indented next line as
+continuation when the payload-so-far is wrap-suspect —
+    `!endsWithTerminalPunctuation && payloadSoFar.length >= 30`
+— provided the usual terminate-signals (new `@target:` directive,
+`@end`, blank line) are absent. The legitimate leader-multi-line-
+narrative case is still caught by the terminal-punctuation guard
+(v0.4.2) and the blank-line guard.
+
+Pairs with a `normalize()` update: single-line folded `\n` with any
+indent (including zero) collapses to a single space. Any `\n` that
+survives to normalize is confirmed by the terminator logic to be
+mid-payload, so the collapse is always correct for single-line bodies.
+
+Asymmetry rationale: under-fold is silent truncation — worker gets
+unusable instructions, leader never notices. Over-fold is recoverable
+— worker reads a few extra tokens of context, task proceeds. Prefer
+over-fold when the signal is ambiguous.
+
+### Tests
+
+Six new v0.8.9 cases in `messageRouter.test.ts`:
+
+- `indent-less wrap continuation in same chunk folds` — verbatim
+  field drop reproduction. Was the RED baseline.
+- `indent-less wrap across two pty chunks folds` — cooperates with
+  v0.8.7 end-of-buffer hold across chunk boundaries.
+- `short payload without terminal punct does NOT force-fold` —
+  threshold guard; `"apple"` is too short to plausibly be wrap.
+- `terminal punct ends directive even with long no-indent follow` —
+  v0.4.2 terminal-punctuation guard preserved.
+- `next @target directive terminates a long no-punct payload` —
+  explicit target boundary wins over wrap-suspect heuristic.
+- `blank line after long no-punct payload still terminates` —
+  paragraph-break guard preserved.
+
+All 209 tests green. No regressions in v2.7.15 / v0.4.2 / CRLF /
+ellipsis / multi-directive / chunk-boundary fixtures.
+
 ## [0.8.8] - 2026-04-24
 
 ### Fix · Drop sanitizer covers the remaining 2026-04 verb set

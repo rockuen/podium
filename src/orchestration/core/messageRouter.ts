@@ -467,8 +467,30 @@ export class WorkerPatternParser {
       const payloadSoFar = this.buffer.slice(from, chosen.payloadEnd);
       const endsWithTerminalPunctuation =
         /[.!?。！？](?:["'"'')）\]]+)?\s*$/.test(payloadSoFar);
+      // v0.8.9 · no-indent wrap continuation
+      // -------------------------------------
+      // Field evidence (2026-04-23 `to-worker-2-turn4-seq1.md`, 60B): Ink
+      // occasionally wraps long directives onto the next visual row with
+      // NO 2-space indent. v2.7.15 required indent to classify as
+      // continuation, so these landed as premature terminators and the
+      // worker received a directive cut mid-sentence at "(1)".
+      //
+      // When the payload is long enough that Ink would plausibly have
+      // wrapped it (WRAP_SUSPECT_THRESHOLD chars, same as the v0.8.7
+      // end-of-buffer hold) AND has no terminal punctuation, treat a
+      // non-indented next line as continuation too — provided it's not a
+      // new `@target:`, not `@end`, and not blank. Those three guards
+      // still correctly terminate the legitimate leader-multi-line cases.
+      //
+      // Asymmetry rationale: under-fold is silent truncation (worker
+      // gets unusable instructions, leader never notices). Over-fold is
+      // recoverable (worker reads a few extra tokens of context). Prefer
+      // over-fold when the signal is ambiguous.
+      const WRAP_SUSPECT_THRESHOLD = 30;
+      const isWrapSuspect =
+        !endsWithTerminalPunctuation && payloadSoFar.length >= WRAP_SUSPECT_THRESHOLD;
       const isContinuation =
-        isIndented &&
+        (isIndented || isWrapSuspect) &&
         !startsWithTarget &&
         !startsWithEnd &&
         !isBlank &&
@@ -506,16 +528,22 @@ export class WorkerPatternParser {
 
   /**
    * Single-line normalize: strip leading bullet/indent, fold continuation
-   * rows (\n + 2+ space indent) back to a single space, trim trailing
-   * whitespace. v2.7.15: the continuation fold mirrors the terminator
-   * lookahead — without it the raw slice would contain the raw `\n  `
-   * sequences that Ink used for visual wrapping, and the worker would see
-   * an awkwardly-broken prompt.
+   * rows back to a single space, trim trailing whitespace. Mirrors the
+   * terminator lookahead in `findSingleLineTerminator`.
+   *
+   * v2.7.15 folded `\n` + 2+ space indent (Ink's default wrap form).
+   * v0.8.9 folds `\n` with any indent (including 0), because Ink
+   * occasionally emits wraps without the 2-space indent and the parser
+   * now accepts those as continuations when the payload is wrap-suspect.
+   * Any `\n` that survived to this point is confirmed to be mid-payload
+   * (the parser already ruled out target/end/blank/terminal-punct), so
+   * collapsing it to a single space is always correct for single-line
+   * bodies.
    */
   private normalize(raw: string): string {
     return raw
       .replace(/^[ \t●•\-*]+/, '')
-      .replace(/\r?\n[ \t]{2,}/g, ' ')
+      .replace(/\r?\n[ \t]*/g, ' ')
       .replace(/[ \t\r\n]+$/g, '');
   }
 
