@@ -545,6 +545,14 @@ test('orch v0.6.0: long worker turn body spills to drop file + leader notice', a
   feedPrompt(ctl, 'W1', 'claude');
   clock.advance(200);
 
+  // v0.6.1 — Spill is now gated on `hasPendingReply` being true,
+  // which is set when the orchestrator injects into the worker.
+  // Fire an initial `@worker-1:` directive from the leader so the
+  // worker is marked as having a pending reply; otherwise the spill
+  // branch is skipped (treated as boot/repaint noise).
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: 구현해줘.\n' });
+  clock.advance(200);
+
   // Simulate worker emitting a long multi-line code reply.
   const longBody =
     '@leader:\n' +
@@ -591,6 +599,72 @@ test('orch v0.6.0: long worker turn body spills to drop file + leader notice', a
   orch.dispose();
 });
 
+test('orch v0.6.1: worker boot output without preceding inject must NOT spill', async () => {
+  // Field bug v0.6.0: on summonTeam, Claude workers emit a multi-kilobyte
+  // boot UI (welcome screen, status bar, bypass-permissions notice) that
+  // accumulated in `transcript` and crossed SPILL_THRESHOLD_CHARS. Tick's
+  // idle-edge handler then spilled it as if it were a reply, injecting
+  // spurious `[drop from worker-N turn 0]` notices into the leader, which
+  // triggered a runaway meta-analysis cascade (leader tried to explain
+  // why workers had produced empty frames, delegating investigation back
+  // to workers, recursively).
+  //
+  // v0.6.1 gates spill/flush on `hasPendingReply` — only set by inject().
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-boot-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+  });
+
+  // Simulate a long boot-time burst from the worker — no inject preceded it.
+  const bootNoise =
+    '╭──────────────────────────────────────────────────╮\n' +
+    '│  Claude Code v2.1.118                           │\n' +
+    '│  Opus 4.7 (1M context) — Claude Max             │\n' +
+    "│  c:\\\\obsidian\\\\Won's 2nd Brain                    │\n" +
+    '╰──────────────────────────────────────────────────╯\n' +
+    '[OMC#4.12.0] | 5h:5%(4h4m) wk:46%(4d20h) sn:0%(5d15h)\n' +
+    '⏵⏵ bypass permissions on (shift+tab to cycle)\n' +
+    '>\n'.repeat(10);
+  assert.ok(bootNoise.length > 300, 'boot noise must exceed spill threshold to exercise the gate');
+
+  ctl.firePaneData({ paneId: 'W1', data: bootNoise });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+  (orch as any).tick();
+
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  assert.equal(
+    files.length,
+    0,
+    `boot noise must not spill. files: ${files.join(', ')}`,
+  );
+
+  // And the leader must not have been poked with a drop notice.
+  const leaderWrites = ctl.writes.filter((w) => w.paneId === 'L').map((w) => w.data).join('');
+  assert.ok(
+    !leaderWrites.includes('[drop from worker-1'),
+    `boot noise produced a drop notice: ${leaderWrites}`,
+  );
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
 test('orch v0.6.0: short worker reply stays on parser path (no drop file)', async () => {
   // Negative control: body under threshold routes via parser as before.
   const os = await import('node:os');
@@ -614,6 +688,9 @@ test('orch v0.6.0: short worker reply stays on parser path (no drop file)', asyn
   feedPrompt(ctl, 'W1', 'claude');
   clock.advance(200);
 
+  // Prime hasPendingReply via an inject; then emit short reply.
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: say ok.\n' });
+  clock.advance(200);
   ctl.firePaneData({ paneId: 'W1', data: '@leader: 짧은 확인 답변.\n' });
   feedPrompt(ctl, 'W1', 'claude');
   clock.advance(200);

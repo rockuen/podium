@@ -254,6 +254,17 @@ export interface WorkerRuntime {
   currentTurnStart: number;
   /** Monotonic seq used for drop filenames; disambiguates multiple spills per turn. */
   spillSeq: number;
+  /**
+   * v0.6.1 — True when the worker has received an orchestrator-initiated
+   * inject since its last busy→idle edge. Gates spill/flush: if a worker
+   * transitions idle without ever having been addressed (boot output
+   * settling, Ink repaint, anything else that is NOT a reply to a
+   * delegated task), we skip both spill and parser.flush so we do not
+   * emit spurious drop notices into the leader and trigger runaway
+   * meta-analysis loops. `inject()` sets it true. The idle-edge handler
+   * resets it to false after handling.
+   */
+  hasPendingReply: boolean;
 }
 
 /** Cap per-worker transcript to avoid unbounded memory growth in long runs. */
@@ -548,6 +559,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
         wasIdle: false,
         currentTurnStart: 0,
         spillSeq: 0,
+        hasPendingReply: false,
         projector:
           this.enableWorkerRouting && w.agent === 'claude'
             ? new ClaudeLeaderRoutingProjector()
@@ -681,6 +693,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
       wasIdle: false,
       currentTurnStart: 0,
       spillSeq: 0,
+      hasPendingReply: false,
       // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
       parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
       projector:
@@ -1640,6 +1653,13 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // back dispatches) even though worker-1 with a shorter payload fired
     // fine. A short macrotask gap lets ConPTY flush the body bytes through
     // win32-input-mode before the submit sequence arrives.
+    //
+    // v0.6.1 — Mark the worker as having a pending reply. The next
+    // busy→idle edge will treat its transcript slice as a real reply
+    // (flush + maybe-spill). Boot output and idle repaints happening
+    // BEFORE any inject arrives are skipped to avoid spurious drop
+    // notices and the meta-analysis cascade they triggered in v0.6.0.
+    w.hasPendingReply = true;
     const paneId = w.cfg.paneId;
     const opts = { agent: w.cfg.agent };
     try {
@@ -1833,23 +1853,41 @@ export class PodiumOrchestrator implements vscode.Disposable {
       //       The leader uses its Read tool to ingest the full body.
       //       See SPILL_THRESHOLD_CHARS for rationale.
       if (w.parser && w.idle.isIdle && !w.wasIdle) {
-        const turnBody = w.transcript.slice(w.currentTurnStart);
-        if (turnBody.length >= SPILL_THRESHOLD_CHARS) {
-          this.spillAndNotify(w, turnBody);
-          // Drain anything the parser had buffered — we just superseded it
-          // via the drop file, and leaving it would let half-parsed
-          // fragments route on the NEXT idle edge.
-          w.parser.flush();
-        } else {
-          const pending = w.parser.flush();
-          if (pending.length > 0) {
-            this.stats.flushed += pending.length;
-            this.output.appendLine(
-              `[orch] ${w.cfg.id} idle — flushed ${pending.length} pending directive(s)`,
-            );
-            for (const m of pending) this.route(m, w.cfg.paneId);
+        if (w.hasPendingReply) {
+          // Worker was addressed (inject fired) and has now settled. Treat
+          // the transcript slice as a real reply: spill-or-flush.
+          const turnBody = w.transcript.slice(w.currentTurnStart);
+          if (turnBody.length >= SPILL_THRESHOLD_CHARS) {
+            this.spillAndNotify(w, turnBody);
+            // Drain anything the parser had buffered — we just superseded
+            // it via the drop file, and leaving it would let half-parsed
+            // fragments route on the NEXT idle edge.
+            w.parser.flush();
+          } else {
+            const pending = w.parser.flush();
+            if (pending.length > 0) {
+              this.stats.flushed += pending.length;
+              this.output.appendLine(
+                `[orch] ${w.cfg.id} idle — flushed ${pending.length} pending directive(s)`,
+              );
+              for (const m of pending) this.route(m, w.cfg.paneId);
+            }
           }
+          w.hasPendingReply = false;
+        } else {
+          // v0.6.1 — No inject was routed to this worker since the last
+          // idle edge. The transcript growth is boot UI, status-tick
+          // repaint, or ambient noise — NOT a reply. Skip spill/flush so
+          // we do not emit spurious drop notices into the leader or
+          // re-route stale fragments from the parser buffer. Still drain
+          // the buffer so it does not accumulate.
+          if (w.parser) w.parser.flush();
+          this.output.appendLine(
+            `[orch] ${w.cfg.id} idle edge skipped (no pending reply — boot/repaint)`,
+          );
         }
+        // Always advance the turn-start marker so the next real reply
+        // slices from the right offset, regardless of which branch ran.
         w.currentTurnStart = w.transcript.length;
         w.wasIdle = true;
       } else if (!w.idle.isIdle) {
