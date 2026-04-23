@@ -30,14 +30,28 @@ const emptyMsg = document.getElementById('emptyMsg') as HTMLDivElement | null;
 
 const instances = new Map<string, PaneInstance>();
 
+// v0.3.3 · Orientation toggle. 'horizontal' keeps the legacy grid (panes
+// arranged left-to-right first). 'vertical' stacks panes top-to-bottom —
+// useful when the panel is itself a narrow side column (Summon Team's
+// workers host). Swapping rows/cols in the template gives us that for
+// free at counts where the original layout was strictly horizontal.
+type Orientation = 'horizontal' | 'vertical';
+let orientation: Orientation = 'horizontal';
+
 function layoutTemplate(count: number): { rows: string; cols: string } {
-  if (count <= 1) return { rows: '1fr', cols: '1fr' };
-  if (count === 2) return { rows: '1fr', cols: '1fr 1fr' };
-  if (count <= 4) return { rows: '1fr 1fr', cols: '1fr 1fr' };
-  if (count <= 6) return { rows: '1fr 1fr', cols: '1fr 1fr 1fr' };
-  if (count <= 9) return { rows: '1fr 1fr 1fr', cols: '1fr 1fr 1fr' };
-  const n = Math.ceil(Math.sqrt(count));
-  return { rows: `repeat(${n}, 1fr)`, cols: `repeat(${n}, 1fr)` };
+  let tmpl: { rows: string; cols: string };
+  if (count <= 1) tmpl = { rows: '1fr', cols: '1fr' };
+  else if (count === 2) tmpl = { rows: '1fr', cols: '1fr 1fr' };
+  else if (count <= 4) tmpl = { rows: '1fr 1fr', cols: '1fr 1fr' };
+  else if (count <= 6) tmpl = { rows: '1fr 1fr', cols: '1fr 1fr 1fr' };
+  else if (count <= 9) tmpl = { rows: '1fr 1fr 1fr', cols: '1fr 1fr 1fr' };
+  else {
+    const n = Math.ceil(Math.sqrt(count));
+    tmpl = { rows: `repeat(${n}, 1fr)`, cols: `repeat(${n}, 1fr)` };
+  }
+  // Vertical orientation transposes the grid so panes stack top-to-bottom.
+  if (orientation === 'vertical') return { rows: tmpl.cols, cols: tmpl.rows };
+  return tmpl;
 }
 
 const lastResize = new Map<string, { cols: number; rows: number }>();
@@ -209,6 +223,16 @@ window.addEventListener('message', (ev: MessageEvent) => {
   }
   if (msg.type === 'remove-pane' && typeof msg.paneId === 'string') {
     removePane(msg.paneId);
+    return;
+  }
+  // v0.3.3 · Host-driven orientation toggle. Summon Team sets 'vertical'
+  // so workers stack top-to-bottom inside the right-column panel.
+  if (msg.type === 'set-orientation') {
+    const v = (msg as { value?: unknown }).value;
+    if (v === 'horizontal' || v === 'vertical') {
+      orientation = v;
+      updateLayout();
+    }
     return;
   }
 });

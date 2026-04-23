@@ -115,7 +115,11 @@ function createPanel(context, extensionPath, session) {
 
   // Spawn claude CLI
   const cwd = session?.cwd || vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath || os.homedir();
-  const sessionId = session?.sessionId || crypto.randomUUID();
+  // v0.3.3 · `sessionId` = resume target, `newSessionId` = fresh session with
+  // a caller-chosen UUID. Workers need the latter (no prior JSONL exists, so
+  // `--resume` errors with "No conversation found with session ID"). Legacy
+  // callers that only set `sessionId` continue to hit the resume path.
+  const sessionId = session?.newSessionId || session?.sessionId || crypto.randomUUID();
   const resolved = resolveClaudeCli();
   if (!resolved) {
     const install = 'Install Claude Code';

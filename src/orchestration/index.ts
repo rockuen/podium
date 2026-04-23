@@ -44,7 +44,6 @@ import { LiveMultiPanel } from './ui/LiveMultiPanel';
 import {
   LegacyPanelBridge,
   type LegacyPanelEntry,
-  type LegacyPanelSpawn,
 } from './ui/LegacyPanelBridge';
 import {
   buildSubmitPayload,
@@ -633,115 +632,72 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       leaderEntry.podiumPaneId = 'leader';
       leaderEntry.podiumRole = 'leader';
 
-      // Require the legacy createPanel via runtime resolution — it's a JS
-      // module TypeScript doesn't compile (allowJs=false) so it stays in
-      // src/. From `out/orchestration/index.js` (this file's compiled
-      // location) the correct relative path is `../../src/panel/createPanel`.
-      // We wrap in try/catch so a missing module fails loudly instead of
-      // silently aborting Summon Team with zero user-visible feedback.
-      type CreatePanelFn = (
-        ctx: vscode.ExtensionContext,
-        extensionPath: string,
-        session: Record<string, unknown> | null,
-      ) => { tabId: number; entry: LegacyPanelEntry } | undefined;
-      let createPanel: CreatePanelFn;
+      // v0.3.3 · Workers live in a single LiveMultiPanel opened in the
+      // right column, stacked top-to-bottom. LiveMultiPanel uses a simpler
+      // display-only xterm renderer — no toolbar, memo, or send box — so
+      // it matches the user's ask for a minimal worker window.
+      let workerPanel: LiveMultiPanel;
       try {
-        // eslint-disable-next-line @typescript-eslint/no-var-requires
-        createPanel = require('../../src/panel/createPanel').createPanel as CreatePanelFn;
+        workerPanel = LiveMultiPanel.create(ctx, output, 'Podium · Workers');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        output.appendLine(`[orch.summonTeam] FAILED to load createPanel — ${msg}`);
-        vscode.window.showErrorMessage(
-          `Podium: internal error loading chat panel factory — ${msg}`,
-        );
+        output.appendLine(`[orch.summonTeam] LiveMultiPanel.create THREW — ${msg}`);
+        vscode.window.showErrorMessage(`Podium: worker panel create failed — ${msg}`);
         return;
       }
-
-      // Factory the bridge uses for dynamic addPane (runtime `addWorker`
-      // requests from the orchestrator). Always opens Beside so new
-      // workers appear alongside existing ones.
-      const spawnPane: LegacyPanelSpawn = (spec) => {
-        const result = createPanel(ctx, ctx.extensionPath, {
-          sessionId: spec.sessionId,
-          cwd: spec.cwd,
-          title: spec.label,
-          viewColumn: vscode.ViewColumn.Beside,
-          extraArgs: spec.extraArgs ? [...spec.extraArgs] : undefined,
-          podiumPaneId: spec.paneId,
-          podiumRole: 'generalist',
-        });
-        return result?.entry ?? null;
-      };
-
-      const bridge = new LegacyPanelBridge('leader', leaderEntry, spawnPane, output);
-      output.appendLine('[orch.summonTeam] bridge created, leader attached');
-
-      // Spawn worker-1 (implementer). ViewColumn.Beside targets whichever
-      // column is currently active; the legacy leader webview is active at
-      // click time, so worker-1 lands to its right.
-      const worker1Sid = randomUUID();
-      output.appendLine(`[orch.summonTeam] spawning worker-1 (implementer) sid=${worker1Sid.slice(0, 8)}`);
-      let worker1: { tabId: number; entry: LegacyPanelEntry } | undefined;
+      workerPanel.setOrientation('vertical');
+      // Reveal Beside so the user sees leader-left, workers-right.
       try {
-        worker1 = createPanel(ctx, ctx.extensionPath, {
-          sessionId: worker1Sid,
+        workerPanel.reveal(vscode.ViewColumn.Beside, true);
+      } catch {
+        /* first reveal before webview is ready is harmless */
+      }
+
+      const bridge = new LegacyPanelBridge('leader', leaderEntry, workerPanel, output);
+      output.appendLine('[orch.summonTeam] bridge + worker panel created');
+
+      // Spawn worker-1 (implementer) + worker-2 (critic) as panes inside
+      // the LiveMultiPanel. `autoSessionId: false` + explicit `sessionId`
+      // makes Claude use `--session-id <uuid>` rather than `--resume`.
+      const worker1Sid = randomUUID();
+      const worker2Sid = randomUUID();
+      output.appendLine(
+        `[orch.summonTeam] addPane worker-1 sid=${worker1Sid.slice(0, 8)}, worker-2 sid=${worker2Sid.slice(0, 8)}`,
+      );
+      try {
+        workerPanel.addPane({
+          paneId: 'worker-1',
+          label: 'worker-1 (implementer)',
+          agent: 'claude',
           cwd,
-          title: 'worker-1 (implementer)',
-          viewColumn: vscode.ViewColumn.Beside,
+          sessionId: worker1Sid,
           extraArgs: buildWorkerExtraArgs({
             workerId: 'worker-1',
             role: 'implementer',
             peers: [{ id: 'worker-2', role: 'critic' }],
           }),
-          podiumPaneId: 'worker-1',
-          podiumRole: 'implementer',
         });
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err);
-        output.appendLine(`[orch.summonTeam] worker-1 spawn THREW — ${msg}`);
-        vscode.window.showErrorMessage(`Podium: worker-1 spawn threw — ${msg}`);
-        return;
-      }
-      if (!worker1) {
-        output.appendLine('[orch.summonTeam] worker-1 spawn returned falsy');
-        vscode.window.showErrorMessage('Podium: worker-1 spawn failed (see Output → Podium - Orchestration).');
-        return;
-      }
-      bridge.attachEntry('worker-1', worker1.entry);
-      output.appendLine('[orch.summonTeam] worker-1 attached to bridge');
-
-      // worker-2 goes in the same column as worker-1 (stacked as a tab).
-      // `ViewColumn.Active` after worker-1 spawned is that same column.
-      const worker2Sid = randomUUID();
-      output.appendLine(`[orch.summonTeam] spawning worker-2 (critic) sid=${worker2Sid.slice(0, 8)}`);
-      let worker2: { tabId: number; entry: LegacyPanelEntry } | undefined;
-      try {
-        worker2 = createPanel(ctx, ctx.extensionPath, {
-          sessionId: worker2Sid,
+        bridge.registerWorker('worker-1');
+        workerPanel.addPane({
+          paneId: 'worker-2',
+          label: 'worker-2 (critic)',
+          agent: 'claude',
           cwd,
-          title: 'worker-2 (critic)',
-          viewColumn: vscode.ViewColumn.Active,
+          sessionId: worker2Sid,
           extraArgs: buildWorkerExtraArgs({
             workerId: 'worker-2',
             role: 'critic',
             peers: [{ id: 'worker-1', role: 'implementer' }],
           }),
-          podiumPaneId: 'worker-2',
-          podiumRole: 'critic',
         });
+        bridge.registerWorker('worker-2');
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        output.appendLine(`[orch.summonTeam] worker-2 spawn THREW — ${msg}`);
-        vscode.window.showErrorMessage(`Podium: worker-2 spawn threw — ${msg}`);
+        output.appendLine(`[orch.summonTeam] addPane THREW — ${msg}`);
+        vscode.window.showErrorMessage(`Podium: worker spawn failed — ${msg}`);
         return;
       }
-      if (!worker2) {
-        output.appendLine('[orch.summonTeam] worker-2 spawn returned falsy');
-        vscode.window.showErrorMessage('Podium: worker-2 spawn failed.');
-        return;
-      }
-      bridge.attachEntry('worker-2', worker2.entry);
-      output.appendLine('[orch.summonTeam] worker-2 attached to bridge — team ready');
+      output.appendLine('[orch.summonTeam] team ready — leader + 2 workers attached');
 
       const orch = new PodiumOrchestrator(bridge, output);
       orch.attach({

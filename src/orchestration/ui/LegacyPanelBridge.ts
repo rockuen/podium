@@ -1,32 +1,29 @@
-// v0.3.1 · LegacyPanelBridge — adapts N standalone `createPanel` webviews
-// (the classic Claude Code chat UI) to the `OrchestratorPanel` contract.
+// v0.3.1 · LegacyPanelBridge — now a hybrid host for Summon Team.
 //
-// Why this exists
-// ---------------
-// Phase A shipped `LiveMultiPanel` — a custom multi-pane webview with its
-// own xterm renderer. Phase B summoned a team by disposing the base chat
-// window and spawning a `LiveMultiPanel` with leader + workers inside.
-//
-// v0.3.1 flips the model: keep the base chat UI (with all its polish —
-// toolbar, memo, paste handling, search, theme) and simply open **more**
-// chat windows in VSCode's native second column. The orchestrator doesn't
-// care about rendering; it only needs a surface that fires pane data
-// events and accepts pane writes. This bridge provides exactly that over
-// existing legacy entries.
-//
-// Responsibilities
+// Design evolution
 // ----------------
-// 1. Per-pane bookkeeping: id → entry, with `attachEntry` on bind.
-// 2. `onPaneData` / `onPaneExit` re-emitters sourced from each entry's
-//    `onPtyData` / `onPaneDispose` taps (added to createPanel in v0.3.1).
-// 3. `writeToPane` → `entry.pty.write(data)`.
-// 4. `removePane` → `entry.panel.dispose()`.
-// 5. `addPane` → calls the injected `spawnPane` factory so the caller
-//    retains control of createPanel's full option surface (viewColumn,
-//    title, role, etc.) without coupling this file to the legacy JS.
-// 6. `onDidDispose` fires exactly once when the **leader** pane closes —
-//    index.ts uses that to tear down the orchestrator registry, matching
-//    `LiveMultiPanel`'s own `onDidDispose` semantics.
+// v0.3.1 shipped the first cut: every pane (leader + workers) was a
+// standalone legacy `createPanel` webview. That gave every worker the full
+// chat UI — toolbar, search, memo, send box — which was more than the
+// orchestrator needed. Each worker also lived in its own VSCode tab in
+// the right column, clutter-stacked rather than visually grouped.
+//
+// v0.3.3 refines: the LEADER keeps its full legacy chat UI (it's where
+// the user types), but the WORKERS share a single `LiveMultiPanel` in
+// the right column, stacked top-to-bottom. LiveMultiPanel uses a simpler
+// xterm renderer with no send-box chrome — exactly the display-only look
+// the user asked for. The bridge multiplexes both sources into a single
+// `OrchestratorPanel` surface so PodiumOrchestrator stays unchanged.
+//
+// Routing rules
+// -------------
+//   paneId === `leaderPaneId` → legacy `leaderEntry` (createPanel webview)
+//   otherwise                 → `workerPanel` (LiveMultiPanel)
+//
+// The bridge forwards pty data from both, exits from both, and fires
+// `onDidDispose` exactly once when the LEADER pane closes — matching the
+// original `LiveMultiPanel.onDidDispose` semantics that index.ts uses to
+// tear down the orchestrator registry.
 
 import * as vscode from 'vscode';
 import type {
@@ -34,6 +31,7 @@ import type {
   LivePaneSpec,
   PaneDataEvent,
   PaneExitEvent,
+  LiveMultiPanel,
 } from './LiveMultiPanel';
 
 /**
@@ -53,9 +51,6 @@ export interface LegacyPanelEntry {
   onPaneDispose: vscode.Event<number>;
 }
 
-/** Factory that spawns a fresh legacy panel on demand (for dynamic addPane). */
-export type LegacyPanelSpawn = (spec: LivePaneSpec) => LegacyPanelEntry | null;
-
 export class LegacyPanelBridge implements OrchestratorPanel {
   private readonly paneDataEmitter = new vscode.EventEmitter<PaneDataEvent>();
   private readonly paneExitEmitter = new vscode.EventEmitter<PaneExitEvent>();
@@ -65,138 +60,149 @@ export class LegacyPanelBridge implements OrchestratorPanel {
   public readonly onPaneExit = this.paneExitEmitter.event;
   public readonly onDidDispose = this.disposeEmitter.event;
 
-  private readonly entries = new Map<
-    string,
-    { entry: LegacyPanelEntry; subs: vscode.Disposable[] }
-  >();
-  private readonly leaderPaneId: string;
+  private readonly subs: vscode.Disposable[] = [];
   private leaderDisposed = false;
+  private workerPanelDisposed = false;
+  /** Worker ids whose pane spec is known — lets us answer `hasPane` without racing the webview. */
+  private readonly workerIds = new Set<string>();
 
   constructor(
-    leaderPaneId: string,
-    leaderEntry: LegacyPanelEntry,
-    private readonly spawnPane: LegacyPanelSpawn,
+    private readonly leaderPaneId: string,
+    private readonly leaderEntry: LegacyPanelEntry,
+    private readonly workerPanel: LiveMultiPanel,
     private readonly output: vscode.OutputChannel,
   ) {
-    this.leaderPaneId = leaderPaneId;
-    this.attachEntry(leaderPaneId, leaderEntry);
-  }
-
-  /**
-   * Bind an already-spawned legacy panel entry under `paneId`. The caller
-   * builds the entry via `createPanel(...)` and hands it over. We wire the
-   * pty-data / dispose taps so the orchestrator sees this pane as part of
-   * the team.
-   */
-  attachEntry(paneId: string, entry: LegacyPanelEntry): void {
-    if (this.entries.has(paneId)) {
-      this.output.appendLine(`[bridge] attachEntry: duplicate paneId "${paneId}" — ignored`);
-      return;
-    }
-    const subs: vscode.Disposable[] = [];
-    subs.push(
-      entry.onPtyData((data) => {
-        this.paneDataEmitter.fire({ paneId, data });
+    // Leader pty data → paneId="leader".
+    this.subs.push(
+      leaderEntry.onPtyData((data) => {
+        this.paneDataEmitter.fire({ paneId: this.leaderPaneId, data });
       }),
     );
-    subs.push(
-      entry.onPaneDispose((exitCode) => {
-        this.paneExitEmitter.fire({ paneId, exitCode });
-        // Cleanup this entry's subscriptions.
-        for (const s of subs) {
-          try {
-            s.dispose();
-          } catch {
-            /* ignore */
-          }
-        }
-        this.entries.delete(paneId);
-        // Leader close = team over. Fire onDidDispose exactly once.
-        if (paneId === this.leaderPaneId && !this.leaderDisposed) {
+    // Leader dispose → emit paneExit, then disposeEmitter (team over).
+    this.subs.push(
+      leaderEntry.onPaneDispose((exitCode) => {
+        this.paneExitEmitter.fire({ paneId: this.leaderPaneId, exitCode });
+        if (!this.leaderDisposed) {
           this.leaderDisposed = true;
           this.disposeEmitter.fire();
         }
       }),
     );
-    this.entries.set(paneId, { entry, subs });
+    // Worker panel pane data → bubble verbatim.
+    this.subs.push(
+      workerPanel.onPaneData((e) => {
+        this.paneDataEmitter.fire(e);
+      }),
+    );
+    this.subs.push(
+      workerPanel.onPaneExit((e) => {
+        this.paneExitEmitter.fire(e);
+      }),
+    );
+    // If user closes the WORKER panel (right column tab), the team's
+    // worker set collapses. We keep the orchestrator attached — the leader
+    // still works standalone — but mark the worker panel as gone so
+    // subsequent writeToPane's on it become no-ops.
+    this.subs.push(
+      workerPanel.onDidDispose(() => {
+        this.workerPanelDisposed = true;
+        this.output.appendLine('[bridge] worker panel closed — leader remains active');
+      }),
+    );
     this.output.appendLine(
-      `[bridge] attached pane "${paneId}" (session=${entry.sessionId.slice(0, 8)}, role=${entry.podiumRole ?? '-'})`,
+      `[bridge] constructed: leader="${leaderPaneId}" (session=${leaderEntry.sessionId.slice(0, 8)})`,
     );
   }
 
+  /**
+   * Register a worker's paneId so `hasPane` + dynamic addWorker lookups
+   * succeed. The actual pane spawn is handled by `workerPanel.addPane(spec)`
+   * — this method is the bridge's own ledger.
+   */
+  registerWorker(paneId: string): void {
+    this.workerIds.add(paneId);
+  }
+
   writeToPane(paneId: string, data: string): void {
-    const hit = this.entries.get(paneId);
-    if (!hit) {
-      this.output.appendLine(`[bridge] writeToPane: unknown paneId "${paneId}" — dropped (${data.length}b)`);
+    if (paneId === this.leaderPaneId) {
+      if (!this.leaderEntry.pty) {
+        this.output.appendLine('[bridge] writeToPane leader: no pty — dropped');
+        return;
+      }
+      try {
+        this.leaderEntry.pty.write(data);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        this.output.appendLine(`[bridge] writeToPane leader FAILED — ${msg}`);
+      }
       return;
     }
-    if (!hit.entry.pty) {
-      this.output.appendLine(`[bridge] writeToPane: pane "${paneId}" has no pty — dropped`);
-      return;
-    }
-    try {
-      hit.entry.pty.write(data);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.output.appendLine(`[bridge] writeToPane "${paneId}" FAILED — ${msg}`);
-    }
-  }
-
-  hasPane(paneId: string): boolean {
-    return this.entries.has(paneId);
-  }
-
-  removePane(paneId: string): void {
-    const hit = this.entries.get(paneId);
-    if (!hit) return;
-    try {
-      hit.entry.panel.dispose();
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.output.appendLine(`[bridge] removePane "${paneId}" dispose FAILED — ${msg}`);
-    }
-    // `onPaneDispose` tap will clean up the Map and subs.
-  }
-
-  addPane(spec: LivePaneSpec): void {
-    if (this.entries.has(spec.paneId)) {
+    if (this.workerPanelDisposed) {
       this.output.appendLine(
-        `[bridge] addPane: "${spec.paneId}" already attached — ignored`,
+        `[bridge] writeToPane "${paneId}": worker panel disposed — dropped (${data.length}b)`,
       );
       return;
     }
-    const entry = this.spawnPane(spec);
-    if (!entry) {
-      this.output.appendLine(`[bridge] addPane: spawn factory returned null for "${spec.paneId}"`);
+    if (!this.workerPanel.hasPane(paneId)) {
+      this.output.appendLine(`[bridge] writeToPane "${paneId}": unknown pane — dropped`);
       return;
     }
-    this.attachEntry(spec.paneId, entry);
+    this.workerPanel.writeToPane(paneId, data);
   }
 
-  /**
-   * Reveal (focus) one of the bridge's panes. Optional column lets callers
-   * preserve the side-by-side layout across reveals.
-   */
-  reveal(paneId?: string, column?: number, preserveFocus?: boolean): void {
-    const id = paneId ?? this.leaderPaneId;
-    const hit = this.entries.get(id);
-    if (!hit) return;
-    try {
-      hit.entry.panel.reveal?.(column, preserveFocus);
-    } catch {
-      /* ignore */
+  hasPane(paneId: string): boolean {
+    if (paneId === this.leaderPaneId) return !this.leaderDisposed;
+    return this.workerPanel.hasPane(paneId);
+  }
+
+  removePane(paneId: string): void {
+    if (paneId === this.leaderPaneId) {
+      try {
+        this.leaderEntry.panel.dispose();
+      } catch {
+        /* already gone */
+      }
+      return;
     }
+    if (this.workerPanelDisposed) return;
+    this.workerPanel.removePane(paneId);
+    this.workerIds.delete(paneId);
   }
 
-  /**
-   * Summary for diagnostics — matches `LiveMultiPanel.isDisposed` /
-   * `listPanes` surface closely enough for logging without locking in API.
-   */
+  addPane(spec: LivePaneSpec): void {
+    if (spec.paneId === this.leaderPaneId) {
+      this.output.appendLine(
+        `[bridge] addPane: refusing to overlay leader "${this.leaderPaneId}"`,
+      );
+      return;
+    }
+    if (this.workerPanelDisposed) {
+      this.output.appendLine(
+        `[bridge] addPane "${spec.paneId}": worker panel disposed — ignored`,
+      );
+      return;
+    }
+    this.workerPanel.addPane(spec);
+    this.workerIds.add(spec.paneId);
+  }
+
+  /** Diagnostic counter: live panes visible to the orchestrator. */
   get paneCount(): number {
-    return this.entries.size;
+    return (this.leaderDisposed ? 0 : 1) + (this.workerPanelDisposed ? 0 : this.workerIds.size);
   }
 
   get isLeaderDisposed(): boolean {
     return this.leaderDisposed;
+  }
+
+  dispose(): void {
+    for (const s of this.subs) {
+      try {
+        s.dispose();
+      } catch {
+        /* ignore */
+      }
+    }
+    this.subs.length = 0;
   }
 }

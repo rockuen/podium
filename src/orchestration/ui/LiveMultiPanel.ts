@@ -274,8 +274,18 @@ export class LiveMultiPanel {
     if (!this._disposed) this.disposeAll();
   }
 
-  reveal(): void {
-    this.panel.reveal(vscode.ViewColumn.Active, false);
+  reveal(column?: vscode.ViewColumn, preserveFocus?: boolean): void {
+    this.panel.reveal(column ?? vscode.ViewColumn.Active, preserveFocus ?? false);
+  }
+
+  /**
+   * v0.3.3 · Switch pane layout orientation. 'horizontal' (default) keeps
+   * multi-pane grids side-by-side — good for wide panels. 'vertical'
+   * transposes them so panes stack top-to-bottom — good when this panel
+   * is itself the right column of a split (Summon Team's workers host).
+   */
+  setOrientation(orientation: 'horizontal' | 'vertical'): void {
+    this.postToWebview({ type: 'set-orientation', value: orientation });
   }
 
   private onMessage(raw: unknown): void {
