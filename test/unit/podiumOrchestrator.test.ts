@@ -372,6 +372,75 @@ test('orch: dedup suppresses redraw repeats within the window', () => {
   orch.dispose();
 });
 
+test('orch v0.5.1: rapid idle→busy flips within cooldown are coalesced into one turn', () => {
+  // Field bug: Claude's Ink TUI takes 500–800ms mid-response pauses
+  // (status ticks, internal re-renders) that the 500ms idle detector
+  // treats as idle→busy flips. Pre-v0.5.1 each flip bumped turnId,
+  // which scattered same-turn dedupe entries across 3–4 turnIds per
+  // user prompt and made B strategy useless. The cooldown coalesces
+  // those flips into a single logical turn.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // Simulate the failure mode: force multiple idle→busy transitions by
+  // flipping leaderWasIdle manually between pane data events, each one
+  // spaced less than the cooldown window (1500ms) apart.
+  const anyOrch = orch as any;
+  const bumpEdge = (dataHex: string) => {
+    anyOrch.leaderWasIdle = true;
+    ctl.firePaneData({ paneId: 'L', data: dataHex });
+  };
+
+  bumpEdge('● @worker-1: first chunk\n'); // turnId: 0 → 1
+  clock.advance(200);
+  bumpEdge('● continuation one\n');        // within cooldown → coalesced
+  clock.advance(200);
+  bumpEdge('● continuation two\n');        // still within cooldown → coalesced
+  clock.advance(200);
+  bumpEdge('● continuation three\n');      // still within cooldown → coalesced
+
+  const turnLogs = out.log.filter((l) => l.startsWith('[orch.turn]'));
+  const advanceLogs = turnLogs.filter((l) => l.includes('turnId advanced'));
+  const coalesceLogs = turnLogs.filter((l) => l.includes('coalesced'));
+
+  assert.equal(
+    advanceLogs.length,
+    1,
+    `expected exactly 1 advance log; got ${advanceLogs.length}: ${turnLogs.join(' | ')}`,
+  );
+  assert.ok(
+    coalesceLogs.length >= 1,
+    `expected at least 1 coalesce log; got ${coalesceLogs.length}: ${turnLogs.join(' | ')}`,
+  );
+
+  // Now advance past the cooldown and fire another edge — this one
+  // IS a new turn.
+  clock.advance(TURN_COOLDOWN_MS_EXPORTED_FOR_TEST + 100);
+  bumpEdge('● new turn content\n');
+  const advanceLogsAfter = out.log
+    .filter((l) => l.startsWith('[orch.turn]'))
+    .filter((l) => l.includes('turnId advanced'));
+  assert.equal(advanceLogsAfter.length, 2, 'second real turn should advance again');
+
+  orch.dispose();
+});
+
+// The orchestrator's TURN_COOLDOWN_MS is not exported; we mirror the
+// value here for test clarity. If the value in the source changes,
+// update this constant too — the test above relies on crossing it.
+const TURN_COOLDOWN_MS_EXPORTED_FOR_TEST = 1500;
+
 test('orch v0.5.0 (B): same-turn dedupe uses the new "same turn=" log format', () => {
   // The commit log for a dedupe hit now includes the turnId so field
   // debugging can distinguish same-turn suppression (correct) from

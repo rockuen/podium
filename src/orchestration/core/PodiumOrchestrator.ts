@@ -252,6 +252,18 @@ const DEFAULT_POLL_MS = 250;
 // re-asking the same task after a long pause.
 const DEFAULT_DEDUPE_WINDOW_MS = 1_800_000;
 
+/**
+ * v0.5.1 — Minimum gap between two `leaderTurnId` bumps.
+ *
+ * An idle→busy edge that fires within this window of the previous bump
+ * is treated as the same logical user turn (Ink mid-response pause /
+ * status-tick flicker) and is NOT counted as a new turn. Picked so it
+ * comfortably exceeds typical intra-response pauses (~500–800ms) while
+ * staying well below realistic intervals between consecutive user
+ * prompts (usually seconds).
+ */
+const TURN_COOLDOWN_MS = 1500;
+
 // v2.7.13: macrotask gap between writing the body and the Win32 Enter
 // KEY_EVENT for Claude/Windows worker injects. Empirically 25 ms is enough
 // for ConPTY to drain the body bytes through win32-input-mode; any lower
@@ -329,8 +341,22 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * route whose stamp matches the same turnId. Different turnId → new
    * delegation, allowed. This is immune to Ink repaint boundary wobble
    * that slipped past the older A+C strategies.
+   *
+   * v0.5.1 — Cooldown guard. The leaderIdle silenceMs is 500ms, which
+   * is shorter than some pauses Claude's Ink TUI takes mid-response
+   * (for tool-call status ticks, re-render sweeps, etc). Without a
+   * cooldown the same logical turn flips idle→busy several times and
+   * blows the turnId up by 3–4 per user prompt. See `lastTurnAdvanceAt`
+   * below.
    */
   private leaderTurnId = 0;
+  /**
+   * v0.5.1 — Timestamp of the most recent `leaderTurnId` bump. An
+   * idle→busy edge within TURN_COOLDOWN_MS of the previous bump is
+   * ignored: it is almost certainly the same logical user turn
+   * experiencing a transient status-tick pause, not a new prompt.
+   */
+  private lastTurnAdvanceAt = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private stats = { routed: 0, injected: 0, queued: 0, dropped: 0, deduped: 0, flushed: 0, dissolved: 0 };
   private nowFn: () => number = Date.now;
@@ -435,6 +461,9 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // in onPaneData will bump it to 1 when the leader starts its first
     // response, which is when we actually want same-turn dedupe to apply.
     this.leaderTurnId = 0;
+    // v0.5.1 — Clear cooldown timestamp so the very first turn boundary
+    // is never suppressed by a stale timestamp from a prior attach.
+    this.lastTurnAdvanceAt = 0;
     this.leaderRecentPayloads.clear();
     // v2.7.28: arm the restore grace window if caller requested one.
     if (opts.restoreGraceMs && opts.restoreGraceMs > 0) {
@@ -837,11 +866,28 @@ export class PodiumOrchestrator implements vscode.Disposable {
       // new prompt and the leader is starting to respond. Bump the turn
       // id so same-turn dedupe entries do NOT mask legitimate re-delegations
       // that a later turn might issue.
+      //
+      // v0.5.1 — Cooldown gate. Claude's Ink TUI takes transient pauses
+      // mid-response (tool status ticks, internal re-renders) that the
+      // 500ms idle detector interprets as idle→busy flips. Without this
+      // gate a single user prompt was bumping turnId by 3–4, scattering
+      // same-turn dedupe entries across multiple turnIds and making B
+      // strategy miss the repaints it was meant to catch. We only bump
+      // when the previous bump is at least TURN_COOLDOWN_MS old.
       if (this.leaderWasIdle) {
-        this.leaderTurnId += 1;
-        this.output.appendLine(
-          `[orch.turn] leader turnId advanced to ${this.leaderTurnId} (idle→busy edge)`,
-        );
+        const now = this.nowFn();
+        const sinceLast = now - this.lastTurnAdvanceAt;
+        if (this.lastTurnAdvanceAt === 0 || sinceLast >= TURN_COOLDOWN_MS) {
+          this.leaderTurnId += 1;
+          this.lastTurnAdvanceAt = now;
+          this.output.appendLine(
+            `[orch.turn] leader turnId advanced to ${this.leaderTurnId} (idle→busy edge, +${sinceLast}ms since last)`,
+          );
+        } else {
+          this.output.appendLine(
+            `[orch.turn] idle→busy edge coalesced into turn=${this.leaderTurnId} (only ${sinceLast}ms since last, cooldown=${TURN_COOLDOWN_MS}ms)`,
+          );
+        }
       }
       this.leaderWasIdle = false; // incoming data — leader is active
       this.consumeLeaderOutput(rawData);
