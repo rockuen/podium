@@ -68,6 +68,65 @@ test('router: flush returns dangling single-line token', () => {
   assert.deepEqual(p.flush(), []);
 });
 
+test('router v0.8.7: long directive wrapped across two pty chunks is NOT truncated', () => {
+  // Field bug: leader emitted a long directive Ink-wrapped at a comma.
+  // First pty chunk ended exactly at the wrap newline; second chunk
+  // carried the 2-space-indented continuation. Pre-v0.8.7 the parser
+  // terminated single-line at the first `\n` (peek empty → isBlank
+  // treated as non-continuation), yielded the truncated row, advanced
+  // past the token, and then had no way to pick up the continuation —
+  // it hit the stream with no `@worker-N:` prefix and got absorbed
+  // as narrative. Drop file carried the comma-cut payload unusable to
+  // the worker. Reference: session 2026-04-24, drop
+  // `to-worker-2-turn6-seq1.md` = 69 bytes mid-sentence.
+  //
+  // Fix: when (a) we are on the first iteration (no folding yet), (b)
+  // the chosen newline is the LAST byte in the buffer, and (c) the
+  // payload is long (>=30 chars) and not sentence-terminated, hold
+  // the partial in the buffer and wait for the next feed.
+  const p = new WorkerPatternParser();
+  // Chunk 1 mimics the field capture: directive, 69-ish bytes, comma
+  // at end, newline is buffer's last byte.
+  const msgs1 = p.feed(
+    '@worker-2: .omc/team/artifacts/reverseString.js 파일을 읽고 두 버전(reverseStringSimple,\n',
+  );
+  assert.equal(msgs1.length, 0, 'must hold until continuation arrives');
+
+  // Chunk 2 brings the 2-space-indented wrap continuation + final
+  // period which terminates the directive.
+  const msgs2 = p.feed(
+    '  reverseStringUnicode)을 검토해줘.\n',
+  );
+  assert.equal(msgs2.length, 1);
+  assert.equal(msgs2[0].workerId, 'worker-2');
+  assert.match(msgs2[0].payload, /reverseStringSimple/);
+  assert.match(msgs2[0].payload, /reverseStringUnicode/);
+  assert.match(msgs2[0].payload, /검토해줘/);
+});
+
+test('router v0.8.7: short directive at end-of-buffer still yields (no hold regression)', () => {
+  // Guard: the v0.8.7 hold must NOT fire for short, sentence-complete
+  // directives that happen to land a newline at the buffer tail. This
+  // is the pattern of the legacy single-directive tests.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: say ok.\n');
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload, 'say ok.');
+});
+
+test('router v0.8.7: held partial is released by flush on leader idle', () => {
+  // If the continuation never arrives (e.g. leader stops emitting),
+  // the held partial must still surface via flush() on the idle edge.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: implement reverseString with Intl.Segmenter and full test coverage,\n',
+  );
+  assert.equal(msgs.length, 0, 'hold until further data');
+  const flushed = p.flush();
+  assert.equal(flushed.length, 1);
+  assert.match(flushed[0].payload, /Intl\.Segmenter/);
+});
+
 // ─── Claude leader projector ───
 
 test('projector: ignores user prompt echo and input-box chrome', () => {

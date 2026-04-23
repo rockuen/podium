@@ -404,6 +404,49 @@ export class WorkerPatternParser {
       // Peek the next line. If it looks like a continuation row, skip this
       // newline and keep scanning. Otherwise terminate here.
       const afterNl = chosen.advance;
+      // v0.8.7 · Hold at end-of-buffer newlines when the payload is
+      // wrap-suspect (long, not sentence-terminated).
+      //
+      // Field evidence (session 2026-04-24): the drop
+      // `to-worker-2-turn6-seq1.md` was cut at 69 bytes mid-sentence
+      // ("...reverseStringSimple,") because Ink visual-wrapped a long
+      // directive at a comma, the wrapped row
+      // ("  reverseStringUnicode) ...") arrived in a LATER pty chunk,
+      // and the parser had already yielded the truncated first row and
+      // advanced past the `@worker-2:` token — so the continuation hit
+      // the stream with no token and was treated as narrative.
+      //
+      // Heuristic: hold only on the FIRST iteration (before any
+      // continuation has been folded) when the newline is the buffer's
+      // last byte AND the payload is not sentence-terminated. Once we
+      // have folded at least one continuation row, the payload is
+      // already multi-line and an end-of-buffer newline there is a
+      // reasonable terminator — returning null would risk never
+      // yielding (iteration count could grow with every chunk).
+      //
+      // Matched test fixtures that informed this shape:
+      //  - v2.7.15 compat (folding across chunks): scanFrom == from on
+      //    iter 1, but the buffer ends AFTER content, so afterNl <
+      //    buffer.length. Check doesn't trigger.
+      //  - v0.4.2 non-terminated folding: iter 2 hits end-of-buffer
+      //    newline; guard allows yield because scanFrom != from.
+      //  - CRLF split directives: iter 1 on second token hits
+      //    end-of-buffer but payload is 4 chars ("next") + terminal
+      //    punctuation test still false — the LENGTH guard below
+      //    short-circuits.
+      //
+      // Worst case if the continuation never arrives: the idle-edge
+      // `flush()` path surfaces the partial as-is. Cost: ~ next chunk
+      // arrival delay (tens to hundreds of ms).
+      if (scanFrom === from && afterNl >= this.buffer.length) {
+        const payloadSoFar = this.buffer.slice(from, chosen.payloadEnd);
+        const WRAP_SUSPECT_THRESHOLD = 30;
+        const endsWithTerminalPunct =
+          /[.!?。！？…](?:["'"'')）\]]+)?\s*$/.test(payloadSoFar);
+        if (!endsWithTerminalPunct && payloadSoFar.length >= WRAP_SUSPECT_THRESHOLD) {
+          return null;
+        }
+      }
       const peek = this.buffer.slice(afterNl, afterNl + 40);
       const isIndented = /^[ \t]{2,}\S/.test(peek);
       const startsWithTarget = /^[ \t]*@(?:worker-\d+|leader):/.test(peek);

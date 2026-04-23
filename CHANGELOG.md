@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.8.7] - 2026-04-24
+
+### Fix · Parser no longer truncates long directives at pty chunk boundaries
+
+Field evidence from session 2026-04-24 retrospective: the drop
+`to-worker-2-turn6-seq1.md` was 69 bytes, cut mid-sentence at a
+comma ("`...reverseStringSimple,`"). The leader's intended directive
+was "`...reverseStringSimple, reverseStringUnicode)을 검토해줘.`" —
+Ink visual-wrapped the row at ~80 columns, the wrap landed a `\n` +
+2-space-indent inside the payload, and that continuation arrived in
+a LATER pty chunk. `WorkerPatternParser.findSingleLineTerminator` saw
+the newline as the buffer's last byte, peeked ahead (empty), and
+classified the absent-content case as `isBlank` → terminate. It
+yielded the truncated first row, advanced past the `@worker-2:`
+token, and the continuation chunk then hit the stream with no token
+prefix and got absorbed as narrative. Worker-2 received unusable
+instructions; the leader blamed itself and re-sent.
+
+Fix: when (a) we are on the first iteration (no continuation folded
+yet), (b) the chosen newline IS the last byte in the buffer, and
+(c) the payload so far is ≥ 30 chars AND not sentence-terminated,
+return null from `findSingleLineTerminator`. `drainComplete`
+preserves the raw `@<target>: <partial>` slice in the buffer for
+the next feed. When the continuation chunk arrives, the peek
+succeeds with the indented content and the normal v2.7.15
+continuation-fold logic runs. If the leader genuinely stops emitting,
+the idle-edge `flush()` path still surfaces the held partial.
+
+Guard conditions tuned against the existing test corpus (v2.7.15
+continuation folding, v0.4.2 non-terminated folding, CRLF line
+endings, ellipsis-inside-payload, multi-directive chunks) — all 34
+router tests pass.
+
+### Fix · Drop sanitizer catches more thinking verbs
+
+Retro evidence showed `Warping…`, `Beaming…`, `Effecting…` slipping
+through — Claude Code v2.1+ placeholder rotation has broader verbs
+than the initial v0.8.5 list. Added: Warping, Beaming, Effecting,
+Conjuring, Transmuting, Invoking, Summoning, Crafting, Weaving,
+Forging, Sculpting, Tuning, Calibrating, Syncing, Aligning, Focusing,
+Channeling, Orchestrating, Synthesizing.
+
+### Tests
+
+- `router v0.8.7: long directive wrapped across two pty chunks is NOT truncated`
+- `router v0.8.7: short directive at end-of-buffer still yields (no hold regression)`
+- `router v0.8.7: held partial is released by flush on leader idle`
+
 ## [0.8.6] - 2026-04-24
 
 ### Fix · Sanitizer hotfix — asterisk spinner + bare counter
