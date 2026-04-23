@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import { strict as assert } from 'node:assert';
-import { IdleDetector } from '../../src/orchestration/core/idleDetector';
+import { IdleDetector, isCosmeticLine, isInkNoise } from '../../src/orchestration/core/idleDetector';
 
 function mkClock(start = 0): { now: () => number; advance: (ms: number) => void } {
   let t = start;
@@ -190,4 +190,84 @@ test('idle v0.3.8: OMC status line as pure contains (no leading prompt) satisfie
   d.feed('some prefix text   [OMC#4.12.0] | session:1m | ctx:4%\n');
   c.advance(600);
   assert.equal(d.isIdle, true, 'OMC status anywhere on a line should count as prompt');
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// v0.8.5 — isInkNoise sanitizer for the drop-file pipeline.
+//
+// Fixtures are taken verbatim from the 2026-04-24 field drops
+// (worker-1-turn4-seq2.md, worker-2-turn6-seq2.md) — the lines the old
+// filter let through and that turned a 200-byte real reply into a
+// 16-37 KB spinner soup.
+// ─────────────────────────────────────────────────────────────────────
+
+test('sanitize: spinner glyph alone is noise', () => {
+  assert.equal(isInkNoise('✻'), true);
+  assert.equal(isInkNoise('  ✶  '), true);
+  assert.equal(isInkNoise('✢'), true);
+  assert.equal(isInkNoise('·'), true);
+  assert.equal(isInkNoise('✽'), true);
+});
+
+test('sanitize: spinner + thinking verb fragments are noise', () => {
+  assert.equal(isInkNoise('✶ C'), true);
+  assert.equal(isInkNoise('✢    n  l'), true);
+  assert.equal(isInkNoise('*      el in'), true);
+  assert.equal(isInkNoise('✻         i  …'), true);
+});
+
+test('sanitize: thinking verb lines (Channelling / Pouncing / etc.) are noise', () => {
+  assert.equal(isInkNoise('Channelling…'), true);
+  assert.equal(isInkNoise('✻ Channelling… (3s · ↓ 74 tokens · thinking)'), true);
+  assert.equal(isInkNoise('Pouncing…'), true);
+  assert.equal(isInkNoise('* Pouncing…           8          thinking'), true);
+  assert.equal(isInkNoise('Sautéed'), true);
+  assert.equal(isInkNoise('Cooked for 53s'), true);
+});
+
+test('sanitize: timing / token status markers are noise', () => {
+  assert.equal(isInkNoise(' (2s · thinking)'), true);
+  assert.equal(isInkNoise('↓ 13 tokens · thinking)'), true);
+  assert.equal(isInkNoise('↑ 6'), true);
+  assert.equal(isInkNoise('  thinking'), true);
+});
+
+test('sanitize: box drawing and Claude logo are noise', () => {
+  assert.equal(isInkNoise('───────────────────────────────'), true);
+  assert.equal(isInkNoise(' ▐▛███▜▌   Claude Code v2.1.118'), true);
+  assert.equal(isInkNoise('▝▜█████▛▘'), true);
+  assert.equal(isInkNoise('  ▘▘ ▝▝'), true);
+});
+
+test('sanitize: tool-use chrome is noise', () => {
+  assert.equal(isInkNoise('  ⎿  .omc/team/drops/to-worker-1-turn2-seq1.md'), true);
+  assert.equal(isInkNoise('● Reading 1 file… (ctrl+o to expand)'), true);
+  assert.equal(isInkNoise('Found 1 settings issue · /doctor for details'), true);
+  assert.equal(isInkNoise('ctrl+g to edit in Notepad'), true);
+});
+
+test('sanitize: cursor-fragmented 1-3 letter scraps are noise', () => {
+  // These are literally what Ink produces when drawing "Channelling…"
+  // across cursor-positioned rows.
+  assert.equal(isInkNoise('Po'), true);
+  assert.equal(isInkNoise('u'), true);
+  assert.equal(isInkNoise('ci'), true);
+  assert.equal(isInkNoise('h n'), false); // has a space — not purely letters
+});
+
+test('sanitize: real assistant content passes through', () => {
+  assert.equal(isInkNoise('@leader: 구현 완료. 5/5 테스트 통과.'), false);
+  assert.equal(isInkNoise('function reverseString(str) {'), false);
+  assert.equal(isInkNoise('  return Array.from(str).reverse().join("");'), false);
+  assert.equal(isInkNoise('}'), false);
+  assert.equal(isInkNoise('1. Intl.Segmenter 기반 grapheme 분할 ✓'), false);
+  assert.equal(isInkNoise('apple'), false); // single-word response (5 chars, > 3 threshold)
+});
+
+test('sanitize: isCosmeticLine still narrow (does NOT catch Ink thinking)', () => {
+  // Regression guard: we intentionally kept isCosmeticLine narrow so
+  // IdleDetector.feed's silence timer logic is unchanged. If someone
+  // accidentally widens it, this test flags it.
+  assert.equal(isCosmeticLine('Channelling…'), false);
+  assert.equal(isCosmeticLine('✻'), false);
 });

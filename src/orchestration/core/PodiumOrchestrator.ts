@@ -44,7 +44,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripAnsi } from './ansi';
-import { IdleDetector, isCosmeticLine } from './idleDetector';
+import { IdleDetector, isCosmeticLine, isInkNoise } from './idleDetector';
 import {
   ClaudeLeaderRoutingProjector,
   WorkerPatternParser,
@@ -1051,15 +1051,21 @@ export class PodiumOrchestrator implements vscode.Disposable {
         if (w.transcript.length > MAX_TRANSCRIPT_CHARS) {
           w.transcript = w.transcript.slice(-MAX_TRANSCRIPT_CHARS);
         }
-        // v0.8.4 — mirror into rawTranscript for spill, filtering out
-        // cosmetic Ink UI rows (OMC status / bypass hint / prompt echo).
-        // Projector-based `transcript` loses content because the Claude
-        // routing projector closes the assistant block on any `other`-
-        // classified line, which in real worker replies matches most
-        // code-block body lines. The raw, cosmetic-filtered stream is
-        // what the drop file actually needs for the leader to Read.
+        // v0.8.4 — mirror into rawTranscript for spill.
+        // v0.8.5 — apply the broader `isInkNoise` sanitizer in addition
+        //         to `isCosmeticLine`. Field drops from the 2026-04-24
+        //         session were 16–37 KB, dominated by Ink TUI rendering
+        //         artifacts: spinner glyphs (✻ ✶ ✢ · ✽), thinking
+        //         verbs fragmented by cursor positioning ("Po", "u",
+        //         "ci g…"), box-draw rules, Claude logo art, and tool-
+        //         use chrome (⎿ path, "● Reading 1 file…"). The narrow
+        //         cosmetic filter (OMC status, prompt `>`, bypass hint)
+        //         caught none of it, so the drop file the leader
+        //         Read'd was mostly noise. Combined filter drops the
+        //         noise to a few hundred bytes without affecting the
+        //         real reply content.
         for (const line of cleaned.split(/\r?\n/)) {
-          if (line.length > 0 && !isCosmeticLine(line)) {
+          if (line.length > 0 && !isCosmeticLine(line) && !isInkNoise(line)) {
             w.rawTranscript += line + '\n';
           }
         }

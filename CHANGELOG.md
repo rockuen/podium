@@ -1,5 +1,52 @@
 # Changelog
 
+## [0.8.5] - 2026-04-24
+
+### Fix · Drop sanitizer (P0-1 from 2026-04-24 retro)
+
+Post-session retro surfaced that v0.8.4's dual-transcript fix, while
+correct in direction, wasn't enough. Drops captured from the
+`reverseString` team run were still 16 KB and 37 KB in size, with
+the user's own estimate that roughly 95% of those bytes were
+terminal rendering noise.
+
+Inspection of `worker-1-turn4-seq2.md` and `worker-2-turn6-seq2.md`
+confirmed the diagnosis: the existing `isCosmeticLine` filter caught
+only OMC status rows, bypass hints, and bare prompts. It did not
+catch the dominant noise sources in Claude Code v2.1+'s Ink TUI:
+
+- Spinner glyphs on their own row or paired with a fragment of a
+  thinking verb (`✻`, `✶ C`, `✢    n  l`).
+- Thinking verbs like `Channelling…`, `Pouncing…`, `Sautéed`,
+  `Cooked`, `Simmering`, `Harmonizing`, and ~30 more that Claude
+  rotates through during generation.
+- Timing / token status markers (`(2s · thinking)`,
+  `↓ 13 tokens · thinking)`, `↑ 6`).
+- Horizontal rules (`───────────────────`) and the Claude logo art
+  block (`▐▛███▜▌`, `▝▜█████▛▘`).
+- Tool-use chrome (`⎿ path`, `● Reading 1 file… (ctrl+o to expand)`,
+  `Found 1 settings issue`, `ctrl+g to edit in Notepad`).
+- Cursor-positioned fragments: Ink draws `Channelling…`
+  character-by-character across rows, so after stripAnsi +
+  cosmetic-filter we saw short lines like `Po`, `u`, `n`, `ci g…`.
+
+Fix: added `isInkNoise` — a broader sanitizer specifically for the
+drop-file pipeline. The rawTranscript accumulator in `onPaneData`
+now filters by `isCosmeticLine || isInkNoise`, so drop contents are
+the worker's actual reply only.
+
+`isCosmeticLine` was intentionally NOT widened. The idle detector's
+silence-timer logic uses it to decide whether a chunk resets the
+timer; widening it would make the timer drift while Claude is mid-
+generation showing "Channelling…" status updates. A regression test
+asserts `isCosmeticLine` stays narrow.
+
+Test coverage: 9 new `sanitize: …` tests in `idleDetector.test.ts`
+with fixtures taken verbatim from the retro field drops.
+
+P0-2 (turn manifest) and P0-3 (reply-to causality) from the same
+retro are queued for v0.8.6 / v0.8.7.
+
 ## [0.8.4] - 2026-04-24
 
 ### Fix · Drop capture truncation (dual transcript)
