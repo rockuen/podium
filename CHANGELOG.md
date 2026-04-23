@@ -1,5 +1,50 @@
 # Changelog
 
+## [0.8.8] - 2026-04-24
+
+### Fix · Drop sanitizer covers the remaining 2026-04 verb set
+
+The v0.8.7 verb sweep was correction-by-memory and missed what was
+actually in the drops folder. An exhaustive sweep with
+`grep -hoE '[A-Z][a-z]+…' drops/*.md | sort -u` over the 2026-04-23/24
+field captures returned ten unique verbs; four of them weren't in
+`THINKING_VERB_RE`:
+
+- `Cooking` (progressive form — `Cooked` was in the list but not
+  the active form; `✶ Cooking… (4s · ↓ 120 tokens · thought for 1s)`
+  leaked straight through)
+- `Forming`
+- `Frosting` (dominated `worker-2-turn5-seq2.md` — the drop that
+  originally motivated the 2026-04-24 retrospective)
+- `Swirling`
+
+Added all four. `Running…` also appeared in drops but is the Bash-tool
+status row (`⎿  Running…`); it's already caught by `TOOL_LEADER_RE`
+and does not belong in the verb regex — `Running the tests` would
+be a legitimate prose prefix and a verb-side match would over-filter.
+
+### Tests
+
+- `sanitize v0.8.8: Cooking/Forming/Frosting/Swirling verbs are noise`
+  — uses verbatim drop-file lines (with counter digits and spinner
+  glyphs) as fixtures. These tests also act as the canonical release
+  tracker: when Claude Code ships a new placeholder verb, add it
+  here first (it fails), then add to the regex.
+
+All 204 tests green.
+
+### Why parser fix not included
+
+The other P0 from the 2026-04-24 retrospective — leader directive
+truncated at `"(1)"` with `\nIntl.Seg` in the same pty chunk — is
+intentionally deferred to v0.8.8b. The naive extension of v0.8.7's
+end-of-buffer hold would over-hold legitimate multi-line prompts.
+Fix requires distinguishing "Ink wrap continuation with no indent"
+from "new narrative line" / "next @target directive" — that needs
+design (peek for `@<target>:` pattern vs non-`@` prose, and a
+column-width heuristic to guess Ink wrap vs author-intentional
+linebreak). Tracked separately.
+
 ## [0.8.7] - 2026-04-24
 
 ### Fix · Parser no longer truncates long directives at pty chunk boundaries

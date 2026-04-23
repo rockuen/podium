@@ -103,7 +103,7 @@ const SPINNER_CHARS_RE = /[✻✶✢·✽]/;
 const ASTERISK_FRAGMENT_RE = /^\s*\*\s+[A-Za-z\s…]{1,12}\s*$/;
 // Bare arrow-and-digit status counters Ink paints during streaming.
 const BARE_COUNTER_RE = /^\s*[↑↓]\s*\d+\s*$/;
-const THINKING_VERB_RE = /^\s*[✻✶✢·✽]?\s*(Channelling|Pouncing|Saut[ée]ed|Cooked|Harmonizing|Manifesting|Thinking|Processing|Reticulating|Percolating|Distilling|Simmering|Brewing|Marinating|Rendering|Contemplating|Cogitating|Deliberating|Musing|Ruminating|Pondering|Reflecting|Noodling|Pouring|Whisking|Kneading|Braising|Poaching|Grilling|Roasting|Frying|Baking|Steaming|Broiling|Sizzling|Pickling|Curing|Aging|Fermenting|Smoking|Blending|Infusing|Reducing|Glazing|Searing|Warping|Beaming|Effecting|Conjuring|Transmuting|Invoking|Summoning|Crafting|Weaving|Forging|Sculpting|Tuning|Calibrating|Syncing|Aligning|Focusing|Channeling|Orchestrating|Synthesizing)…?/i;
+const THINKING_VERB_RE = /^\s*[✻✶✢·✽*]?\s*(Channelling|Pouncing|Saut[ée]ed|Cooked|Cooking|Harmonizing|Manifesting|Thinking|Processing|Reticulating|Percolating|Distilling|Simmering|Brewing|Marinating|Rendering|Contemplating|Cogitating|Deliberating|Musing|Ruminating|Pondering|Reflecting|Noodling|Pouring|Whisking|Kneading|Braising|Poaching|Grilling|Roasting|Frying|Baking|Steaming|Broiling|Sizzling|Pickling|Curing|Aging|Fermenting|Smoking|Blending|Infusing|Reducing|Glazing|Searing|Warping|Beaming|Effecting|Conjuring|Transmuting|Invoking|Summoning|Crafting|Weaving|Forging|Sculpting|Tuning|Calibrating|Syncing|Aligning|Focusing|Channeling|Orchestrating|Synthesizing|Forming|Frosting|Swirling)…?/i;
 const TIMING_MARKER_RE = /\(\s*\d+s\s*·|·\s*thinking\)/;
 const TOKEN_COUNTER_RE = /(?:^|\s)(?:↑|↓)?\s*\d+\s+tokens\b|\bthinking\b/;
 const BOX_RULE_RE = /^[─━═╌╍\s]*$/;

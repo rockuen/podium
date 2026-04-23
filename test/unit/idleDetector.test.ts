@@ -271,3 +271,32 @@ test('sanitize: isCosmeticLine still narrow (does NOT catch Ink thinking)', () =
   assert.equal(isCosmeticLine('Channelling…'), false);
   assert.equal(isCosmeticLine('✻'), false);
 });
+
+// ─────────────────────────────────────────────────────────────────────
+// v0.8.8 — verb additions from the 2026-04-23/24 field drops.
+// Extracted with `grep -hoE '[A-Z][a-z]+…' drops/*.md | sort -u`.
+// This block is the canonical release tracker: if Claude Code ships
+// a new placeholder verb, add it here FIRST (it will fail), then add
+// to THINKING_VERB_RE.
+// ─────────────────────────────────────────────────────────────────────
+
+test('sanitize v0.8.8: Cooking/Forming/Frosting/Swirling verbs are noise', () => {
+  // All four appeared in worker-1-turn*-seq2.md / worker-2-turn*-seq2.md.
+  // The 2026-04-24 retrospective flagged Frosting/Swirling specifically —
+  // Cooking/Forming showed up in the same drops via release tracker sweep.
+  assert.equal(isInkNoise('Frosting…'), true);
+  assert.equal(isInkNoise('Frosting…          33'), true);
+  assert.equal(isInkNoise('* Frosting…            8'), true);
+  assert.equal(isInkNoise('Swirling…'), true);
+  assert.equal(isInkNoise('  Swirling…   5'), true);
+  assert.equal(isInkNoise('Cooking…'), true);
+  assert.equal(isInkNoise('✶ Cooking… (4s · ↓ 120 tokens · thought for 1s)'), true);
+  assert.equal(isInkNoise('Forming…'), true);
+  assert.equal(isInkNoise('  Forming…  7'), true);
+});
+
+// Note: the regex is line-start prefix-match (no `$` anchor, `…?` optional),
+// so prose like "Forming a plan..." also matches. That's a pre-existing
+// property shared with Thinking/Processing/Pondering etc. — not regressed
+// by v0.8.8. If it ever hits real usage, tighten per-verb (some need `…`,
+// some stand alone).
