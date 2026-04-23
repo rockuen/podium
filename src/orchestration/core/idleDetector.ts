@@ -35,10 +35,35 @@ const COSMETIC_LINE_PATTERNS: RegExp[] = [
   /^user>\s*$/,                  // codex bare prompt
 ];
 
+// v0.3.5 · Claude v2.1+ Ink alt-screen repaint.
+//
+// Ink writes the bottom UI (prompt + OMC status + bypass hint) using
+// cursor-positioning escapes instead of newlines, so after `stripAnsi` the
+// positioning codes vanish and the fragments concatenate into one logical
+// "line" like:
+//   `>                  [OMC#4.12.0] | 5h:51%... | ctx:4%    ⏵⏵ bypass permissions on (shift+tab to cycle)`
+// None of the anchored patterns above match that shape, so `lastOutputAt`
+// was refreshing on every Ink repaint (several times per second) and a
+// worker pane sitting at its fresh prompt reported `isIdle === false`
+// indefinitely — v0.3.4 field log: `queue worker-1 (busy, queue=2)` with
+// no inject ever firing.
+//
+// These contains-patterns catch the concatenated form. Risk: if an assistant
+// response literally quotes the OMC status bar we'd classify that line as
+// cosmetic and delay the silence window by a tick — acceptable tradeoff.
+const COSMETIC_CONTAINS_PATTERNS: RegExp[] = [
+  // Any chunk carrying BOTH the status row and the bypass hint is an Ink
+  // compact repaint — the two almost never co-occur in real assistant prose.
+  /\[OMC#[\d.]+\].*?bypass\s+permissions/s,
+  // Compact repaint that caught only the status + prompt (no bypass visible).
+  /^\s*>\s+\[OMC#[\d.]+\]/,
+];
+
 function isCosmeticLine(line: string): boolean {
   const t = line.trim();
   if (t === '') return true; // blank lines are cosmetic by definition
-  return COSMETIC_LINE_PATTERNS.some((re) => re.test(t));
+  if (COSMETIC_LINE_PATTERNS.some((re) => re.test(t))) return true;
+  return COSMETIC_CONTAINS_PATTERNS.some((re) => re.test(t));
 }
 
 export interface IdleDetectorOptions {

@@ -146,3 +146,25 @@ test('idle: msSinceOutput reflects wall clock', () => {
   c.advance(1234);
   assert.equal(d.msSinceOutput, 1234);
 });
+
+test('idle v0.3.5: Ink alt-screen compact repaint is cosmetic (status + bypass concatenated)', () => {
+  const c = mkClock(1000);
+  const d = new IdleDetector({ agent: 'claude', now: c.now, silenceMs: 500 });
+  d.feed('Claude Code v2.1.118\n> \n');
+  c.advance(600);
+  assert.equal(d.isIdle, true, 'should be idle after boot + silence');
+  d.feed('>                                [OMC#4.12.0] | 5h:51%(0h16m) | ctx:4%    ⏵⏵ bypass permissions on (shift+tab to cycle)\n');
+  c.advance(100);
+  assert.equal(d.isIdle, true, 'Ink compact repaint must not reset silence');
+});
+
+test('idle v0.3.5: prompt + OMC status concatenated (no bypass) is cosmetic', () => {
+  const c = mkClock(1000);
+  const d = new IdleDetector({ agent: 'claude', now: c.now, silenceMs: 500 });
+  d.feed('Claude Code v2.1.118\n> \n');
+  c.advance(600);
+  assert.equal(d.isIdle, true);
+  d.feed('>      [OMC#4.12.0] | session:0m | ctx:0%\n');
+  c.advance(50);
+  assert.equal(d.isIdle, true, 'compact prompt+status repaint should be cosmetic');
+});
