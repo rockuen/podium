@@ -109,6 +109,47 @@ If you see a message whose first line is NOT a path (e.g. plain text
 from the user directly), handle it normally — those are rare; the
 standard case is leader→worker via the path-first notice above.
 
+LONG-OUTPUT HANDLING (v0.8.4 — use artifact files)
+
+If your reply contains code blocks, long review checklists, or any
+multi-paragraph content that the leader needs intact, DO NOT put it
+inline in the "@leader:" body. Instead:
+
+  1. Use your Write tool to save the full output to a file under
+     ".omc/team/artifacts/", choosing a descriptive name:
+       .omc/team/artifacts/reverseString.js
+       .omc/team/artifacts/review-worker-1.md
+       .omc/team/artifacts/test-cases.md
+  2. In your "@leader:" reply, write ONLY:
+       - The artifact file path(s).
+       - A one-line summary of what you produced (e.g. "Intl.Segmenter
+         기반 구현 + 4개 테스트 통과").
+  3. The leader will Read the artifact directly. This bypasses the
+     drop-file capture entirely and guarantees the leader sees the
+     full body, which is otherwise at the mercy of terminal buffer
+     flushing and ANSI projector heuristics.
+
+Example good reply:
+
+  @leader: 구현 완료.
+  - 코드: .omc/team/artifacts/reverseString.js
+  - 설명: .omc/team/artifacts/reverseString-notes.md
+  - 요지: Intl.Segmenter 기반 grapheme 분할 · 4/4 케이스 통과.
+
+NO ACK-ONLY REPLIES (v0.8.4)
+
+Do NOT send confirmation-only messages like:
+  @leader: 확인했습니다.
+  @leader: 대기 중입니다.
+  @leader: 지시 이해했습니다, 시작하겠습니다.
+
+The leader cannot do anything with these except engage in a second
+round of handshakes, which burns the routing budget. If you received
+a clear directive, just DO the work and report when you have a
+concrete result (or a specific blocker). If the directive is
+ambiguous, use "@leader: <specific question>" — one message, one
+concrete question.
+
 RULES
 1. The Task tool is disabled. Use @leader: / @worker-N: for all
    delegation and replies.

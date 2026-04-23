@@ -1,5 +1,69 @@
 # Changelog
 
+## [0.8.4] - 2026-04-24
+
+### Fix · Drop capture truncation (dual transcript)
+
+Post-session retrospective surfaced the root cause of a pattern we'd
+been fighting for multiple versions: drop files nominally captured
+worker output (e.g. `worker-1-turn3-seq2.md` at 728 bytes) but
+actually contained only the `@leader:` header line with none of the
+actual code body. Leader Read the drop file, got nothing useful,
+re-asked the worker to resend, burned more rounds, never converged.
+
+Cause: `w.transcript` (the source the spill slices) was fed from
+`ClaudeLeaderRoutingProjector.feed(stripAnsi(rawData))`. The
+projector closes the assistant block on any line it classifies as
+`other` (anything not recognized as assistant-start/cont, prompt,
+chrome, status, or blank). Code block bodies, Korean prose without
+known prefixes, and most real worker output are `other` — so the
+projector dropped them. Intentional for ROUTING (we don't want
+arbitrary text misread as directives), but wrong for SPILL (where
+we want every byte the worker actually wrote).
+
+Fix: dual transcript.
+
+- `WorkerRuntime` gains `rawTranscript` + `rawCurrentTurnStart`.
+- `onPaneData` worker branch now appends raw `stripAnsi` output
+  (minus cosmetic UI lines — OMC status / bypass hint / prompt
+  echo, via the already-existing `isCosmeticLine` filter, now
+  exported from `idleDetector.ts`) to `rawTranscript`. The
+  projector-fed `transcript` is unchanged — parser routing and
+  dedupe continue to use it.
+- Spill in the idle-edge handler now slices `rawTranscript`, not
+  `transcript`. Drop file contents are what the worker actually
+  wrote, including full code blocks.
+- `rawCurrentTurnStart` advances in lockstep with `currentTurnStart`
+  on every idle edge.
+
+### Protocol · Retrospective hardening
+
+Three prompt updates driven by the same field log:
+
+1. Worker protocol — `LONG-OUTPUT HANDLING`: for code blocks, long
+   reviews, or any multi-paragraph content, workers MUST use their
+   Write tool to save the artifact to `.omc/team/artifacts/<name>`
+   and reply with "@leader: <path> + one-line summary". Bypasses
+   drop-file capture entirely. Insurance on top of the dual-transcript
+   fix.
+2. Worker protocol — `NO ACK-ONLY REPLIES`: explicit prohibition
+   on "확인했습니다" / "대기 중입니다" confirmation messages.
+   Workers either do the work, ask a specific question, or report
+   a blocker. No handshake rounds.
+3. Leader protocol — `COMPLEXITY GATE`: team usage requires at
+   least one of { multi-file, genuinely independent perspectives,
+   parallelizable chunks, needs external verification }. Single
+   small functions: leader answers directly. Strict sequential
+   dependency: use one worker for "implement + self-verify"
+   rather than splitting.
+4. Leader protocol — `NO ENGAGEMENT WITH WORKER ACK-ONLY
+   REPLIES`: symmetric to worker side. Leader ignores
+   confirmation-only messages, responds only to concrete output,
+   specific questions, or real blockers.
+
+No existing tests lock in the projector→transcript path or the
+prompt text, so all 190 tests remain green.
+
 ## [0.8.3] - 2026-04-24
 
 ### Fix · Worker→leader always spills (threshold removed)

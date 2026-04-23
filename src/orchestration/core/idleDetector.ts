@@ -59,7 +59,7 @@ const COSMETIC_CONTAINS_PATTERNS: RegExp[] = [
   /^\s*>\s+\[OMC#[\d.]+\]/,
 ];
 
-function isCosmeticLine(line: string): boolean {
+export function isCosmeticLine(line: string): boolean {
   const t = line.trim();
   if (t === '') return true; // blank lines are cosmetic by definition
   if (COSMETIC_LINE_PATTERNS.some((re) => re.test(t))) return true;

@@ -44,7 +44,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { stripAnsi } from './ansi';
-import { IdleDetector } from './idleDetector';
+import { IdleDetector, isCosmeticLine } from './idleDetector';
 import {
   ClaudeLeaderRoutingProjector,
   WorkerPatternParser,
@@ -252,6 +252,21 @@ export interface WorkerRuntime {
    * the pty-stdin parser path (which fragments on long replies).
    */
   currentTurnStart: number;
+  /**
+   * v0.8.4 — Raw-stripped transcript (no projector). The routing projector
+   * closes the assistant block on any `other`-classified line, which in
+   * practice means code blocks, Korean prose without known prefixes, and
+   * most of what a worker actually wants the leader to read got dropped
+   * from `transcript`. Field evidence: `worker-1-turn3-seq2.md` was 728
+   * bytes but contained only the `@leader:` header and no code. We keep
+   * `transcript` for parser/dedupe (it must stay stable and routing-safe)
+   * but ADDITIONALLY accumulate `rawTranscript` — raw `stripAnsi` output
+   * minus cosmetic UI lines (prompt row, OMC status, bypass hint). This
+   * is what the spill file writes, so the leader actually sees the code.
+   */
+  rawTranscript: string;
+  /** Parallel marker for rawTranscript, advanced in lockstep with currentTurnStart. */
+  rawCurrentTurnStart: number;
   /** Monotonic seq used for drop filenames; disambiguates multiple spills per turn. */
   spillSeq: number;
   /**
@@ -596,6 +611,8 @@ export class PodiumOrchestrator implements vscode.Disposable {
         queue: [],
         recentPayloads: new Map(),
         transcript: '',
+        rawTranscript: '',
+        rawCurrentTurnStart: 0,
         // v0.3.0: only wire worker-side parsers when bidirectional is on.
         parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
         wasIdle: false,
@@ -734,6 +751,8 @@ export class PodiumOrchestrator implements vscode.Disposable {
       queue: [],
       recentPayloads: new Map(),
       transcript: '',
+      rawTranscript: '',
+      rawCurrentTurnStart: 0,
       wasIdle: false,
       currentTurnStart: 0,
       spillSeq: 0,
@@ -1031,6 +1050,21 @@ export class PodiumOrchestrator implements vscode.Disposable {
         w.transcript += projected;
         if (w.transcript.length > MAX_TRANSCRIPT_CHARS) {
           w.transcript = w.transcript.slice(-MAX_TRANSCRIPT_CHARS);
+        }
+        // v0.8.4 — mirror into rawTranscript for spill, filtering out
+        // cosmetic Ink UI rows (OMC status / bypass hint / prompt echo).
+        // Projector-based `transcript` loses content because the Claude
+        // routing projector closes the assistant block on any `other`-
+        // classified line, which in real worker replies matches most
+        // code-block body lines. The raw, cosmetic-filtered stream is
+        // what the drop file actually needs for the leader to Read.
+        for (const line of cleaned.split(/\r?\n/)) {
+          if (line.length > 0 && !isCosmeticLine(line)) {
+            w.rawTranscript += line + '\n';
+          }
+        }
+        if (w.rawTranscript.length > MAX_TRANSCRIPT_CHARS) {
+          w.rawTranscript = w.rawTranscript.slice(-MAX_TRANSCRIPT_CHARS);
         }
         // v0.3.0: if bidirectional routing is enabled, parse this worker's
         // output for `@leader:` / `@worker-N:` directives and route them.
@@ -2105,27 +2139,19 @@ export class PodiumOrchestrator implements vscode.Disposable {
       //       See SPILL_THRESHOLD_CHARS for rationale.
       if (w.parser && w.idle.isIdle && !w.wasIdle) {
         if (w.hasPendingReply) {
-          // Worker was addressed (inject fired) and has now settled. v0.8.3:
-          // drop the SPILL_THRESHOLD_CHARS gate — always spill the turn body
-          // via a drop file when there is any content, mirroring v0.8.0's
-          // leader→worker path. Rationale:
-          //
-          //   (1) The "short replies handled by parser.flush()" branch
-          //       missed the common `@leader: <header>\n<long body>` pattern.
-          //       The parser yielded only the header (single-line form), the
-          //       body stayed in transcript, and the flush branch dropped it
-          //       because the parser had nothing left pending. Field logs
-          //       from a reverseString relay showed workers writing full
-          //       reviews that leader never received.
-          //
-          //   (2) Matches the symmetry fix for leader→worker in v0.8.0 —
-          //       Ink fragmentation makes every pty-borne reply unsafe
-          //       regardless of length; the drop file is the robust channel.
-          //
-          //   (3) Gives observability for every turn. Without a log line
-          //       the short-flush path was silent when parser.flush()
-          //       returned empty, masking idle-edge issues.
-          const turnBody = w.transcript.slice(w.currentTurnStart);
+          // v0.8.3: always spill the turn body via a drop file (no
+          //         SPILL_THRESHOLD_CHARS gate).
+          // v0.8.4: spill from `rawTranscript` (cosmetic-filtered raw
+          //         stripAnsi), NOT the projector-filtered `transcript`.
+          //         Field evidence: `worker-1-turn3-seq2.md` was 728 B
+          //         but contained only the `@leader:` header line — the
+          //         projector closed the assistant block on the first
+          //         `other`-classified line (in practice, the first code
+          //         line), dropping the body. The routing parser still
+          //         reads the projected stream (that logic is unchanged),
+          //         but the drop file now carries what the worker
+          //         actually wrote.
+          const turnBody = w.rawTranscript.slice(w.rawCurrentTurnStart);
           if (turnBody.trim().length > 0) {
             this.spillAndNotify(w, turnBody);
           } else {
@@ -2152,6 +2178,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
         // Always advance the turn-start marker so the next real reply
         // slices from the right offset, regardless of which branch ran.
         w.currentTurnStart = w.transcript.length;
+        w.rawCurrentTurnStart = w.rawTranscript.length;
         w.wasIdle = true;
       } else if (!w.idle.isIdle) {
         w.wasIdle = false;
