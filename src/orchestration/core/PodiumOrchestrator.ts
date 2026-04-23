@@ -2105,25 +2105,37 @@ export class PodiumOrchestrator implements vscode.Disposable {
       //       See SPILL_THRESHOLD_CHARS for rationale.
       if (w.parser && w.idle.isIdle && !w.wasIdle) {
         if (w.hasPendingReply) {
-          // Worker was addressed (inject fired) and has now settled. Treat
-          // the transcript slice as a real reply: spill-or-flush.
+          // Worker was addressed (inject fired) and has now settled. v0.8.3:
+          // drop the SPILL_THRESHOLD_CHARS gate — always spill the turn body
+          // via a drop file when there is any content, mirroring v0.8.0's
+          // leader→worker path. Rationale:
+          //
+          //   (1) The "short replies handled by parser.flush()" branch
+          //       missed the common `@leader: <header>\n<long body>` pattern.
+          //       The parser yielded only the header (single-line form), the
+          //       body stayed in transcript, and the flush branch dropped it
+          //       because the parser had nothing left pending. Field logs
+          //       from a reverseString relay showed workers writing full
+          //       reviews that leader never received.
+          //
+          //   (2) Matches the symmetry fix for leader→worker in v0.8.0 —
+          //       Ink fragmentation makes every pty-borne reply unsafe
+          //       regardless of length; the drop file is the robust channel.
+          //
+          //   (3) Gives observability for every turn. Without a log line
+          //       the short-flush path was silent when parser.flush()
+          //       returned empty, masking idle-edge issues.
           const turnBody = w.transcript.slice(w.currentTurnStart);
-          if (turnBody.length >= SPILL_THRESHOLD_CHARS) {
+          if (turnBody.trim().length > 0) {
             this.spillAndNotify(w, turnBody);
-            // Drain anything the parser had buffered — we just superseded
-            // it via the drop file, and leaving it would let half-parsed
-            // fragments route on the NEXT idle edge.
-            w.parser.flush();
           } else {
-            const pending = w.parser.flush();
-            if (pending.length > 0) {
-              this.stats.flushed += pending.length;
-              this.output.appendLine(
-                `[orch] ${w.cfg.id} idle — flushed ${pending.length} pending directive(s)`,
-              );
-              for (const m of pending) this.route(m, w.cfg.paneId);
-            }
+            this.output.appendLine(
+              `[orch] ${w.cfg.id} idle — no body to spill (turnBody empty, pendingReply cleared)`,
+            );
           }
+          // Drain any parser state regardless — the drop file supersedes
+          // anything the parser yielded mid-stream.
+          w.parser.flush();
           w.hasPendingReply = false;
         } else {
           // v0.6.1 — No inject was routed to this worker since the last

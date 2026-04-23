@@ -1,5 +1,47 @@
 # Changelog
 
+## [0.8.3] - 2026-04-24
+
+### Fix · Worker→leader always spills (threshold removed)
+
+Field log from a reverseString relay with an implementer + critic
+roster: workers produced long `@leader:` replies that never reached
+the leader. Worker-2 wrote a header line (`@leader: worker-1 구현
+검토 결과 — 3개 축 + 추가 이슈.`) followed by a multi-paragraph
+Korean review. The parser matched the header as a single-line
+`@leader:` directive and yielded just that one line. The review body
+below sat in `w.transcript` waiting for the busy→idle edge to spill
+it. That spill never fired — and when it did, the branch gate
+`turnBody.length >= SPILL_THRESHOLD_CHARS (300)` was the wrong lever.
+Worker-1's direct evidence: zero `worker-1-turn*.md` drop files in
+`.omc/team/drops/` across every session tried, only `to-worker-*`
+leader→worker files.
+
+Root cause: the short-reply branch ran `parser.flush()` to drain
+pending directives, but in the observed pattern the parser had
+**already** yielded the header mid-stream — the body wasn't in
+parser buffer, it was in transcript. Flush returned empty, no log
+line, the body was lost.
+
+Fix (symmetric with v0.8.0 leader→worker):
+
+- Drop the `SPILL_THRESHOLD_CHARS` gate on the worker→leader idle
+  edge. Any non-empty turnBody now spills to
+  `.omc/team/drops/worker-N-turn<M>-seq<S>.md` and injects the
+  path-first drop notice into the leader.
+- `parser.flush()` still runs to drain state, but the drop file
+  supersedes anything it might have emitted mid-stream. No more
+  double-delivery: parser mid-stream yields that were already routed
+  are fine (different dedupe key from the drop-notice text).
+- Add explicit log line for empty-body idle edges so the path is
+  never silent: `[orch] worker-N idle — no body to spill`.
+
+Test update: `orch v0.6.0: short worker reply stays on parser path`
+becomes `orch v0.8.3: short worker reply ALSO spills (threshold
+removed)`. Assertion flipped from "no worker→leader spill file" to
+"at least one worker→leader spill file". The 190 other tests remain
+green; only the semantic intent of the one test changed.
+
 ## [0.8.2] - 2026-04-24
 
 ### Fix · Leader now uses every worker in the roster by default

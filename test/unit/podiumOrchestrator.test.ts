@@ -831,8 +831,14 @@ test('orch v0.6.1: worker boot output without preceding inject must NOT spill', 
   orch.dispose();
 });
 
-test('orch v0.6.0: short worker reply stays on parser path (no drop file)', async () => {
-  // Negative control: body under threshold routes via parser as before.
+test('orch v0.8.3: short worker reply ALSO spills (threshold removed)', async () => {
+  // v0.8.3 dropped the SPILL_THRESHOLD_CHARS gate for worker→leader.
+  // Rationale: field logs (reverseString relay) showed workers writing
+  // `@leader: <header>\n<long body>` — parser yielded only the header
+  // (single-line form) and the flush branch silently dropped the body.
+  // The user's review never reached the leader. Same symmetry argument
+  // that motivated v0.8.0's leader→worker unconditional spill applies
+  // the other way: the drop file is the robust channel; always use it.
   const os = await import('node:os');
   const fsPromises = await import('node:fs/promises');
   const pathMod = await import('node:path');
@@ -862,19 +868,14 @@ test('orch v0.6.0: short worker reply stays on parser path (no drop file)', asyn
   clock.advance(200);
   (orch as any).tick();
 
-  // v0.8.0 — leader→worker is now unconditionally spilled, which
-  // produces `to-worker-1-turn*.md`. The invariant under test is that
-  // the WORKER→LEADER direction (files `worker-*.md` without the `to-`
-  // prefix) still has a size threshold and short replies do NOT spill.
   const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
   const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
   const workerToLeaderFiles = files.filter(
     (f) => f.startsWith('worker-1-turn') && !f.startsWith('to-'),
   );
-  assert.equal(
-    workerToLeaderFiles.length,
-    0,
-    `short worker→leader reply must not spill (all files: ${files.join(', ')})`,
+  assert.ok(
+    workerToLeaderFiles.length >= 1,
+    `short worker→leader reply must spill too (all files: ${files.join(', ')})`,
   );
 
   await fsPromises.rm(tmpRoot, { recursive: true, force: true });
