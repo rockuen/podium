@@ -232,6 +232,15 @@ export interface WorkerRuntime {
   parser: WorkerPatternParser | null;
   /** v0.3.0 · Claude TUI projector for Claude worker output. Null for non-claude agents. */
   projector: ClaudeLeaderRoutingProjector | null;
+  /**
+   * v0.5.2 — Mirror of `leaderWasIdle` but per-worker. Used by `tick()` to
+   * detect the worker's busy → idle transition and flush its parser so
+   * multi-line `@leader:\n<body>\n` directives that have no `@end`
+   * sentinel finally drain. Without this, a worker that replies with a
+   * long code block gets its payload stuck in its parser buffer forever
+   * because no subsequent token arrives to terminate the multi-line form.
+   */
+  wasIdle: boolean;
 }
 
 /** Cap per-worker transcript to avoid unbounded memory growth in long runs. */
@@ -491,6 +500,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
         transcript: '',
         // v0.3.0: only wire worker-side parsers when bidirectional is on.
         parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
+        wasIdle: false,
         projector:
           this.enableWorkerRouting && w.agent === 'claude'
             ? new ClaudeLeaderRoutingProjector()
@@ -621,6 +631,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
       queue: [],
       recentPayloads: new Map(),
       transcript: '',
+      wasIdle: false,
       // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
       parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
       projector:
@@ -1677,6 +1688,26 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.leaderWasIdle = false;
     }
     for (const w of this.workers.values()) {
+      // v0.5.2 — Worker idle edge: flush the worker's parser so pending
+      // multi-line `@leader:` / `@worker-N:` directives (started with
+      // `@target:\n<body>` but never terminated with `@end`) finally
+      // drain once the worker stops emitting. Without this, a long
+      // code block reply from a Claude worker would sit in the parser
+      // buffer waiting for a terminator that never comes, and the
+      // leader never sees the answer.
+      if (w.parser && w.idle.isIdle && !w.wasIdle) {
+        const pending = w.parser.flush();
+        if (pending.length > 0) {
+          this.stats.flushed += pending.length;
+          this.output.appendLine(
+            `[orch] ${w.cfg.id} idle — flushed ${pending.length} pending directive(s)`,
+          );
+          for (const m of pending) this.route(m, w.cfg.paneId);
+        }
+        w.wasIdle = true;
+      } else if (!w.idle.isIdle) {
+        w.wasIdle = false;
+      }
       if (w.queue.length > 0 && w.idle.isIdle) {
         const next = w.queue.shift();
         if (next !== undefined) this.inject(w, next);
