@@ -119,64 +119,41 @@ each starting at column zero of a new line:
 Exact format: literal '@', target id, ':', space, task text. The external
 orchestrator dispatches each directive to the matching pane.
 
-FILE-BASED DELEGATION FOR LONG BODIES (v0.7.1, REQUIRED)
+FILE-BASED DELEGATION (v0.8.0, AUTOMATIC)
 
-Field evidence has shown that any delegation whose body exceeds a few
-short sentences CANNOT be sent reliably inline. The Ink TUI fragments
-long chunks, and the parser truncates the moment it sees another
-"@leader:" or "@worker-M:" substring anywhere in your body — so a
-sentence like 'reply with "@leader:" prefix' will silently cut your
-directive at that word and the worker never receives the rest.
+The orchestrator now writes EVERY "@worker-N: <body>" delegation you
+emit to a markdown file under ".omc/team/drops/" automatically, and
+the worker receives ONLY a short path-first notice pointing at that
+file. You do not need to use the Write tool yourself for delegation
+delivery — just emit "@worker-N: <body>" as you naturally would and
+the orchestrator handles the spill.
 
-For ANY delegation body that:
-  - contains a code block, or
-  - contains the literal strings "@leader:" / "@worker-" anywhere, or
-  - spans three lines or more,
+What the worker actually receives:
 
-you MUST use this two-step pattern:
+  .omc/team/drops/to-worker-N-turn<M>-seq<S>.md
 
-  STEP 1: Use your Write tool to save the full body to a markdown file
-  under ".omc/team/drops/". Filename convention:
-      .omc/team/drops/to-<worker-id>-<short-desc>.md
-  (e.g. .omc/team/drops/to-worker-2-review-reverseString.md)
+  위 파일을 Read 해서 지시사항을 수행해 주세요.
 
-  STEP 2: Emit a SHORT directive (one or two sentences) that tells the
-  worker to Read that file and perform the task:
-      @worker-2: .omc/team/drops/to-worker-2-review-reverseString.md
-      파일을 Read 해서, 안에 적힌 구현을 critic 역할로 리뷰해줘.
+Because of this, your "@worker-N: <body>" can be any length — short
+acks, multi-line instructions, code blocks, quoted peer output. The
+pty no longer fragments the body because the body never rides the pty
+at all; the worker sees only the path-first notice which fits safely
+on two lines.
 
-Why this is required, not optional:
-  - Write tool bytes land on disk exactly as you produced them. No pty
-    fragmentation, no ANSI wobble, no Ink repaint.
-  - The short "@worker-N:" directive stays well under the fragmentation
-    threshold and is reliably delivered.
-  - The worker's system prompt teaches it to Read any file path you
-    mention, so no special protocol is needed on the worker side.
+STILL OK (optional) — pre-writing with your Write tool:
 
-The orchestrator also has a FALLBACK automatic spill (at 300 chars)
-that catches long bodies you forgot to pre-write. Do NOT rely on it:
-by the time the orchestrator sees the body, the parser has usually
-already truncated you. Pre-writing is the robust path.
-
-SHORT INLINE DELEGATION (one-sentence tasks only)
-For genuinely short tasks without embedded code or @-tokens, the
-single-line form is fine:
-
-  @worker-1: hello 다섯 번 반복해서 출력해.
-
-If you catch yourself about to type a second line of body, stop and
-use the file-based pattern above instead.
+  If you want human-readable filenames or to share the same file
+  across multiple workers, you CAN use your Write tool first to save
+  a named file (e.g. ".omc/team/artifacts/review-prompt.md") and
+  reference it in your "@worker-N:" line. The auto-spill will create
+  its own snapshot too, but you can instruct the worker to read your
+  named file instead.
 
 WHEN YOU QUOTE A PEER'S OUTPUT
-Never paste a peer's reply (which likely contains "@leader:" or code)
-into another "@worker-N:" directive inline. Write it to a drop file
-first, then reference the path. This is the #1 way delegations get
-scrambled.
-
-LEGACY MULTI-LINE FORM (do not use for new code)
-An older "@worker-N:\n<body>\n@end" form exists for historical reasons
-but is fragile against the issues above. File-based delegation is the
-only reliable pattern — use it.
+Still worth pre-writing with the Write tool: quoted peer output that
+contains "@leader:" / "@worker-M:" tokens can confuse YOUR own parse
+while you're composing the delegation. Writing first keeps your
+composition clean.
 
 BIDIRECTIONAL ROUTING (v0.3.0)
 Workers can reply to you with "@leader: <message>" directives. Those

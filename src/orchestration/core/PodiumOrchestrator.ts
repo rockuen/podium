@@ -1811,26 +1811,39 @@ export class PodiumOrchestrator implements vscode.Disposable {
   }
 
   /**
-   * v0.7.0 — Leader→Worker symmetric spill.
+   * v0.8.0 — Leader→Worker: unconditional file-mediated delivery.
    *
-   * When the leader routes a payload larger than SPILL_THRESHOLD_CHARS
-   * toward a worker (typically: long code review request, multi-line
-   * task spec with embedded snippets), skip direct pty injection and
-   * instead:
-   *   1. Save the full body to `.omc/team/drops/to-<worker>-turn<N>-seq<S>.md`
-   *   2. Return a short pty-safe notice to inject instead, with the
-   *      relative file path and a 5-line preview.
-   * The worker's system prompt (workerProtocol DROP HANDLING section)
-   * instructs it to Read the file before starting the task.
+   * Every leader-originated payload (regardless of length) is written
+   * to `.omc/team/drops/to-<worker>-turn<N>-seq<S>.md` and only a
+   * SHORT PTY-SAFE NOTICE is injected into the worker's stdin. The
+   * notice's FIRST LINE is the file path — so even if Ink TUI
+   * fragments the rest of the notice mid-stream the worker still sees
+   * the path and can Read it to recover the full directive.
    *
-   * Short payloads pass through unchanged.
+   * Why unconditional (change from v0.7.0's 300-char threshold): field
+   * logs of v0.7.4 showed Claude's Ink TUI fragments delegations well
+   * under the 300-char threshold whenever an 'other' line intervenes
+   * and kicks the projector out of the assistant block. Short inline
+   * payloads therefore are NOT reliable either. The user explicitly
+   * requested that ALL leader-to-worker delegations go through files
+   * — that is what this function now guarantees.
+   *
+   * Path-first notice format (critical for fragmentation survival):
+   *
+   *   .omc/team/drops/to-worker-1-turn3-seq1.md
+   *
+   *   위 파일을 Read 해서 지시사항을 수행해 주세요.
+   *
+   * The path is the first token on the first line. Anything cut from
+   * the notice after that is recoverable because the worker already
+   * has the path. Worker's system prompt (workerProtocol DROP HANDLING)
+   * is updated to recognize this format.
    *
    * File-write failures fall back to injecting the original payload
    * (best-effort: fragmentation is worse than nothing, but losing the
    * task entirely is worse than fragmentation).
    */
   private maybeSpillLeaderToWorker(w: WorkerRuntime, payload: string): string {
-    if (payload.length < SPILL_THRESHOLD_CHARS) return payload;
     w.spillSeq += 1;
     const root = this.attachedCwd ?? process.cwd();
     const dir = path.join(root, '.omc', 'team', 'drops');
@@ -1854,15 +1867,11 @@ export class PodiumOrchestrator implements vscode.Disposable {
       );
       return payload;
     }
-    const preview = this.buildSpillPreview(payload);
     this.output.appendLine(
-      `[orch.spill] leader → ${w.cfg.id}: ${relPath} (${payload.length} bytes); injecting notice`,
+      `[orch.spill] leader → ${w.cfg.id}: ${relPath} (${payload.length} bytes); injecting path-first notice`,
     );
-    return (
-      `[drop for you from leader turn ${this.leaderTurnId}] 본문 저장됨: ${relPath}\n\n` +
-      `미리보기:\n${preview}\n\n` +
-      `전체 본문은 위 파일을 Read 해서 확인한 뒤 task를 수행해 주세요.`
-    );
+    // PATH MUST BE FIRST. Fragmentation-survivable format.
+    return `${relPath}\n\n위 파일을 Read 해서 지시사항을 수행해 주세요.`;
   }
 
   /**

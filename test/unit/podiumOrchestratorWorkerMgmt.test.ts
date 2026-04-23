@@ -432,7 +432,13 @@ test('renameWorker v2.7.25: label-only — cfg.id untouched, routing by id still
   const writesAfter = ctl.writes.slice(writesBefore);
   const w1Writes = writesAfter.filter((w) => w.paneId === 'W1');
   assert.ok(w1Writes.length >= 1, 'worker-1 still receives routed payload');
-  assert.ok(w1Writes[0].data.startsWith('hello'), 'payload content routed correctly');
+  // v0.8.0 — delivery is via path-first drop notice; body 'hello' is in
+  // the drop file, not in the worker's stdin write. Assert that the
+  // write starts with the drop path prefix.
+  assert.ok(
+    w1Writes[0].data.startsWith('.omc/team/drops/to-worker-1-turn'),
+    `payload must be routed via path-first notice, got: ${w1Writes[0].data.slice(0, 80)}`,
+  );
 
   // captureSnapshot serializes the label.
   const snap = orch.captureSnapshot();

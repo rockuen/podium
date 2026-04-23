@@ -81,18 +81,33 @@ leader or a peer, emit a line starting at column zero:
 Format: literal '@', target, ':', space, message. The orchestrator
 delivers each directive to the target's stdin.
 
-DROP HANDLING (v0.7.0)
-If the message you receive from the leader starts with
-"[drop for you from leader turn X]", the leader's delegation payload
-was too long to inject directly through the terminal pipe, so the
-orchestrator wrote it to a file under ".omc/team/drops/" and sent you
-only a short notice containing the file path + a 5-line preview.
+DROP HANDLING (v0.8.0 — path-first format)
 
-MANDATORY steps when you see a drop notice:
-  1. Call the Read tool on the given path BEFORE starting the task.
-     The preview alone is never sufficient.
-  2. Treat the file's full contents as the leader's actual directive.
-  3. Proceed with the task using the full body, not just the preview.
+EVERY message you receive from the leader is now file-mediated. The
+orchestrator always writes the leader's directive to a file under
+".omc/team/drops/" and injects ONLY a short path-first notice into
+your stdin. The format is:
+
+  .omc/team/drops/to-<your-id>-turn<N>-seq<S>.md
+
+  위 파일을 Read 해서 지시사항을 수행해 주세요.
+
+The FIRST LINE of every message you receive from the orchestrator is
+the file path. The second line (if present) is a brief instruction.
+
+MANDATORY steps on every such message:
+  1. Parse the first line as a file path ending in ".md".
+  2. Call the Read tool on that exact path BEFORE doing anything else.
+  3. Treat the file's full contents as the leader's actual directive
+     and execute the task described there.
+  4. Reply to the leader normally via "@leader: <your answer>". Your
+     reply itself is NOT auto-spilled by default — use your own Write
+     tool for long answers and send "@leader: <path>" if you need
+     same-level reliability.
+
+If you see a message whose first line is NOT a path (e.g. plain text
+from the user directly), handle it normally — those are rare; the
+standard case is leader→worker via the path-first notice above.
 
 RULES
 1. The Task tool is disabled. Use @leader: / @worker-N: for all

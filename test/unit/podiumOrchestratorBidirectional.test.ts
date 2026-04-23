@@ -172,11 +172,14 @@ test('bidi: worker → peer worker routing works (worker-1 → worker-2)', () =>
     data: '● @worker-2: please test this function.\n',
   });
 
+  // v0.8.0 — peer routing also spills. Worker-2 receives a path-first
+  // notice pointing at a `to-worker-2-turn*.md` drop file; the raw body
+  // lives in the file, not in the worker's stdin.
   assert.ok(
     ctl.writes.some(
-      (w) => w.paneId === 'W2' && w.data.includes('please test this function'),
+      (w) => w.paneId === 'W2' && w.data.includes('.omc/team/drops/to-worker-2-turn'),
     ),
-    'worker-2 should receive the peer-routed directive',
+    'worker-2 should receive the peer-routed path-first notice',
   );
   orch.dispose();
 });
@@ -248,14 +251,18 @@ test('round cap: resetRound() re-arms routing', () => {
 
   orch.resetRound();
   assert.equal(orch.roundState.current, 0);
+  const writesBeforeThird = ctl.writes.filter((w) => w.paneId === 'W1').length;
 
   // Third emit with distinct payload should now succeed.
+  // v0.8.0 — body goes to drop file; we assert that a NEW write happened
+  // targeting W1 after resetRound (one more than before).
   feedPrompt(ctl, 'W1');
   clock.advance(200);
   ctl.firePaneData({ paneId: 'L', data: '● @worker-1: third.\n' });
+  const writesAfterThird = ctl.writes.filter((w) => w.paneId === 'W1').length;
   assert.ok(
-    ctl.writes.some((w) => w.paneId === 'W1' && w.data.includes('third')),
-    'third emit routes after reset',
+    writesAfterThird > writesBeforeThird,
+    `third emit must route after reset (writes grew from ${writesBeforeThird} to ${writesAfterThird})`,
   );
   orch.dispose();
 });
@@ -287,12 +294,15 @@ test('pause: drops routing, resume restores it', () => {
 
   orch.resume();
   assert.equal(orch.isPaused, false);
+  const writesBeforeResume = ctl.writes.filter((w) => w.paneId === 'W1').length;
   feedPrompt(ctl, 'W1');
   clock.advance(200);
   ctl.firePaneData({ paneId: 'L', data: '● @worker-1: after resume.\n' });
+  // v0.8.0 — body goes to drop file; assert write count grew after resume.
+  const writesAfterResume = ctl.writes.filter((w) => w.paneId === 'W1').length;
   assert.ok(
-    ctl.writes.some((w) => w.paneId === 'W1' && w.data.includes('after resume')),
-    'resumed routing delivers',
+    writesAfterResume > writesBeforeResume,
+    `resumed routing must deliver (W1 writes grew from ${writesBeforeResume} to ${writesAfterResume})`,
   );
   orch.dispose();
 });

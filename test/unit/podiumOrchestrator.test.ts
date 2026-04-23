@@ -80,9 +80,16 @@ test('orch: leader assistant token → immediate injection to correct worker', (
 
   ctl.firePaneData({ paneId: 'L', data: '● @worker-1: hello there\n' });
 
+  // v0.8.0 — EVERY leader→worker delegation now auto-spills to a file
+  // and the worker pane receives ONLY a path-first notice. The raw body
+  // ('hello there') is written to the drop file, never to the worker's
+  // stdin. Fragmentation survival: path is the first token on line 1.
   assert.equal(ctl.writes.length, 1);
   assert.equal(ctl.writes[0].paneId, 'W1');
-  assert.ok(ctl.writes[0].data.startsWith('hello there'));
+  assert.ok(
+    ctl.writes[0].data.startsWith('.omc/team/drops/to-worker-1-turn'),
+    `expected path-first notice, got: ${ctl.writes[0].data.slice(0, 80)}`,
+  );
   assert.equal(orch.snapshot.stats.injected, 1);
 
   orch.dispose();
@@ -150,11 +157,12 @@ test('orch: assistant continuation routes clean worker payloads without border c
       '────────────────────────────────────\n',
   });
 
+  // v0.8.0 — each delegation auto-spills; workers receive path-first notices.
   assert.equal(ctl.writes.length, 2);
   assert.equal(ctl.writes[0].paneId, 'W1');
   assert.equal(ctl.writes[1].paneId, 'W2');
-  assert.ok(ctl.writes[0].data.startsWith('"apple, banana, cherry"를 한글로 번역해서 답해줘.'));
-  assert.ok(ctl.writes[1].data.startsWith('1부터 10까지 합을 계산해서 답만 숫자로 줘.'));
+  assert.ok(ctl.writes[0].data.startsWith('.omc/team/drops/to-worker-1-turn'));
+  assert.ok(ctl.writes[1].data.startsWith('.omc/team/drops/to-worker-2-turn'));
   assert.ok(!ctl.writes[1].data.includes('─'));
 
   orch.dispose();
@@ -207,8 +215,12 @@ test('orch: strips ANSI from leader output before parsing', () => {
     data: '\x1b[38;5;117m● @worker-1: go\x1b[0m\n',
   });
 
+  // v0.8.0 — body still routes (proving ANSI was stripped and the
+  // parser saw `@worker-1: go`), but delivery is via auto-spill so
+  // the worker pane receives the path-first notice, and the original
+  // body 'go' lands in the drop file.
   assert.equal(ctl.writes.length, 1);
-  assert.ok(ctl.writes[0].data.startsWith('go'));
+  assert.ok(ctl.writes[0].data.startsWith('.omc/team/drops/to-worker-1-turn'));
 
   orch.dispose();
 });
@@ -672,11 +684,11 @@ test('orch v0.7.0: long leader → worker payload spills to to-*.md + short noti
     'drop file must record direction',
   );
 
-  // Worker pane should have received a short notice rather than the full body.
+  // Worker pane should have received a path-first notice rather than the full body.
   const workerWrites = ctl.writes.filter((w) => w.paneId === 'W1').map((w) => w.data).join('');
   assert.ok(
-    workerWrites.includes('[drop for you from leader'),
-    `worker did not receive drop notice. writes: ${JSON.stringify(ctl.writes.map((w) => ({ p: w.paneId, d: w.data.slice(0, 40) })))}`,
+    workerWrites.includes('.omc/team/drops/to-worker-1-turn'),
+    `worker did not receive path-first drop notice. writes: ${JSON.stringify(ctl.writes.map((w) => ({ p: w.paneId, d: w.data.slice(0, 80) })))}`,
   );
   assert.ok(
     !workerWrites.includes('for (const { segment } of segmenter.segment(str))'),
@@ -687,12 +699,17 @@ test('orch v0.7.0: long leader → worker payload spills to to-*.md + short noti
   orch.dispose();
 });
 
-test('orch v0.7.0: short leader → worker payload stays on direct inject path', async () => {
-  // Negative control: payloads under threshold must NOT spill.
+test('orch v0.8.0: EVERY leader → worker payload spills (unconditional, path-first notice)', async () => {
+  // v0.7.x had a 300-char threshold under which payloads went inline;
+  // v0.8.0 removes the threshold entirely. EVERY delegation is written
+  // to a file and the worker receives only a short path-first notice.
+  // Rationale: even short inline payloads fragment when Ink TUI
+  // classifies preceding context as 'other' and closes the assistant
+  // block mid-stream. The file-mediated path is the only reliable one.
   const os = await import('node:os');
   const fsPromises = await import('node:fs/promises');
   const pathMod = await import('node:path');
-  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-l2w-short-'));
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-l2w-v080-'));
 
   const ctl = makeFakePanel();
   const out = makeOutputChannel();
@@ -715,14 +732,34 @@ test('orch v0.7.0: short leader → worker payload stays on direct inject path',
   ctl.firePaneData({ paneId: 'L', data: '● @worker-1: run quick task.\n' });
   clock.advance(200);
 
+  // Even this tiny 'run quick task.' payload MUST spill to a file.
   const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
   const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
   const toFiles = files.filter((f) => f.startsWith('to-worker-1-turn'));
-  assert.equal(toFiles.length, 0, `short payload must not spill. files: ${files.join(', ')}`);
+  assert.equal(toFiles.length, 1, `short payload must also spill. files: ${files.join(', ')}`);
 
+  // File must contain the original body.
+  const dropContent = await fsPromises.readFile(pathMod.join(dropDir, toFiles[0]), 'utf8');
+  assert.ok(dropContent.includes('run quick task'), 'drop file must contain original body');
+
+  // Worker pane receives the path-first notice, NOT the body itself.
   const workerWrites = ctl.writes.filter((w) => w.paneId === 'W1').map((w) => w.data).join('');
-  assert.ok(workerWrites.includes('run quick task'), 'worker must receive the short payload directly');
-  assert.ok(!workerWrites.includes('[drop for you'), 'short payload must NOT produce a drop notice');
+  assert.ok(
+    workerWrites.includes('.omc/team/drops/to-worker-1-turn'),
+    `worker did not receive path-first notice. writes: ${JSON.stringify(ctl.writes.map((w) => ({ p: w.paneId, d: w.data.slice(0, 80) })))}`,
+  );
+  assert.ok(
+    !workerWrites.includes('run quick task'),
+    'worker pane must NOT receive the raw body — only the path-first notice',
+  );
+
+  // And the notice must START with the path (first 100 chars of the
+  // first inject to W1 must contain the path within). This is the
+  // fragmentation-survival invariant.
+  const firstW1Inject = ctl.writes.find((w) => w.paneId === 'W1' && w.data.includes('.omc/team/drops/'));
+  assert.ok(firstW1Inject, 'expected a W1 inject containing the drop path');
+  const pathOffset = firstW1Inject!.data.indexOf('.omc/team/drops/');
+  assert.ok(pathOffset < 50, `path must be near the START of the notice (got offset ${pathOffset})`);
 
   await fsPromises.rm(tmpRoot, { recursive: true, force: true });
   orch.dispose();
@@ -825,9 +862,20 @@ test('orch v0.6.0: short worker reply stays on parser path (no drop file)', asyn
   clock.advance(200);
   (orch as any).tick();
 
+  // v0.8.0 — leader→worker is now unconditionally spilled, which
+  // produces `to-worker-1-turn*.md`. The invariant under test is that
+  // the WORKER→LEADER direction (files `worker-*.md` without the `to-`
+  // prefix) still has a size threshold and short replies do NOT spill.
   const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
   const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
-  assert.equal(files.length, 0, 'short reply must not spill');
+  const workerToLeaderFiles = files.filter(
+    (f) => f.startsWith('worker-1-turn') && !f.startsWith('to-'),
+  );
+  assert.equal(
+    workerToLeaderFiles.length,
+    0,
+    `short worker→leader reply must not spill (all files: ${files.join(', ')})`,
+  );
 
   await fsPromises.rm(tmpRoot, { recursive: true, force: true });
   orch.dispose();
