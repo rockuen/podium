@@ -132,10 +132,15 @@ function createPanel(context, extensionPath, session) {
   }
 
   const claudeShell = resolved.shell;
+  // v0.3.1: session.extraArgs lets callers (e.g. Summon Team) inject the
+  // Podium worker/leader system prompt via `--append-system-prompt` and
+  // disable the Task tool via `--disallowedTools Task`. Prepended before
+  // the session flag so Claude CLI parses them as pre-session options.
+  const podiumExtraArgs = Array.isArray(session?.extraArgs) ? session.extraArgs : [];
   const claudeArgs = session?.sessionId
     ? ['--resume', session.sessionId]
     : ['--session-id', sessionId];
-  const directArgs = [...resolved.args, ...claudeArgs];
+  const directArgs = [...resolved.args, ...podiumExtraArgs, ...claudeArgs];
 
   const spawnShell = claudeShell;
   const spawnArgs = directArgs;
@@ -173,6 +178,14 @@ function createPanel(context, extensionPath, session) {
     return;
   }
 
+  // v0.3.1 · Orchestrator taps. The legacy panel is now addressable by
+  // PodiumOrchestrator via LegacyPanelBridge: every pty chunk fires
+  // `onPtyData`, and panel-close fires `onPaneDispose(exitCode)`.
+  // When session.podiumRole / session.podiumPaneId are set, the entry is
+  // a participant in a summoned team and the bridge uses those for routing.
+  const onPtyDataEmitter = new vscode.EventEmitter();
+  const onPaneDisposeEmitter = new vscode.EventEmitter();
+
   const entry = {
     panel,
     pty: ptyProcess,
@@ -182,6 +195,14 @@ function createPanel(context, extensionPath, session) {
     sessionId: sessionId,
     state: 'running',
     idleTimer: null,
+    tabId: tabId,
+    // v0.3.1 orchestrator metadata (absent for plain chat windows).
+    podiumRole: session?.podiumRole,
+    podiumPaneId: session?.podiumPaneId,
+    onPtyData: onPtyDataEmitter.event,
+    onPaneDispose: onPaneDisposeEmitter.event,
+    _onPtyDataEmitter: onPtyDataEmitter,
+    _onPaneDisposeEmitter: onPaneDisposeEmitter,
   };
   state.panels.set(tabId, entry);
   saveSessions();
@@ -221,6 +242,9 @@ function createPanel(context, extensionPath, session) {
     if (entry.pty !== initialPty) return; // stale handler guard
     dataCount++;
     if (dataCount <= 3) console.log('[Podium] PTY data #' + dataCount + ' (' + data.length + ' bytes):', data.substring(0, 100));
+    // v0.3.1: fan out to orchestrator taps (LegacyPanelBridge). Cheap when
+    // no one is subscribed — vscode.EventEmitter short-circuits empty lists.
+    try { onPtyDataEmitter.fire(data); } catch (_) {}
     if (!webviewReady) {
       outputBuffer.push(data);
     } else {
@@ -375,7 +399,18 @@ function createPanel(context, extensionPath, session) {
       saveSessions();
     }
     updateStatusBar();
+    // v0.3.1 · orchestrator tap — fire AFTER pty kill so any pending
+    // routing commits have already been attempted. Exit code is 0 for a
+    // user-driven close (we don't have a real pty exit code at this path).
+    try { onPaneDisposeEmitter.fire(0); } catch (_) {}
+    try { onPtyDataEmitter.dispose(); } catch (_) {}
+    try { onPaneDisposeEmitter.dispose(); } catch (_) {}
   }, undefined, context.subscriptions);
+
+  // v0.3.1: return a handle so callers (Summon Team command) can bind the
+  // entry to the orchestrator bridge. Legacy callers that ignore the return
+  // value (status-bar click, Ctrl+Shift+;) are unaffected.
+  return { tabId: tabId, entry: entry };
 }
 
 module.exports = { createPanel };

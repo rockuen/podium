@@ -50,7 +50,7 @@ import {
 } from './messageRouter';
 import { buildSubmitPayload, splitSubmitPayload, needsWin32KeyEvents } from './cliInput';
 import type { AgentKind } from './agentSpawn';
-import type { LiveMultiPanel, LivePaneSpec } from '../ui/LiveMultiPanel';
+import type { LivePaneSpec, OrchestratorPanel } from '../ui/LiveMultiPanel';
 import { claudeBareSummarizer, type Summarizer } from './summarizer';
 import type { WorkerRole } from './workerProtocol';
 
@@ -352,7 +352,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
   private readonly leaderRecentPayloads = new Map<string, number>();
 
   constructor(
-    private readonly panel: LiveMultiPanel,
+    private readonly panel: OrchestratorPanel,
     private readonly output: vscode.OutputChannel,
     private readonly summarizer: Summarizer = claudeBareSummarizer,
   ) {}

@@ -41,6 +41,16 @@ import {
   WorkerTreeItem,
 } from './ui/TeamsTreeProvider';
 import { LiveMultiPanel } from './ui/LiveMultiPanel';
+import {
+  LegacyPanelBridge,
+  type LegacyPanelEntry,
+  type LegacyPanelSpawn,
+} from './ui/LegacyPanelBridge';
+import {
+  buildSubmitPayload,
+  splitSubmitPayload,
+  needsWin32KeyEvents,
+} from './core/cliInput';
 import { MAX_RUNTIME_WORKERS, PodiumOrchestrator } from './core/PodiumOrchestrator';
 import { buildLeaderExtraArgs } from './core/leaderProtocol';
 import { buildWorkerExtraArgs, type WorkerRole } from './core/workerProtocol';
@@ -584,103 +594,127 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
     }),
   );
 
-  // ─── v0.3.0 — Summon Team: hand off legacy single-session webview ───
-  // Invoked from the 🎭 toolbar button in the base Claude Code window
-  // (ctrl+shift+;). Picks up the running session's uuid + cwd, disposes the
-  // legacy panel, and spawns a LiveMultiPanel with that session as the
-  // leader (--resume) plus an implementer + critic worker alongside.
+  // ─── v0.3.1 — Summon Team: split the base chat window sideways ───
+  // Invoked from the 🎭 toolbar button on a running legacy createPanel
+  // webview. Keeps that window in place as the team's LEADER and opens
+  // two more chat windows to the right (ViewColumn.Beside), one per
+  // worker role. All three share the same xterm-based UI the user is
+  // already familiar with — no custom multi-pane renderer.
+  //
+  // The PodiumOrchestrator attaches to a `LegacyPanelBridge` rather than
+  // the native `LiveMultiPanel`, so routing / round cap / pause / role
+  // prompts all behave identically — only the pane host differs.
+  //
+  // The leader's Claude process is NOT restarted (that would disrupt the
+  // live conversation). Instead, once the workers have spawned we submit
+  // a one-shot "[Podium team summoned]" note to the leader explaining the
+  // routing protocol and the available worker roster. From that point on
+  // the leader can emit `@worker-N:` directives and receive `@leader:`
+  // replies exactly like a freshly orchestrated team.
   ctx.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.podium.summonTeam', async (arg?: unknown) => {
       output.appendLine('[orch.summonTeam] invoked');
-      const payload = (arg ?? {}) as {
-        sessionId?: string;
-        cwd?: string;
-        title?: string;
-        panel?: vscode.WebviewPanel;
-      };
-      const sessionId = payload.sessionId;
-      const cwd = payload.cwd ?? currentCwd();
-      if (!sessionId) {
+      const payload = (arg ?? {}) as { leaderEntry?: LegacyPanelEntry };
+      const leaderEntry = payload.leaderEntry;
+      if (!leaderEntry) {
         vscode.window.showErrorMessage(
-          'Podium: Summon Team needs a live Claude session. Open a chat window first (Ctrl+Shift+;), then click 🎭.',
+          'Podium: Summon Team must be invoked from the Claude Code chat window toolbar (🎭 button).',
         );
         return;
       }
-      const resumable = isClaudeSessionResumable(cwd, sessionId);
+
+      const sessionId = leaderEntry.sessionId;
+      const cwd = leaderEntry.cwd;
       output.appendLine(
-        `[orch.summonTeam] sessionId=${sessionId.slice(0, 8)} cwd=${cwd} resumable=${resumable}`,
+        `[orch.summonTeam] leaderSession=${sessionId.slice(0, 8)} cwd=${cwd}`,
       );
 
-      const panel = LiveMultiPanel.create(
-        ctx,
-        output,
-        `Podium · Team (summoned from ${sessionId.slice(0, 8)})`,
-      );
+      // Tag the leader entry so the bridge / diagnostics show it correctly.
+      leaderEntry.podiumPaneId = 'leader';
+      leaderEntry.podiumRole = 'leader';
 
+      // Require the legacy createPanel via runtime resolution — it's a JS
+      // module and we don't want a hard TS dependency on the file shape.
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { createPanel } = require('../panel/createPanel') as {
+        createPanel: (
+          ctx: vscode.ExtensionContext,
+          extensionPath: string,
+          session: Record<string, unknown> | null,
+        ) => { tabId: number; entry: LegacyPanelEntry } | undefined;
+      };
+
+      // Factory the bridge uses for dynamic addPane (runtime `addWorker`
+      // requests from the orchestrator). Always opens Beside so new
+      // workers appear alongside existing ones.
+      const spawnPane: LegacyPanelSpawn = (spec) => {
+        const result = createPanel(ctx, ctx.extensionPath, {
+          sessionId: spec.sessionId,
+          cwd: spec.cwd,
+          title: spec.label,
+          viewColumn: vscode.ViewColumn.Beside,
+          extraArgs: spec.extraArgs ? [...spec.extraArgs] : undefined,
+          podiumPaneId: spec.paneId,
+          podiumRole: 'generalist',
+        });
+        return result?.entry ?? null;
+      };
+
+      const bridge = new LegacyPanelBridge('leader', leaderEntry, spawnPane, output);
+
+      // Spawn worker-1 (implementer). ViewColumn.Beside targets whichever
+      // column is currently active; the legacy leader webview is active at
+      // click time, so worker-1 lands to its right.
       const worker1Sid = randomUUID();
-      const worker2Sid = randomUUID();
-
-      // Leader: resume the live session and apply the role-aware prompt.
-      // If Claude hasn't written the JSONL yet (user never submitted in the
-      // base window), fall back to spawning fresh with the same session-id
-      // so the protocol still applies — same strategy as snapshot.load.
-      if (resumable) {
-        panel.addPane({
-          paneId: 'leader',
-          label: `leader (summoned ${sessionId.slice(0, 8)})`,
-          agent: 'claude',
-          cwd,
-          autoSessionId: false,
-          extraArgs: buildLeaderExtraArgs({
-            resumeSessionId: sessionId,
-            workers: DEFAULT_TEAM_ROLES,
-            maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
-          }),
-        });
-      } else {
-        output.appendLine(
-          `[orch.summonTeam] leader session has no JSONL yet — spawning fresh with same session-id + protocol`,
-        );
-        panel.addPane({
-          paneId: 'leader',
-          label: `leader (fresh ${sessionId.slice(0, 8)})`,
-          agent: 'claude',
-          cwd,
-          sessionId,
-          extraArgs: buildLeaderExtraArgs({
-            workers: DEFAULT_TEAM_ROLES,
-            maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
-          }),
-        });
-      }
-      panel.addPane({
-        paneId: 'worker-1',
-        label: 'worker-1 (implementer)',
-        agent: 'claude',
-        cwd,
+      const worker1 = createPanel(ctx, ctx.extensionPath, {
         sessionId: worker1Sid,
+        cwd,
+        title: 'worker-1 (implementer)',
+        viewColumn: vscode.ViewColumn.Beside,
         extraArgs: buildWorkerExtraArgs({
           workerId: 'worker-1',
           role: 'implementer',
           peers: [{ id: 'worker-2', role: 'critic' }],
         }),
+        podiumPaneId: 'worker-1',
+        podiumRole: 'implementer',
       });
-      panel.addPane({
-        paneId: 'worker-2',
-        label: 'worker-2 (critic)',
-        agent: 'claude',
-        cwd,
+      if (!worker1) {
+        vscode.window.showErrorMessage('Podium: worker-1 spawn failed (see Output → Podium - Orchestration).');
+        return;
+      }
+      bridge.attachEntry('worker-1', worker1.entry);
+
+      // worker-2 goes in the same column as worker-1 (stacked as a tab).
+      // `ViewColumn.Active` after worker-1 spawned is that same column.
+      const worker2Sid = randomUUID();
+      const worker2 = createPanel(ctx, ctx.extensionPath, {
         sessionId: worker2Sid,
+        cwd,
+        title: 'worker-2 (critic)',
+        viewColumn: vscode.ViewColumn.Active,
         extraArgs: buildWorkerExtraArgs({
           workerId: 'worker-2',
           role: 'critic',
           peers: [{ id: 'worker-1', role: 'implementer' }],
         }),
+        podiumPaneId: 'worker-2',
+        podiumRole: 'critic',
       });
+      if (!worker2) {
+        vscode.window.showErrorMessage('Podium: worker-2 spawn failed.');
+        return;
+      }
+      bridge.attachEntry('worker-2', worker2.entry);
 
-      const orch = new PodiumOrchestrator(panel, output);
+      const orch = new PodiumOrchestrator(bridge, output);
       orch.attach({
-        leader: { paneId: 'leader', agent: 'claude', sessionId, label: `leader (summoned ${sessionId.slice(0, 8)})` },
+        leader: {
+          paneId: 'leader',
+          agent: 'claude',
+          sessionId,
+          label: leaderEntry.title,
+        },
         workers: [
           { id: 'worker-1', paneId: 'worker-1', agent: 'claude', sessionId: worker1Sid, role: 'implementer', label: 'worker-1 (implementer)' },
           { id: 'worker-2', paneId: 'worker-2', agent: 'claude', sessionId: worker2Sid, role: 'critic', label: 'worker-2 (critic)' },
@@ -691,49 +725,56 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         enableWorkerRouting: true,
         maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
         autoResetRoundMs: DEFAULT_AUTO_RESET_ROUND_MS,
-        // If the leader actually resumes, Ink will replay scrollback — give
-        // the same 15s wall-clock grace as snapshot.load to prevent re-routing.
-        restoreGraceMs: resumable ? 15000 : 0,
+        // No restoreGrace: leader never restarted, so there's no scrollback
+        // replay to absorb. Workers are fresh.
       });
 
       const sessionKey = `orch-summon-${Date.now()}`;
       orchestratorRegistry.set(sessionKey, orch);
-      panel.onPaneExit(() => {
+      teamsProvider.refresh();
+
+      bridge.onDidDispose(() => {
         const existing = orchestratorRegistry.get(sessionKey);
         if (existing) {
           existing.dispose();
           orchestratorRegistry.delete(sessionKey);
           teamsProvider.refresh();
-        }
-      });
-      panel.onDidDispose(() => {
-        const existing = orchestratorRegistry.get(sessionKey);
-        if (existing) {
-          existing.dispose();
-          orchestratorRegistry.delete(sessionKey);
-          teamsProvider.refresh();
-          output.appendLine(`[orch] panel disposed → ${sessionKey} removed from registry`);
+          output.appendLine(`[orch] bridge disposed → ${sessionKey} removed from registry`);
         }
       });
 
-      panel.reveal();
-
-      // Dispose the legacy panel that summoned us. Deferred so the new panel
-      // has time to render before the old one tears down its terminal and
-      // the user briefly sees blank space.
-      if (payload.panel) {
-        setTimeout(() => {
-          try {
-            payload.panel!.dispose();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            output.appendLine(`[orch.summonTeam] legacy panel dispose failed — ${msg}`);
+      // Teach the running leader the protocol. Since the Podium leader
+      // system prompt was NOT applied at spawn time (we can't restart a
+      // live conversation), inject a user-visible note instructing the
+      // model how to route. Fired after a short delay so workers' panels
+      // have rendered and the user sees the note in context.
+      setTimeout(() => {
+        const protocolNote =
+          '[Podium team summoned] 2 workers are now attached and routable:\n' +
+          '  - worker-1 (implementer) — writes concrete code/patches.\n' +
+          '  - worker-2 (critic) — finds logic flaws, missing edge cases.\n' +
+          'Delegate by emitting a line like `@worker-1: <task>` in your response.\n' +
+          'Workers reply with `@leader: <message>` which I will inject as user input.\n' +
+          `Round budget: ${DEFAULT_MAX_ROUNDS} routed turns per task. Acknowledge briefly, then wait for my next instruction.`;
+        try {
+          const agent = 'claude' as const;
+          const opts = { agent };
+          if (needsWin32KeyEvents(opts)) {
+            const { body, submit } = splitSubmitPayload(protocolNote, opts);
+            bridge.writeToPane('leader', body);
+            setTimeout(() => bridge.writeToPane('leader', submit), 25);
+          } else {
+            bridge.writeToPane('leader', buildSubmitPayload(protocolNote, opts));
           }
-        }, 800);
-      }
+          output.appendLine('[orch.summonTeam] protocol note submitted to leader');
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          output.appendLine(`[orch.summonTeam] protocol note submit FAILED — ${msg}`);
+        }
+      }, 1500);
 
       vscode.window.showInformationMessage(
-        `Podium: team summoned — leader continues from ${sessionId.slice(0, 8)} with implementer + critic.`,
+        'Podium: team summoned — leader stays, 2 workers opened to the right.',
       );
     }),
   );

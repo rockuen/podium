@@ -82,17 +82,13 @@ function routeWebviewMessage(msg, ctx) {
       handleToolbar(msg.action, entry, context, extensionPath, createPanel);
       return;
 
-    // v0.3.0 · Summon Team — the legacy single-session webview hands its
-    // claude `--session-id` off to the orchestration layer, which spawns a
-    // fresh LiveMultiPanel with that session as the leader (via --resume)
-    // and 2 role-typed worker panes alongside. The current panel is then
-    // disposed. Seamless enough that the conversation carries over.
+    // v0.3.1 · Summon Team — keep this legacy chat window as the leader
+    // and open 2 role-typed worker chat windows to the right (ViewColumn
+    // .Beside). The orchestrator binds all three via LegacyPanelBridge.
+    // The user keeps the familiar chat UI in every pane.
     case 'summon-team':
       vscode.commands.executeCommand('claudeCodeLauncher.podium.summonTeam', {
-        sessionId: entry.sessionId,
-        cwd: entry.cwd,
-        title: entry.title,
-        panel: panel,
+        leaderEntry: entry,
       });
       return;
 

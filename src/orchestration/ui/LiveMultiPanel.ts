@@ -63,6 +63,24 @@ export interface PaneExitEvent {
   exitCode: number;
 }
 
+/**
+ * v0.3.1 · Orchestrator-facing contract for any multi-pane host.
+ *
+ * Originally this was `LiveMultiPanel`'s concrete class surface — extracted
+ * to an interface so `LegacyPanelBridge` (which wraps N separate
+ * `createPanel` webviews, one per agent) can also serve as an orchestrator
+ * target without bringing its own xterm renderer. PodiumOrchestrator is
+ * now typed against this interface, so either host works interchangeably.
+ */
+export interface OrchestratorPanel {
+  readonly onPaneData: vscode.Event<PaneDataEvent>;
+  readonly onPaneExit: vscode.Event<PaneExitEvent>;
+  writeToPane(paneId: string, data: string): void;
+  hasPane(paneId: string): boolean;
+  removePane(paneId: string): void;
+  addPane(spec: LivePaneSpec): void;
+}
+
 export class LiveMultiPanel {
   static readonly viewType = 'podium.liveMultipane';
 
