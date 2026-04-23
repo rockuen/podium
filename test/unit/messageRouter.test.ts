@@ -291,3 +291,59 @@ test('projector v0.3.6: prompt echo with bare @worker- still dropped', () => {
   const msgs = parser.feed(projected);
   assert.equal(msgs.length, 0, 'prompt echo must not route');
 });
+
+// ─── v0.4.0 · protocol-template noise guard ───
+
+test('router v0.4.0: placeholder-only payload `... /` is dropped', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: ... /\n');
+  assert.equal(msgs.length, 0, 'ellipsis-slash placeholder must not route');
+});
+
+test('router v0.4.0: pure ellipsis payload is dropped', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: ...\n');
+  assert.equal(msgs.length, 0, 'pure ellipsis must not route');
+});
+
+test('router v0.4.0: protocol meta keywords drop the directive', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-2: ... (컬럼 0에서 시작) - 라운드 예산: 작업당 10회 - Effort: max\n',
+  );
+  assert.equal(msgs.length, 0, 'protocol meta payload must not route');
+});
+
+test('router v0.4.0: system-prompt template row `<task for worker-1>` is dropped', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: <task for worker-1>\n');
+  assert.equal(msgs.length, 0, 'template placeholder must not route');
+});
+
+test('router v0.4.0: real task mentioning ellipsis still routes', () => {
+  // Negative control: payloads with real content that happens to CONTAIN
+  // ellipsis must still go through — only payloads that are ENTIRELY
+  // placeholder text should be suppressed.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: 피보나치 수열을 1, 1, 2, 3, 5, ... 로 출력해줘.\n');
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].workerId, 'worker-1');
+  assert.match(msgs[0].payload, /피보나치/);
+});
+
+test('router v0.4.0: multi-directive chunk drops template, keeps real task', () => {
+  // Reproduces the v0.3.9 field log where a single projected chunk yielded
+  // both a template row and a real task row. Only the real task survives.
+  const p = new WorkerPatternParser();
+  const chunk =
+    '@worker-1: ... /\n' +
+    '@worker-2: ... (컬럼 0에서 시작) - 라운드 예산: 작업당 10회 - Effort: max\n' +
+    '@worker-1: "apple"이라고만 말해줘. 다른 말은 붙이지 말고.\n' +
+    '@worker-2: "banana"라고만 말해줘. 다른 말은 붙이지 말고.\n';
+  const msgs = p.feed(chunk);
+  assert.equal(msgs.length, 2, 'only the two real task directives survive');
+  assert.equal(msgs[0].workerId, 'worker-1');
+  assert.match(msgs[0].payload, /apple/);
+  assert.equal(msgs[1].workerId, 'worker-2');
+  assert.match(msgs[1].payload, /banana/);
+});

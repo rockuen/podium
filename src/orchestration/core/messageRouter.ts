@@ -68,6 +68,37 @@ export interface RoutedMessage {
 
 const TOKEN_RE = /@(leader|worker-\d+):/g;
 const END_RE = /@end\b/;
+
+// v0.4.0 — Protocol template / placeholder noise guard
+// -----------------------------------------------------
+// Two failure modes observed in field logs:
+//
+//   1. Leader, while acknowledging the protocol on its first turn, types a
+//      template block that quotes the delegation syntax back, e.g.:
+//         @worker-1: ... / @worker-2: ... (컬럼 0에서 시작)
+//         - 라운드 예산: 작업당 10회
+//         - Effort: max
+//      The tokenizer happily yields directives with payloads like `... /`
+//      and `... (컬럼 0에서 시작) - 라운드 예산: 작업당 10회`, which then
+//      route to workers as if they were real tasks.
+//
+//   2. System-prompt example rows like `@worker-1: <task for worker-1>`
+//      occasionally bleed through repaints; same class of problem.
+//
+// Filter payloads at yield-time so the orchestrator never sees them.
+// Conservative by design: only drop payloads that are OBVIOUSLY template or
+// placeholder content — never a legitimate user task.
+const PLACEHOLDER_PAYLOAD_RE = /^[\s…./\-*·]+$/;
+const PROTOCOL_META_RE = /컬럼\s*0\s*에서\s*시작|라운드\s*예산|작업당\s*\d+\s*회|Effort\s*[::]|<task for\b/;
+
+function isProtocolNoise(payload: string): boolean {
+  if (!payload) return true;
+  const trimmed = payload.trim();
+  if (trimmed.length === 0) return true;
+  if (PLACEHOLDER_PAYLOAD_RE.test(trimmed)) return true;
+  if (PROTOCOL_META_RE.test(trimmed)) return true;
+  return false;
+}
 const CLAUDE_ASSISTANT_START_RE = /^\s*●(?:\s+|(?=@(?:worker-|leader:)))/;
 const CLAUDE_ASSISTANT_CONT_RE = /^(?:\s{2,}\S|@(?:worker-\d+|leader):|@end\b)/;
 // v0.3.6 · Bare routing directive at column 0 (no leading `●` bullet, no
@@ -211,7 +242,7 @@ export class WorkerPatternParser {
     const { workerId, payloadStart } = remaining;
     const payload = this.normalize(this.buffer.slice(payloadStart));
     this.buffer = '';
-    if (payload.length === 0) return drained;
+    if (payload.length === 0 || isProtocolNoise(payload)) return drained;
     return [...drained, { workerId, payload }];
   }
 
@@ -240,7 +271,7 @@ export class WorkerPatternParser {
       const payload = isMultiline
         ? this.normalizeMultiline(rawPayload)
         : this.normalize(rawPayload);
-      if (payload.length > 0) {
+      if (payload.length > 0 && !isProtocolNoise(payload)) {
         out.push({ workerId: token.workerId, payload });
       }
       this.buffer = this.buffer.slice(terminator.advanceTo);
