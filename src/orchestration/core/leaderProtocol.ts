@@ -119,34 +119,64 @@ each starting at column zero of a new line:
 Exact format: literal '@', target id, ':', space, task text. The external
 orchestrator dispatches each directive to the matching pane.
 
-CODE / LONG-BODY DELEGATION (v0.5.0)
-When the task body contains code blocks, multi-paragraph instructions,
-or anything that spans more than one line, you MUST use the explicit
-multi-line form terminated by @end:
+FILE-BASED DELEGATION FOR LONG BODIES (v0.7.1, REQUIRED)
 
-  @worker-1:
-  아래 reverseString 구현을 리뷰해주세요.
+Field evidence has shown that any delegation whose body exceeds a few
+short sentences CANNOT be sent reliably inline. The Ink TUI fragments
+long chunks, and the parser truncates the moment it sees another
+"@leader:" or "@worker-M:" substring anywhere in your body — so a
+sentence like 'reply with "@leader:" prefix' will silently cut your
+directive at that word and the worker never receives the rest.
 
-  function reverseString(str) {
-    return [...str].reverse().join('');
-  }
+For ANY delegation body that:
+  - contains a code block, or
+  - contains the literal strings "@leader:" / "@worker-" anywhere, or
+  - spans three lines or more,
 
-  특히 이모지/ZWJ 문자열에서의 동작을 지적해주세요.
-  @end
+you MUST use this two-step pattern:
 
-Rules for the multi-line form:
-1. The directive line is ONLY "@worker-N:" (or "@worker-N: " with nothing
-   after the space). The body starts on the NEXT line.
-2. Every line of the body belongs to that worker's payload until the
-   "@end" sentinel on its own line (column zero).
-3. Do not nest another "@worker-M:" inside — the orchestrator would
-   terminate the payload at that inner token.
-4. If you forget "@end", the orchestrator terminates at your next
-   "@worker-N:" directive, so always close the block explicitly.
+  STEP 1: Use your Write tool to save the full body to a markdown file
+  under ".omc/team/drops/". Filename convention:
+      .omc/team/drops/to-<worker-id>-<short-desc>.md
+  (e.g. .omc/team/drops/to-worker-2-review-reverseString.md)
 
-Single-line form is fine for short one-sentence tasks; use the multi-
-line form above whenever you are pasting code, quoting a peer's
-output, or sending instructions longer than one sentence.
+  STEP 2: Emit a SHORT directive (one or two sentences) that tells the
+  worker to Read that file and perform the task:
+      @worker-2: .omc/team/drops/to-worker-2-review-reverseString.md
+      파일을 Read 해서, 안에 적힌 구현을 critic 역할로 리뷰해줘.
+
+Why this is required, not optional:
+  - Write tool bytes land on disk exactly as you produced them. No pty
+    fragmentation, no ANSI wobble, no Ink repaint.
+  - The short "@worker-N:" directive stays well under the fragmentation
+    threshold and is reliably delivered.
+  - The worker's system prompt teaches it to Read any file path you
+    mention, so no special protocol is needed on the worker side.
+
+The orchestrator also has a FALLBACK automatic spill (at 300 chars)
+that catches long bodies you forgot to pre-write. Do NOT rely on it:
+by the time the orchestrator sees the body, the parser has usually
+already truncated you. Pre-writing is the robust path.
+
+SHORT INLINE DELEGATION (one-sentence tasks only)
+For genuinely short tasks without embedded code or @-tokens, the
+single-line form is fine:
+
+  @worker-1: hello 다섯 번 반복해서 출력해.
+
+If you catch yourself about to type a second line of body, stop and
+use the file-based pattern above instead.
+
+WHEN YOU QUOTE A PEER'S OUTPUT
+Never paste a peer's reply (which likely contains "@leader:" or code)
+into another "@worker-N:" directive inline. Write it to a drop file
+first, then reference the path. This is the #1 way delegations get
+scrambled.
+
+LEGACY MULTI-LINE FORM (do not use for new code)
+An older "@worker-N:\n<body>\n@end" form exists for historical reasons
+but is fragile against the issues above. File-based delegation is the
+only reliable pattern — use it.
 
 BIDIRECTIONAL ROUTING (v0.3.0)
 Workers can reply to you with "@leader: <message>" directives. Those
