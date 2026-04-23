@@ -711,9 +711,12 @@ test('dissolve v2.7.25: add+dissolve includes runtime-added worker in summary in
   await orch.addWorker({ id: 'worker-3', paneId: 'worker-3', agent: 'claude' });
 
   // Feed each pane a distinctive transcript.
-  ctl.firePaneData({ paneId: 'W1', data: 'w1-transcript-marker\n' });
-  ctl.firePaneData({ paneId: 'W2', data: 'w2-transcript-marker\n' });
-  ctl.firePaneData({ paneId: 'worker-3', data: 'w3-transcript-marker\n' });
+  // v0.7.4: transcript uses the assistant-only projector; prefix with
+  // the `● ` bullet so the lines classify as assistant-start and land
+  // in each worker's transcript.
+  ctl.firePaneData({ paneId: 'W1', data: '● w1-transcript-marker\n' });
+  ctl.firePaneData({ paneId: 'W2', data: '● w2-transcript-marker\n' });
+  ctl.firePaneData({ paneId: 'worker-3', data: '● w3-transcript-marker\n' });
 
   const removedBefore = ctl.removed.length;
   await orch.dissolve();

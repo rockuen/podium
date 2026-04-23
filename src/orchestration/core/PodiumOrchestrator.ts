@@ -602,10 +602,12 @@ export class PodiumOrchestrator implements vscode.Disposable {
         currentTurnStart: 0,
         spillSeq: 0,
         hasPendingReply: false,
-        projector:
-          this.enableWorkerRouting && w.agent === 'claude'
-            ? new ClaudeLeaderRoutingProjector()
-            : null,
+        // v0.7.4 — Projector instantiated for all Claude agents (not
+        // gated on routing) so transcript capture gets the same
+        // assistant-only filtering as parser routing. Spill files
+        // then contain only assistant text, no thinking spinners or
+        // status chrome.
+        projector: w.agent === 'claude' ? new ClaudeLeaderRoutingProjector() : null,
       });
     }
 
@@ -738,8 +740,9 @@ export class PodiumOrchestrator implements vscode.Disposable {
       hasPendingReply: false,
       // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
       parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
+      // v0.7.4 — see attach() site for rationale.
       projector:
-        this.enableWorkerRouting && cfg.agent === 'claude'
+        cfg.agent === 'claude'
           ? new ClaudeLeaderRoutingProjector()
           : null,
     };
@@ -1011,15 +1014,27 @@ export class PodiumOrchestrator implements vscode.Disposable {
     for (const w of this.workers.values()) {
       if (w.cfg.paneId === paneId) {
         w.idle.feed(rawData);
-        // Accumulate stripped output for dissolve-time summarization. Keep
-        // only the tail to bound memory on long-running teams.
-        w.transcript += stripAnsi(rawData);
+        // v0.7.4 — Accumulate PROJECTED output (not raw) for the
+        // transcript. Raw stripAnsi output includes Claude CLI's
+        // thinking spinner frames (✻ ✽ ✶ ✢ ·), status bar repaints
+        // (`[OMC#4.12.0] | ...`), chrome (─), prompt box (> ), and
+        // every cursor-replace frame of the assistant-streaming UI.
+        // Spill files then filled up with that garbage instead of the
+        // assistant's actual reply text, so the leader could not use
+        // the drop files and asked for retries. The projector already
+        // knows how to strip UI and keep only the assistant block
+        // (● bullet + its continuation rows); running it here once
+        // serves BOTH routing (consumeWorkerOutput reuses the result)
+        // and transcript capture (spill slices this).
+        const cleaned = stripAnsi(rawData);
+        const projected = w.projector ? w.projector.feed(cleaned) : cleaned;
+        w.transcript += projected;
         if (w.transcript.length > MAX_TRANSCRIPT_CHARS) {
           w.transcript = w.transcript.slice(-MAX_TRANSCRIPT_CHARS);
         }
         // v0.3.0: if bidirectional routing is enabled, parse this worker's
         // output for `@leader:` / `@worker-N:` directives and route them.
-        this.consumeWorkerOutput(w, rawData);
+        this.consumeWorkerOutput(w, projected);
         return;
       }
     }
@@ -1032,10 +1047,14 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * projector pair so multiple workers stream in parallel without
    * cross-contaminating each other's directive buffers.
    */
-  private consumeWorkerOutput(w: WorkerRuntime, rawData: string): void {
+  private consumeWorkerOutput(w: WorkerRuntime, projected: string): void {
+    // v0.7.4 — stripAnsi + projector moved upstream to onPaneData so
+    // the transcript and routing share a single projection pass. This
+    // callee now receives already-projected (assistant-block-only)
+    // text, not raw ANSI. Feeding the projector twice would double-
+    // advance its inAssistantBlock / partial state and corrupt the
+    // classification.
     if (!this.enableWorkerRouting || !w.parser) return;
-    const cleaned = stripAnsi(rawData);
-    const projected = w.projector ? w.projector.feed(cleaned) : cleaned;
     if (!projected) return;
     const msgs = w.parser.feed(projected);
     if (msgs.length === 0) return;

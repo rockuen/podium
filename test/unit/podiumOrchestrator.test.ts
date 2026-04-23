@@ -555,19 +555,23 @@ test('orch v0.6.0: long worker turn body spills to drop file + leader notice', a
   clock.advance(200);
 
   // Simulate worker emitting a long multi-line code reply.
+  // v0.7.4: body lines must be 2-space indented so the projector
+  // classifies them as assistant-cont (otherwise 'other' closes the
+  // block and the body is filtered out of the transcript). Real
+  // Claude output wraps multi-line assistant content this way.
   const longBody =
     '@leader:\n' +
-    '/**\n' +
-    ' * Grapheme cluster 단위로 문자열을 뒤집는다.\n' +
-    ' * surrogate pair, ZWJ 시퀀스, combining mark 모두 보존.\n' +
-    ' */\n' +
-    'function reverseString(str) {\n' +
-    "  if (typeof str !== 'string') throw new TypeError('expected a string');\n" +
-    '  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });\n' +
-    '  const graphemes = [];\n' +
-    '  for (const { segment } of segmenter.segment(str)) graphemes.push(segment);\n' +
-    '  return graphemes.reverse().join("");\n' +
-    '}\n';
+    '  /**\n' +
+    '   * Grapheme cluster 단위로 문자열을 뒤집는다.\n' +
+    '   * surrogate pair, ZWJ 시퀀스, combining mark 모두 보존.\n' +
+    '   */\n' +
+    '  function reverseString(str) {\n' +
+    "    if (typeof str !== 'string') throw new TypeError('expected a string');\n" +
+    '    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });\n' +
+    '    const graphemes = [];\n' +
+    '    for (const { segment } of segmenter.segment(str)) graphemes.push(segment);\n' +
+    '    return graphemes.reverse().join("");\n' +
+    '  }\n';
   assert.ok(longBody.length > 300, 'test body must exceed spill threshold');
 
   ctl.firePaneData({ paneId: 'W1', data: longBody });

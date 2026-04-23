@@ -87,8 +87,12 @@ test('dissolve: captures stripped transcript per worker', async () => {
   });
 
   // Feed worker output with ANSI that should be stripped in the transcript.
-  ctl.firePaneData({ paneId: 'W1', data: '\x1b[31manswer from w1\x1b[0m\n' });
-  ctl.firePaneData({ paneId: 'W2', data: 'answer from w2\n' });
+  // v0.7.4: transcript now runs through the assistant-only projector, so
+  // the input must be shaped as real Claude assistant output ("● " bullet)
+  // to land in the transcript. Non-bullet lines correctly classify as UI
+  // chrome or narration and are filtered out.
+  ctl.firePaneData({ paneId: 'W1', data: '\x1b[31m● answer from w1\x1b[0m\n' });
+  ctl.firePaneData({ paneId: 'W2', data: '● answer from w2\n' });
 
   const summary = await orch.dissolve();
   assert.equal(summary, 'stub summary');
@@ -149,7 +153,7 @@ test('dissolve: summarizer failure falls back to raw transcript tails', async ()
     skipAutoTick: true,
   });
 
-  ctl.firePaneData({ paneId: 'W1', data: 'raw answer from worker\n' });
+  ctl.firePaneData({ paneId: 'W1', data: '● raw answer from worker\n' });
 
   const summary = await orch.dissolve();
   assert.ok(summary && summary.includes('worker-1'));
@@ -199,9 +203,17 @@ test('dissolve: transcript cap at 50KB keeps only the tail', async () => {
   });
 
   // Feed 60KB of filler then a distinctive final marker.
-  const filler = 'x'.repeat(60_000);
-  ctl.firePaneData({ paneId: 'W1', data: filler });
-  ctl.firePaneData({ paneId: 'W1', data: '\nFINAL_ANSWER_MARKER\n' });
+  // v0.7.4: transcript runs through the assistant-only projector, so
+  // the filler lines need a bullet (`● `) to classify as assistant-
+  // start, and the marker line needs a 2-space indent to classify as
+  // assistant-cont. We also split the filler into many lines so each
+  // stays well under the projector's MAX_PARTIAL (8KB) buffer cap,
+  // which would otherwise force-flush + close the assistant block.
+  const fillerLine = '● ' + 'x'.repeat(500);
+  const lines: string[] = [];
+  for (let i = 0; i < 130; i++) lines.push(fillerLine);
+  lines.push('  FINAL_ANSWER_MARKER');
+  ctl.firePaneData({ paneId: 'W1', data: lines.join('\n') + '\n' });
 
   await orch.dissolve();
   assert.ok(received);
