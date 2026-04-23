@@ -982,6 +982,13 @@ export class PodiumOrchestrator implements vscode.Disposable {
   private route(msg: RoutedMessage, sourcePaneId?: string): void {
     const source = sourcePaneId ?? this.leader?.paneId ?? '';
 
+    // v0.3.7 · Field diagnostic entry log. Makes every routing attempt
+    // visible so stalls between "parser yielded" and actual injection can
+    // be traced. Budget: one short line per parsed directive.
+    this.output.appendLine(
+      `[orch.route] src=${source} → target=${msg.workerId} (round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}, debounce=${this.dispatchDebounceMs}ms): ${preview(msg.payload)}`,
+    );
+
     // v0.3.0 · Pause kill-switch — drops without any side effect.
     if (this.routingPaused) {
       this.stats.dropped += 1;
@@ -1230,9 +1237,14 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // land a longer version in the next few hundred ms; re-arm and wait.
     const source = [...this.workers.values()].find((w) => w.cfg.paneId === sourcePaneId);
     if (source && !source.idle.isIdle) {
+      const ms = source.idle.msSinceOutput;
+      this.output.appendLine(
+        `[orch.debounce] re-arm leader←${sourcePaneId} (source busy, msSinceOutput=${ms}ms): ${preview(payload)}`,
+      );
       this.armLeaderDispatchTimer(sourcePaneId, payload);
       return;
     }
+    this.output.appendLine(`[orch.debounce] commit leader←${sourcePaneId}: ${preview(payload)}`);
     this.pendingLeaderInject.delete(sourcePaneId);
     this.commitLeaderInject(payload, sourcePaneId);
   }
@@ -1250,15 +1262,27 @@ export class PodiumOrchestrator implements vscode.Disposable {
    */
   private tryDispatchPending(workerId: string, payload: string): void {
     if (this.leaderIdle && !this.leaderIdle.isIdle) {
+      // v0.3.7 · Field diagnostic: log every re-arm so silent stalls are
+      // visible. Field log showed the pending debounce looping forever when
+      // leaderIdle misjudged busy; without this log the loop was invisible.
+      const ms = this.leaderIdle.msSinceOutput;
+      this.output.appendLine(
+        `[orch.debounce] re-arm ${workerId} (leaderIdle=busy, msSinceOutput=${ms}ms): ${preview(payload)}`,
+      );
       this.armDispatchTimer(workerId, payload);
       return;
     }
+    this.output.appendLine(`[orch.debounce] commit ${workerId}: ${preview(payload)}`);
     this.pendingRoute.delete(workerId);
     const w = this.workers.get(workerId);
     if (w) this.commitRoute(w, payload);
   }
 
   private commitRoute(w: WorkerRuntime, payload: string): void {
+    // v0.3.7 · Entry log — field diagnostic for stalls between commit and inject.
+    this.output.appendLine(
+      `[orch.commit] ${w.cfg.id} (idle=${w.idle.isIdle}, queueLen=${w.queue.length}): ${preview(payload)}`,
+    );
     // Redraw dedupe: Claude's Ink UI repaints the same line on every status
     // tick. Suppress any payload we've seen for this worker within the dedupe
     // window. First hit logs as dedup-suppressed; silent for subsequent hits.
@@ -1267,6 +1291,9 @@ export class PodiumOrchestrator implements vscode.Disposable {
     const lastSeen = w.recentPayloads.get(payload);
     if (lastSeen !== undefined) {
       this.stats.deduped += 1;
+      this.output.appendLine(
+        `[orch.commit] ${w.cfg.id} deduped (already routed within ${this.dedupeWindowMs}ms)`,
+      );
       return;
     }
     // v0.3.0: enforce round cap AFTER dedupe so Ink redraws of a single
