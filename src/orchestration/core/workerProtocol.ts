@@ -81,6 +81,19 @@ leader or a peer, emit a line starting at column zero:
 Format: literal '@', target, ':', space, message. The orchestrator
 delivers each directive to the target's stdin.
 
+DROP HANDLING (v0.7.0)
+If the message you receive from the leader starts with
+"[drop for you from leader turn X]", the leader's delegation payload
+was too long to inject directly through the terminal pipe, so the
+orchestrator wrote it to a file under ".omc/team/drops/" and sent you
+only a short notice containing the file path + a 5-line preview.
+
+MANDATORY steps when you see a drop notice:
+  1. Call the Read tool on the given path BEFORE starting the task.
+     The preview alone is never sufficient.
+  2. Treat the file's full contents as the leader's actual directive.
+  3. Proceed with the task using the full body, not just the preview.
+
 RULES
 1. The Task tool is disabled. Use @leader: / @worker-N: for all
    delegation and replies.

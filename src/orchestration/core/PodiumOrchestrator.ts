@@ -1660,11 +1660,19 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // BEFORE any inject arrives are skipped to avoid spurious drop
     // notices and the meta-analysis cascade they triggered in v0.6.0.
     w.hasPendingReply = true;
+    // v0.7.0 — Symmetric spill. A long leader→worker payload (the
+    // delegation body, especially when the leader pastes code or a
+    // full review request) fragments through the pty pipeline just like
+    // worker→leader replies did in v0.5.2. Check size here and, above
+    // SPILL_THRESHOLD_CHARS, divert to a drop file and inject only a
+    // short pty-safe notice. The worker is taught (via workerProtocol)
+    // to Read the file before starting the task.
+    const effective = this.maybeSpillLeaderToWorker(w, payload);
     const paneId = w.cfg.paneId;
     const opts = { agent: w.cfg.agent };
     try {
       if (needsWin32KeyEvents(opts)) {
-        const { body, submit } = splitSubmitPayload(payload, opts);
+        const { body, submit } = splitSubmitPayload(effective, opts);
         this.panel.writeToPane(paneId, body);
         setTimeout(() => {
           try {
@@ -1675,17 +1683,72 @@ export class PodiumOrchestrator implements vscode.Disposable {
           }
         }, INJECT_SUBMIT_DELAY_MS);
       } else {
-        const bytes = buildSubmitPayload(payload, opts);
+        const bytes = buildSubmitPayload(effective, opts);
         this.panel.writeToPane(paneId, bytes);
       }
       w.idle.markBusy();
       this.stats.injected += 1;
-      this.output.appendLine(`[orch] → ${w.cfg.id}: ${preview(payload)}`);
+      this.output.appendLine(`[orch] → ${w.cfg.id}: ${preview(effective)}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[orch] inject → ${w.cfg.id} FAILED — ${msg}`);
       this.stats.dropped += 1;
     }
+  }
+
+  /**
+   * v0.7.0 — Leader→Worker symmetric spill.
+   *
+   * When the leader routes a payload larger than SPILL_THRESHOLD_CHARS
+   * toward a worker (typically: long code review request, multi-line
+   * task spec with embedded snippets), skip direct pty injection and
+   * instead:
+   *   1. Save the full body to `.omc/team/drops/to-<worker>-turn<N>-seq<S>.md`
+   *   2. Return a short pty-safe notice to inject instead, with the
+   *      relative file path and a 5-line preview.
+   * The worker's system prompt (workerProtocol DROP HANDLING section)
+   * instructs it to Read the file before starting the task.
+   *
+   * Short payloads pass through unchanged.
+   *
+   * File-write failures fall back to injecting the original payload
+   * (best-effort: fragmentation is worse than nothing, but losing the
+   * task entirely is worse than fragmentation).
+   */
+  private maybeSpillLeaderToWorker(w: WorkerRuntime, payload: string): string {
+    if (payload.length < SPILL_THRESHOLD_CHARS) return payload;
+    w.spillSeq += 1;
+    const root = this.attachedCwd ?? process.cwd();
+    const dir = path.join(root, '.omc', 'team', 'drops');
+    const filename = `to-${w.cfg.id}-turn${this.leaderTurnId}-seq${w.spillSeq}.md`;
+    const absPath = path.join(dir, filename);
+    const relPath = path.posix.join('.omc', 'team', 'drops', filename);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const now = new Date().toISOString();
+      const header =
+        `# Drop: leader → ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
+        `direction: leader → ${w.cfg.id}\n` +
+        `timestamp: ${now}\n` +
+        `bytes: ${payload.length}\n` +
+        `---\n\n`;
+      fs.writeFileSync(absPath, header + payload, 'utf8');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(
+        `[orch.spill] leader→${w.cfg.id} write FAILED — ${msg}; falling back to direct inject`,
+      );
+      return payload;
+    }
+    const preview = this.buildSpillPreview(payload);
+    this.output.appendLine(
+      `[orch.spill] leader → ${w.cfg.id}: ${relPath} (${payload.length} bytes); injecting notice`,
+    );
+    return (
+      `[drop for you from leader turn ${this.leaderTurnId}] 본문 저장됨: ${relPath}\n\n` +
+      `미리보기:\n${preview}\n\n` +
+      `전체 본문은 위 파일을 Read 해서 확인한 뒤 task를 수행해 주세요.`
+    );
   }
 
   /**

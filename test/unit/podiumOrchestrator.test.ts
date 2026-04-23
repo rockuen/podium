@@ -540,6 +540,7 @@ test('orch v0.6.0: long worker turn body spills to drop file + leader notice', a
     skipAutoTick: true,
     dedupeWindowMs: 30_000,
     enableWorkerRouting: true,
+    dispatchDebounceMs: 0,
   });
   feedPrompt(ctl, 'L', 'claude');
   feedPrompt(ctl, 'W1', 'claude');
@@ -594,6 +595,130 @@ test('orch v0.6.0: long worker turn body spills to drop file + leader notice', a
     `leader did not receive drop notice. writes: ${JSON.stringify(ctl.writes.map((w) => w.paneId))}`,
   );
   assert.ok(leaderWrites.includes('미리보기'), 'drop notice should include preview block');
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
+test('orch v0.7.0: long leader → worker payload spills to to-*.md + short notice injected', async () => {
+  // v0.6.x solved worker→leader long replies via drop files. v0.7.0
+  // applies the symmetric treatment to leader→worker delegations: when
+  // the leader sends a long payload (e.g. code review request with an
+  // embedded snippet), inject() diverts to a drop file and writes only
+  // a short notice to the worker pane.
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-l2w-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+    dispatchDebounceMs: 0,
+  });
+  feedPrompt(ctl, 'L', 'claude');
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // Leader emits a multi-line `@worker-1:` with a long body. This must
+  // trigger inject() with a > 300-char payload.
+  // Projector requires continuation lines to be 2-space indented
+  // (CLAUDE_ASSISTANT_CONT_RE). Body lines at column 0 classify as 'other'
+  // and close the assistant block, so we indent the body to keep the
+  // whole delegation inside the assistant block and reach the parser.
+  const longCodeDelegation =
+    '@worker-1:\n' +
+    '  다음 JavaScript reverseString 구현을 리뷰해줘. Intl.Segmenter 사용.\n\n' +
+    '  function reverseString(str) {\n' +
+    "    if (typeof str !== 'string') throw new TypeError('expected a string');\n" +
+    '    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });\n' +
+    '    const graphemes = [];\n' +
+    '    for (const { segment } of segmenter.segment(str)) graphemes.push(segment);\n' +
+    '    return graphemes.reverse().join("");\n' +
+    '  }\n\n' +
+    '  특히 ZWJ emoji, surrogate pair, combining mark 관점에서 결함 찾아줘.\n' +
+    '  @end\n';
+  assert.ok(longCodeDelegation.length > 300, 'test delegation must exceed spill threshold');
+  ctl.firePaneData({ paneId: 'L', data: '● ' + longCodeDelegation });
+  clock.advance(200);
+
+  // Drop file with `to-worker-1-turn*.md` naming should exist.
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  const toFiles = files.filter((f) => f.startsWith('to-worker-1-turn') && f.endsWith('.md'));
+  assert.equal(
+    toFiles.length,
+    1,
+    `expected 1 leader→worker drop file, got ${toFiles.length}: ${files.join(', ')}`,
+  );
+
+  const content = await fsPromises.readFile(pathMod.join(dropDir, toFiles[0]), 'utf8');
+  assert.ok(content.includes('reverseString'), 'drop file must contain the full body');
+  assert.ok(
+    content.includes('direction: leader → worker-1'),
+    'drop file must record direction',
+  );
+
+  // Worker pane should have received a short notice rather than the full body.
+  const workerWrites = ctl.writes.filter((w) => w.paneId === 'W1').map((w) => w.data).join('');
+  assert.ok(
+    workerWrites.includes('[drop for you from leader'),
+    `worker did not receive drop notice. writes: ${JSON.stringify(ctl.writes.map((w) => ({ p: w.paneId, d: w.data.slice(0, 40) })))}`,
+  );
+  assert.ok(
+    !workerWrites.includes('for (const { segment } of segmenter.segment(str))'),
+    'worker pane must NOT receive the full code body (spill failed to divert)',
+  );
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
+test('orch v0.7.0: short leader → worker payload stays on direct inject path', async () => {
+  // Negative control: payloads under threshold must NOT spill.
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-l2w-short-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+    dispatchDebounceMs: 0,
+  });
+  feedPrompt(ctl, 'L', 'claude');
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: run quick task.\n' });
+  clock.advance(200);
+
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  const toFiles = files.filter((f) => f.startsWith('to-worker-1-turn'));
+  assert.equal(toFiles.length, 0, `short payload must not spill. files: ${files.join(', ')}`);
+
+  const workerWrites = ctl.writes.filter((w) => w.paneId === 'W1').map((w) => w.data).join('');
+  assert.ok(workerWrites.includes('run quick task'), 'worker must receive the short payload directly');
+  assert.ok(!workerWrites.includes('[drop for you'), 'short payload must NOT produce a drop notice');
 
   await fsPromises.rm(tmpRoot, { recursive: true, force: true });
   orch.dispose();
