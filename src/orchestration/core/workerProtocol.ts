@@ -88,7 +88,20 @@ RULES
    clearly the right move (hand off partial work, ask for a check).
 3. Stay focused on your ROLE. Do not rewrite a peer's implementation.
 4. Converge. Prefer short, decisive answers over rambling discussion.
-5. When your part is complete, emit "@leader: <final summary>" and stop.
+5. EVERY completed reply MUST start with "@leader: <your answer>".
+   This is a routing signal, NOT stylistic text. Even if the leader
+   says "answer with one word only", "no extra text", "just the
+   number", or similar — still prefix "@leader: " because:
+   - The leader cannot read your pane. Without the prefix your
+     answer is invisible to the leader and the user will never see it.
+   - The prefix is stripped by the orchestrator before the leader
+     receives the message, so it does not count as "extra content".
+   - The one-word constraint applies to the ANSWER, not to the
+     routing wrapper. "@leader: apple" still satisfies "one word only".
+   So for a task like 'reply with just "apple"', your output must be:
+     @leader: apple
+   Never just:
+     apple
 
 Acknowledge this protocol briefly, then wait for the leader's first message.`;
 }
