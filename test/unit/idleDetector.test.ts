@@ -168,3 +168,26 @@ test('idle v0.3.5: prompt + OMC status concatenated (no bypass) is cosmetic', ()
   c.advance(50);
   assert.equal(d.isIdle, true, 'compact prompt+status repaint should be cosmetic');
 });
+
+test('idle v0.3.8: Ink compact repaint also satisfies hasPromptPattern', () => {
+  // Regression for v0.3.7 field log: silence reached 52s but isIdle stayed
+  // false because the only content in rollingTail was an Ink compact
+  // repaint (prompt + status + bypass concatenated on one line) and none
+  // of the anchored PROMPT_PATTERNS matched. hasPromptPattern needs the
+  // contains-form too.
+  const c = mkClock(1000);
+  const d = new IdleDetector({ agent: 'claude', now: c.now, silenceMs: 500 });
+  // Feed ONLY the compact repaint — no preceding boxed/plain prompt.
+  d.feed('>                  [OMC#4.12.0] | 5h:11%(4h31m) wk:39%(5d2h) | session:0m | ctx:0%    ⏵⏵ bypass permissions on (shift+tab to cycle)\n');
+  c.advance(600);
+  assert.equal(d.isIdle, true, 'compact repaint alone should satisfy hasPromptPattern');
+});
+
+test('idle v0.3.8: OMC status line as pure contains (no leading prompt) satisfies prompt', () => {
+  const c = mkClock(1000);
+  const d = new IdleDetector({ agent: 'claude', now: c.now, silenceMs: 500 });
+  // Just the status row on its own (common Ink repaint form).
+  d.feed('some prefix text   [OMC#4.12.0] | session:1m | ctx:4%\n');
+  c.advance(600);
+  assert.equal(d.isIdle, true, 'OMC status anywhere on a line should count as prompt');
+});

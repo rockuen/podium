@@ -105,6 +105,16 @@ const PROMPT_PATTERNS: Record<AgentKind, RegExp[]> = {
     /^\s*╰──+/,                  // boxed bottom border (loose)
     /^\s*>\s*$/,                 // v2.1+ plain prompt row (v2.7.22: allow leading ws)
     /^\s*\[OMC#[\d.]+\]\s*\|/,   // v2.1+ OMC status line (v2.7.22: allow leading ws)
+    // v0.3.8 · Claude Ink alt-screen compact repaint. Cursor-positioning
+    // escapes render prompt + status + bypass as one logical "line" after
+    // stripAnsi: `>                [OMC#4.12.0] | ... | ctx:0%    ⏵⏵ bypass
+    // permissions on (shift+tab to cycle)`. None of the anchored patterns
+    // above match it, so hasPromptPattern() returned false even when the
+    // worker/leader was clearly sitting at a fresh prompt (v0.3.7 field
+    // log: 52s silence with re-arm loop — silence window satisfied but
+    // prompt pattern kept failing). Contains-match catches the concat.
+    /\[OMC#[\d.]+\]\s*\|/,       // OMC status present anywhere on the line
+    /⏵⏵\s+bypass permissions/,   // bypass hint present anywhere on the line
     /^\s*⏵⏵\s+bypass permissions/, // v2.7.22: bypass hint appears immediately after prompt
   ],
   // Codex CLI prints `user> ` at column 0 when awaiting input.
