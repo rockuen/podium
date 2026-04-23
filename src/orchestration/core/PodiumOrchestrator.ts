@@ -1288,6 +1288,38 @@ export class PodiumOrchestrator implements vscode.Disposable {
         this.stats.dropped += 1;
         return;
       }
+      // v0.8.1 · Route-time dedupe (leader target). Mirrors commitLeaderInject
+      // but runs BEFORE the debounce timer arms, so a storm of scrollback
+      // repaints can't push the commit past CROSS_TURN_DEDUPE_MS. Without
+      // this, a worker pane that keeps repainting a prior `@leader: ...`
+      // line burns CPU on re-arm logs and eventually re-injects the stale
+      // reply into the leader. See same-direction guard in the worker
+      // branch below for the symmetric case.
+      {
+        const nowL = this.nowFn();
+        this.pruneLeaderRecent(nowL);
+        const keyL = this.dedupeKey(msg.payload);
+        const prevL = this.leaderRecentPayloads.get(keyL);
+        if (prevL !== undefined) {
+          const sameTurn = prevL.turnId === this.leaderTurnId;
+          const crossTurnWithin = nowL - prevL.ts < CROSS_TURN_DEDUPE_MS;
+          if (sameTurn || crossTurnWithin) {
+            this.stats.deduped += 1;
+            const reason = sameTurn
+              ? `same turn=${this.leaderTurnId}`
+              : `cross-turn within ${CROSS_TURN_DEDUPE_MS}ms (prior turn=${prevL.turnId}, cur=${this.leaderTurnId})`;
+            this.output.appendLine(
+              `[orch.route] leader (from ${source}) dedup-drop (${reason}, key="${preview(keyL, 40)}"): ${preview(msg.payload)}`,
+            );
+            const pendingL = this.pendingLeaderInject.get(source);
+            if (pendingL && this.dedupeKey(pendingL.payload) === keyL) {
+              clearTimeout(pendingL.timer);
+              this.pendingLeaderInject.delete(source);
+            }
+            return;
+          }
+        }
+      }
       // v0.3.4 · Ink re-render absorber, symmetric with the worker-target
       // path in the branch below. Without this, each wrap stage of a
       // single worker @leader: reply counted as a separate round.
@@ -1346,6 +1378,39 @@ export class PodiumOrchestrator implements vscode.Disposable {
       );
       this.stats.dropped += 1;
       return;
+    }
+
+    // v0.8.1 · Route-time dedupe (worker target). Catches the bug where
+    // Ink alt-screen repaints re-emit a prior turn's `@worker-N: ...`
+    // directive in the middle of the NEXT turn. The repaint lands in
+    // `route()`, which arms a debounce timer; each subsequent repaint
+    // re-arms the timer ad infinitum while the leader is busy. By the
+    // time the leader falls idle and commit fires, CROSS_TURN_DEDUPE_MS
+    // measured from the ORIGINAL commit has lapsed → commit-time dedupe
+    // misses → the task is re-injected into the worker. Dropping at
+    // route time prevents both the spam and the re-injection.
+    const nowR = this.nowFn();
+    this.pruneRecent(w, nowR);
+    const keyR = this.dedupeKey(msg.payload);
+    const prevR = w.recentPayloads.get(keyR);
+    if (prevR !== undefined) {
+      const sameTurn = prevR.turnId === this.leaderTurnId;
+      const crossTurnWithin = nowR - prevR.ts < CROSS_TURN_DEDUPE_MS;
+      if (sameTurn || crossTurnWithin) {
+        this.stats.deduped += 1;
+        const reason = sameTurn
+          ? `same turn=${this.leaderTurnId}`
+          : `cross-turn within ${CROSS_TURN_DEDUPE_MS}ms (prior turn=${prevR.turnId}, cur=${this.leaderTurnId})`;
+        this.output.appendLine(
+          `[orch.route] ${w.cfg.id} dedup-drop (${reason}, key="${preview(keyR, 40)}"): ${preview(msg.payload)}`,
+        );
+        const pending = this.pendingRoute.get(w.cfg.id);
+        if (pending && this.dedupeKey(pending.payload) === keyR) {
+          clearTimeout(pending.timer);
+          this.pendingRoute.delete(w.cfg.id);
+        }
+        return;
+      }
     }
 
     if (this.dispatchDebounceMs <= 0) {

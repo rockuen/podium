@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.8.1] - 2026-04-24
+
+### Fix · Route-time dedupe kills the re-inject storm
+
+Field logs from a reverseString relay showed the leader's @worker-1 directive being re-dispatched once per user-visible turn. Root cause: Claude's Ink TUI repaints scrollback across turn boundaries, so an already-committed `@worker-N: ...` line reappears in the parser stream on turn N+1. The orchestrator armed a debounce timer for it; each subsequent repaint re-armed (hence the hundreds of `re-arm worker-1 (leaderIdle=busy, msSinceOutput=…ms)` lines in the log). By the time the leader finally fell idle and the debounce fired, `CROSS_TURN_DEDUPE_MS` (120 s, measured from the ORIGINAL commit) had expired — so `commitRoute`'s dedupe missed and the worker got the same task injected again, acknowledging "이전 turn과 동일 요청 — 결과 재전달".
+
+Fix: `route()` now checks dedupe at parse time, before the debounce timer is armed. If the dedupeKey (first line, trim, cap 100) matches a recent `recentPayloads` entry in the same turn or within `CROSS_TURN_DEDUPE_MS`, the route is dropped and any in-flight pending debounce for the same key is cancelled. Symmetric guard added to the `@leader` branch. The commit-time dedupe is retained as a safety net but is now a no-op on the repaint path.
+
+Result: no more re-arm spam, no more stale re-injects after long worker tasks.
+
 ## [0.2.1] - 2026-04-23
 
 ### Teams Orchestration view — buttons
