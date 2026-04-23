@@ -307,6 +307,18 @@ export class PodiumOrchestrator implements vscode.Disposable {
     string,
     { payload: string; timer: ReturnType<typeof setTimeout> }
   >();
+  /**
+   * v0.3.4 · Per-source pending debounce for worker→leader routing. Mirrors
+   * `pendingRoute` but keyed by the SOURCE pane id (the worker that emitted
+   * the @leader: directive). Absorbs the same Ink re-render "short pulse →
+   * longer pulse" pattern on the leader-inject path that the worker-target
+   * route's pendingRoute already handles — without this, every wrap stage
+   * of a single @leader: reply counted as a separate round.
+   */
+  private readonly pendingLeaderInject = new Map<
+    string,
+    { payload: string; timer: ReturnType<typeof setTimeout> }
+  >();
   /** v2.7.19 · Captured cwd for team snapshot export. */
   private attachedCwd: string | null = null;
   /** v2.7.19 · Auto-save hook wired by the command layer (see index.ts). */
@@ -452,6 +464,9 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
     for (const { timer } of this.pendingRoute.values()) clearTimeout(timer);
     this.pendingRoute.clear();
+    // v0.3.4 · also drain the symmetric leader-inject pending map.
+    for (const { timer } of this.pendingLeaderInject.values()) clearTimeout(timer);
+    this.pendingLeaderInject.clear();
     this.recentAdds.clear();
     // v0.3.0: reset per-worker projector state + leader dedupe cache.
     for (const w of this.workers.values()) {
@@ -1015,7 +1030,33 @@ export class PodiumOrchestrator implements vscode.Disposable {
         this.stats.dropped += 1;
         return;
       }
-      this.commitLeaderInject(msg.payload, source);
+      // v0.3.4 · Ink re-render absorber, symmetric with the worker-target
+      // path in the branch below. Without this, each wrap stage of a
+      // single worker @leader: reply counted as a separate round.
+      if (this.dispatchDebounceMs <= 0) {
+        this.commitLeaderInject(msg.payload, source);
+        return;
+      }
+      const existingL = this.pendingLeaderInject.get(source);
+      if (existingL) {
+        clearTimeout(existingL.timer);
+        const newExtendsOld = msg.payload.startsWith(existingL.payload);
+        const oldExtendsNew = existingL.payload.startsWith(msg.payload);
+        if (!newExtendsOld && !oldExtendsNew) {
+          // Different logical messages — flush pending, debounce new.
+          this.commitLeaderInject(existingL.payload, source);
+        }
+        if (oldExtendsNew && !newExtendsOld) {
+          // New is a shrinking prefix — keep the longer pending.
+          const timer = setTimeout(() => {
+            this.pendingLeaderInject.delete(source);
+            this.commitLeaderInject(existingL.payload, source);
+          }, this.dispatchDebounceMs);
+          this.pendingLeaderInject.set(source, { payload: existingL.payload, timer });
+          return;
+        }
+      }
+      this.armLeaderDispatchTimer(source, msg.payload);
       return;
     }
 
@@ -1169,6 +1210,31 @@ export class PodiumOrchestrator implements vscode.Disposable {
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.tryDispatchPending(workerId, payload), this.dispatchDebounceMs);
     this.pendingRoute.set(workerId, { payload, timer });
+  }
+
+  /** v0.3.4 · Mirror of `armDispatchTimer` for worker→leader routing. */
+  private armLeaderDispatchTimer(sourcePaneId: string, payload: string): void {
+    const existing = this.pendingLeaderInject.get(sourcePaneId);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(
+      () => this.tryDispatchPendingLeader(sourcePaneId, payload),
+      this.dispatchDebounceMs,
+    );
+    this.pendingLeaderInject.set(sourcePaneId, { payload, timer });
+  }
+
+  private tryDispatchPendingLeader(sourcePaneId: string, payload: string): void {
+    // Gate on the SOURCE worker's idle state — same rationale as
+    // `tryDispatchPending` gates on leaderIdle. If the source is still
+    // emitting assistant output, an Ink re-wrap of the @leader: line may
+    // land a longer version in the next few hundred ms; re-arm and wait.
+    const source = [...this.workers.values()].find((w) => w.cfg.paneId === sourcePaneId);
+    if (source && !source.idle.isIdle) {
+      this.armLeaderDispatchTimer(sourcePaneId, payload);
+      return;
+    }
+    this.pendingLeaderInject.delete(sourcePaneId);
+    this.commitLeaderInject(payload, sourcePaneId);
   }
 
   /**

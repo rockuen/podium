@@ -65,7 +65,13 @@ const DEFAULT_TEAM_ROLES: { id: string; role: WorkerRole }[] = [
 ];
 
 // v0.3.0 · Shared routing budget for the bidirectional orchestrator.
-const DEFAULT_MAX_ROUNDS = 5;
+// v0.3.4 raised from 5 → 10: field log showed 5 was too tight once the
+// "team summoned" note's handshake (leader ack → worker ready → leader
+// role-check → worker role-confirm) already consumed 4 rounds before the
+// user had a chance to delegate. 10 leaves comfortable headroom for a
+// multi-step task (delegate → critique → revise → test → summarize)
+// without being so large that runaway ping-pong goes unchecked.
+const DEFAULT_MAX_ROUNDS = 10;
 const DEFAULT_AUTO_RESET_ROUND_MS = 30_000;
 import { pickClaudeSession, isClaudeSessionResumable } from './core/sessionPicker';
 import {
@@ -735,19 +741,52 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         }
       });
 
-      // Teach the running leader the protocol. Since the Podium leader
-      // system prompt was NOT applied at spawn time (we can't restart a
-      // live conversation), inject a user-visible note instructing the
-      // model how to route. Fired after a short delay so workers' panels
-      // have rendered and the user sees the note in context.
+      // v0.3.4 · Teach the running leader the protocol.
+      //
+      // We can't restart the leader's Claude process (that would discard
+      // the live conversation), so we submit a one-shot note describing
+      // how routing works. This note has three tricky constraints:
+      //
+      // 1. It must NOT contain the literal `@worker-N:` / `@leader:`
+      //    tokens. The leader echoes the note's wording in its ack, and
+      //    any matching token gets parsed by the orchestrator as a real
+      //    routing directive — see v0.3.3 field log where
+      //    "@worker-1: <task>" from the note text got routed to worker-1
+      //    as garbage, consuming the round budget before the user
+      //    delegated anything.
+      //
+      // 2. It must NOT ask the leader to "acknowledge briefly". Leaders
+      //    oblige with a multi-line reply that the critic worker may
+      //    then also respond to, eating rounds on meta-discussion
+      //    instead of real work.
+      //
+      // 3. It must still explain the routing convention clearly enough
+      //    that the leader emits correctly-formatted directives when
+      //    the user actually delegates.
+      //
+      // The solution: describe the tokens via placeholder surrogates
+      // ("AT-WORKER-N:" uppercase, with a "use lowercase at-sign /
+      // `at` prefix in your real output" nudge). Uppercase doesn't
+      // match the `/@(leader|worker-\d+):/g` parser regex, so it's
+      // safe to appear in the note. Claude understands the mapping.
       setTimeout(() => {
         const protocolNote =
-          '[Podium team summoned] 2 workers are now attached and routable:\n' +
-          '  - worker-1 (implementer) — writes concrete code/patches.\n' +
-          '  - worker-2 (critic) — finds logic flaws, missing edge cases.\n' +
-          'Delegate by emitting a line like `@worker-1: <task>` in your response.\n' +
-          'Workers reply with `@leader: <message>` which I will inject as user input.\n' +
-          `Round budget: ${DEFAULT_MAX_ROUNDS} routed turns per task. Acknowledge briefly, then wait for my next instruction.`;
+          '[Podium] Team ready. Two workers are attached and routable:\n' +
+          '  - worker-1 — implementer role (writes concrete code and patches).\n' +
+          '  - worker-2 — critic role (finds logic flaws, missing edge cases).\n' +
+          '\n' +
+          'When the user asks you to delegate, emit routing directives on\n' +
+          'their own lines, starting in column zero. Format: lowercase at\n' +
+          'sign, the worker id, a colon, a space, then the task text.\n' +
+          'Shown here with uppercase "AT" so this note does not self-route;\n' +
+          'your real output MUST use the lowercase at-sign:\n' +
+          '\n' +
+          '  AT-worker-1: draft the code for X\n' +
+          '  AT-worker-2: review the draft for logic flaws\n' +
+          '\n' +
+          'Workers reply with the same prefix targeting "leader"; those\n' +
+          'replies will appear here as my user input. Do not route anything\n' +
+          `right now — wait for my next instruction. Round budget per task: ${DEFAULT_MAX_ROUNDS}.`;
         try {
           const agent = 'claude' as const;
           const opts = { agent };
