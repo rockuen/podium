@@ -223,12 +223,19 @@ export interface WorkerRuntime {
 const MAX_TRANSCRIPT_CHARS = 50_000;
 
 const DEFAULT_POLL_MS = 250;
-// Claude Code v2.1+ uses an Ink TUI that repaints the alt-screen periodically
-// (every few seconds, driven by its status-row refresh). Each repaint re-emits
-// the same `@worker-N: …` line through the pty, which our line-based parser
-// sees as a fresh token. Within this window we suppress exact duplicates per
-// worker so a single routing directive doesn't spawn a 10-deep queue.
-const DEFAULT_DEDUPE_WINDOW_MS = 30_000;
+// Claude Code v2.1+ uses an Ink TUI that repaints the alt-screen periodically,
+// and crucially it can re-emit the ENTIRE visible scrollback on a full
+// refresh (scroll, resize, next-turn replay). Each repaint surfaces every
+// earlier `@worker-N: ...` directive from prior turns as a "fresh" parser
+// token. Within this window we suppress exact duplicates per worker.
+//
+// v0.3.9 bumped from 30_000 → 1_800_000 (30 min). Field log showed the
+// previous 30s window cleared between user turns, so on each new prompt
+// the leader's scrollback replay re-injected the PREVIOUS turn's tasks
+// back into the workers. 30 minutes covers realistic scrollback retention
+// in typical multi-turn sessions without blocking the user from explicitly
+// re-asking the same task after a long pause.
+const DEFAULT_DEDUPE_WINDOW_MS = 1_800_000;
 
 // v2.7.13: macrotask gap between writing the body and the Win32 Enter
 // KEY_EVENT for Claude/Windows worker injects. Empirically 25 ms is enough
