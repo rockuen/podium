@@ -88,7 +88,7 @@ const END_RE = /@end\b/;
 // Filter payloads at yield-time so the orchestrator never sees them.
 // Conservative by design: only drop payloads that are OBVIOUSLY template or
 // placeholder content — never a legitimate user task.
-const PLACEHOLDER_PAYLOAD_RE = /^[\s…./\-*·]+$/;
+const PLACEHOLDER_PAYLOAD_RE = /^[\s…./\-*·●•]+$/;
 const PROTOCOL_META_RE = /컬럼\s*0\s*에서\s*시작|라운드\s*예산|작업당\s*\d+\s*회|Effort\s*[::]|<task for\b/;
 
 function isProtocolNoise(payload: string): boolean {

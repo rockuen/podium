@@ -506,7 +506,7 @@ test('addWorker v2.7.25: id recycle after remove yields a FRESH runtime (no resi
 
   // Seed queue + recentPayloads + pendingRoute on the first incarnation.
   firstIncarnation.queue.push('stale-queued');
-  firstIncarnation.recentPayloads.set('stale-recent', 1500);
+  firstIncarnation.recentPayloads.set('stale-recent', { turnId: 0, ts: 1500 });
   const staleTimer = setTimeout(() => {}, 10_000);
   (orch as any).pendingRoute.set('worker-3', { payload: 'stale-pending', timer: staleTimer });
 

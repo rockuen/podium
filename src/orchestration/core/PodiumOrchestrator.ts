@@ -202,8 +202,23 @@ export interface WorkerRuntime {
   cfg: WorkerConfig;
   idle: IdleDetector;
   queue: string[];
-  /** payload → last-seen ms timestamp. Used to suppress redraw duplicates. */
-  recentPayloads: Map<string, number>;
+  /**
+   * payload-key → { turnId, ts } used for dedupe.
+   *
+   * v0.5.0 (strategy "B"): entries carry the leader turnId at which the
+   * route was first committed. commitRoute drops incoming payloads whose
+   * key was already routed IN THE SAME TURN, regardless of how many
+   * times Ink repaints the scrollback. Different-turn reuses of the same
+   * key are allowed through (the turnId changed → legitimate new
+   * delegation of the same task in a later user prompt).
+   *
+   * v0.4.2 (strategy "A") still applies at key level (dedupeKey() returns
+   * the normalized first line, capped at 100 chars). B is the stronger
+   * dominant filter; A remains as a safety net against minor boundary
+   * wobbles inside the same turn that nonetheless produce slightly
+   * different raw payload strings.
+   */
+  recentPayloads: Map<string, { turnId: number; ts: number }>;
   /** Accumulated stripped output. Tail is kept when the buffer exceeds cap. */
   transcript: string;
   /**
@@ -304,6 +319,18 @@ export class PodiumOrchestrator implements vscode.Disposable {
   // surfaced instead of rotting in the buffer.
   private leaderIdle: IdleDetector | null = null;
   private leaderWasIdle = false;
+  /**
+   * v0.5.0 — Turn counter for strategy B dedupe.
+   *
+   * Bumped each time the leader transitions from idle → busy (which in
+   * practice means "user just sent a prompt and leader started emitting
+   * its response"). commitRoute / commitLeaderInject stamp their
+   * recentPayloads entries with the current turnId and drop any repeat
+   * route whose stamp matches the same turnId. Different turnId → new
+   * delegation, allowed. This is immune to Ink repaint boundary wobble
+   * that slipped past the older A+C strategies.
+   */
+  private leaderTurnId = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private stats = { routed: 0, injected: 0, queued: 0, dropped: 0, deduped: 0, flushed: 0, dissolved: 0 };
   private nowFn: () => number = Date.now;
@@ -363,12 +390,18 @@ export class PodiumOrchestrator implements vscode.Disposable {
   /** Prevents the cap-reached notice from firing every subsequent dropped route. */
   private roundCapNotifyFired = false;
   /**
+   * v0.5.0 — Track whether routing was paused *because* of the round cap
+   * (vs a manual pause()/resume() by the user). Only the round-cap pause
+   * is auto-cleared by `resetRound()`; user-requested pauses stay put.
+   */
+  private routingPausedByRoundCap = false;
+  /**
    * Payload → last-seen ms for directives aimed at the LEADER. Mirrors
    * `WorkerRuntime.recentPayloads` but for the leader target (which has no
    * WorkerRuntime of its own). Keeps Claude's Ink redraw duplicates from
    * re-injecting the same reply N times into the leader stdin.
    */
-  private readonly leaderRecentPayloads = new Map<string, number>();
+  private readonly leaderRecentPayloads = new Map<string, { turnId: number; ts: number }>();
 
   constructor(
     private readonly panel: OrchestratorPanel,
@@ -397,6 +430,11 @@ export class PodiumOrchestrator implements vscode.Disposable {
     this.roundCapNotifyFired = false;
     this.lastRouteAt = 0;
     this.routingPaused = false;
+    this.routingPausedByRoundCap = false;
+    // v0.5.0 — Fresh attach starts at turnId=0. The first idle→busy edge
+    // in onPaneData will bump it to 1 when the leader starts its first
+    // response, which is when we actually want same-turn dedupe to apply.
+    this.leaderTurnId = 0;
     this.leaderRecentPayloads.clear();
     // v2.7.28: arm the restore grace window if caller requested one.
     if (opts.restoreGraceMs && opts.restoreGraceMs > 0) {
@@ -684,6 +722,9 @@ export class PodiumOrchestrator implements vscode.Disposable {
   resume(): void {
     if (!this.routingPaused) return;
     this.routingPaused = false;
+    // v0.5.0 — User-initiated resume clears the round-cap pause marker
+    // too (single source of truth: after resume, routing is live).
+    this.routingPausedByRoundCap = false;
     this.output.appendLine('[orch] routing resumed');
   }
 
@@ -701,6 +742,13 @@ export class PodiumOrchestrator implements vscode.Disposable {
     const prior = this.currentRound;
     this.currentRound = 0;
     this.roundCapNotifyFired = false;
+    // v0.5.0 — If routing was paused solely because of the round cap,
+    // clear that pause on reset. User-invoked pauses stay in effect.
+    if (this.routingPausedByRoundCap) {
+      this.routingPaused = false;
+      this.routingPausedByRoundCap = false;
+      this.output.appendLine(`[orch] routing auto-resumed (round cap cleared)`);
+    }
     this.output.appendLine(`[orch] round reset (was ${prior})`);
   }
 
@@ -782,6 +830,19 @@ export class PodiumOrchestrator implements vscode.Disposable {
   private onPaneData(paneId: string, rawData: string): void {
     if (this.leader && paneId === this.leader.paneId) {
       this.leaderIdle?.feed(rawData);
+      // v0.5.0 — Turn boundary detection (strategy B)
+      // ----------------------------------------------
+      // If the leader was idle before this chunk arrived, we just crossed
+      // an idle → busy edge. That almost always means the user sent a
+      // new prompt and the leader is starting to respond. Bump the turn
+      // id so same-turn dedupe entries do NOT mask legitimate re-delegations
+      // that a later turn might issue.
+      if (this.leaderWasIdle) {
+        this.leaderTurnId += 1;
+        this.output.appendLine(
+          `[orch.turn] leader turnId advanced to ${this.leaderTurnId} (idle→busy edge)`,
+        );
+      }
       this.leaderWasIdle = false; // incoming data — leader is active
       this.consumeLeaderOutput(rawData);
       return;
@@ -1023,10 +1084,13 @@ export class PodiumOrchestrator implements vscode.Disposable {
       );
       // Seed the target's dedupe cache so post-grace Ink redraws don't re-route.
       if (msg.workerId === 'leader') {
-        this.leaderRecentPayloads.set(msg.payload, this.nowFn());
+        this.leaderRecentPayloads.set(msg.payload, {
+          turnId: this.leaderTurnId,
+          ts: this.nowFn(),
+        });
       } else {
         const w = this.workers.get(msg.workerId);
-        if (w) w.recentPayloads.set(msg.payload, this.nowFn());
+        if (w) w.recentPayloads.set(msg.payload, { turnId: this.leaderTurnId, ts: this.nowFn() });
       }
       return;
     }
@@ -1156,12 +1220,23 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
     const nowMs = this.nowFn();
     this.pruneLeaderRecent(nowMs);
-    if (this.leaderRecentPayloads.has(payload)) {
+    // v0.5.0 · (A+B) Normalized key + turn-based dedupe also on the
+    // worker→leader direction. Ghost repaints from worker panes re-emitting
+    // a prior turn's `@leader: banana` directive must NOT make it back to
+    // the leader stdin a second time — field logs showed worker-2 yielding
+    // ["leader=banana", "leader=25"] multiple times per tick after it had
+    // already moved on to a new task.
+    const key = this.dedupeKey(payload);
+    const lastSeen = this.leaderRecentPayloads.get(key);
+    if (lastSeen !== undefined && lastSeen.turnId === this.leaderTurnId) {
       this.stats.deduped += 1;
+      this.output.appendLine(
+        `[orch.commit] leader (from ${sourcePaneId}) deduped (same turn=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+      );
       return;
     }
     if (this.enforceRoundCap(`leader (from ${sourcePaneId})`, payload)) return;
-    this.leaderRecentPayloads.set(payload, nowMs);
+    this.leaderRecentPayloads.set(key, { turnId: this.leaderTurnId, ts: nowMs });
     this.currentRound += 1;
     this.lastRouteAt = nowMs;
     const agent = this.leader.agent;
@@ -1193,8 +1268,8 @@ export class PodiumOrchestrator implements vscode.Disposable {
   }
 
   private pruneLeaderRecent(nowMs: number): void {
-    for (const [payload, t] of this.leaderRecentPayloads) {
-      if (nowMs - t >= this.dedupeWindowMs) this.leaderRecentPayloads.delete(payload);
+    for (const [payload, entry] of this.leaderRecentPayloads) {
+      if (nowMs - entry.ts >= this.dedupeWindowMs) this.leaderRecentPayloads.delete(payload);
     }
   }
 
@@ -1212,6 +1287,15 @@ export class PodiumOrchestrator implements vscode.Disposable {
     );
     if (!this.roundCapNotifyFired) {
       this.roundCapNotifyFired = true;
+      // v0.5.0 — When the round cap is first hit, flip the routing pause
+      // switch. The existing notify already tells the leader to stop
+      // delegating, but the leader often keeps trying for a few more
+      // turns (the model doesn't parse "paused" as a hard stop). Flipping
+      // `routingPaused` converts those continued attempts into cheap
+      // `[orch.paused]` drops instead of letting them re-enter the dedupe
+      // / debounce path. `resetRound()` re-enables routing.
+      this.routingPaused = true;
+      this.routingPausedByRoundCap = true;
       this.scheduleLeaderNotify(
         `round cap reached (${this.maxRoundsPerTask}). Further worker routing is paused — summarize what you have and reply to the user, or ask to reset.`,
       );
@@ -1309,10 +1393,16 @@ export class PodiumOrchestrator implements vscode.Disposable {
     this.pruneRecent(w, nowMs);
     const key = this.dedupeKey(payload);
     const lastSeen = w.recentPayloads.get(key);
-    if (lastSeen !== undefined) {
+    // v0.5.0 · (B) Turn-based dedupe
+    // -------------------------------
+    // Same-turn repeat → drop. Different turn reusing the same key is
+    // allowed through so a later user prompt can legitimately re-delegate
+    // the same task text (e.g. "retry the failing test") without being
+    // silently suppressed. A+C still apply at the key level.
+    if (lastSeen !== undefined && lastSeen.turnId === this.leaderTurnId) {
       this.stats.deduped += 1;
       this.output.appendLine(
-        `[orch.commit] ${w.cfg.id} deduped (already routed within ${this.dedupeWindowMs}ms)`,
+        `[orch.commit] ${w.cfg.id} deduped (same turn=${this.leaderTurnId}, key="${preview(key, 40)}")`,
       );
       return;
     }
@@ -1320,7 +1410,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // commit don't exhaust the budget. Once the cap is hit the route is
     // dropped and a single notice fires (see enforceRoundCap).
     if (this.enforceRoundCap(w.cfg.id, payload)) return;
-    w.recentPayloads.set(key, nowMs);
+    w.recentPayloads.set(key, { turnId: this.leaderTurnId, ts: nowMs });
     this.currentRound += 1;
     this.lastRouteAt = nowMs;
 
@@ -1336,8 +1426,8 @@ export class PodiumOrchestrator implements vscode.Disposable {
   }
 
   private pruneRecent(w: WorkerRuntime, nowMs: number): void {
-    for (const [payload, t] of w.recentPayloads) {
-      if (nowMs - t >= this.dedupeWindowMs) w.recentPayloads.delete(payload);
+    for (const [payload, entry] of w.recentPayloads) {
+      if (nowMs - entry.ts >= this.dedupeWindowMs) w.recentPayloads.delete(payload);
     }
   }
 

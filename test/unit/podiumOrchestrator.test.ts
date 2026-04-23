@@ -371,3 +371,107 @@ test('orch: dedup suppresses redraw repeats within the window', () => {
 
   orch.dispose();
 });
+
+test('orch v0.5.0 (B): same-turn dedupe uses the new "same turn=" log format', () => {
+  // The commit log for a dedupe hit now includes the turnId so field
+  // debugging can distinguish same-turn suppression (correct) from
+  // cross-turn leakage (wrong). Verify the format change is wired.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: run task X\n' });
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: run task X\n' });
+
+  assert.equal(ctl.writes.length, 1);
+  assert.equal(orch.snapshot.stats.deduped, 1);
+  const sameTurnLogs = out.log.filter((l) => l.includes('same turn='));
+  assert.ok(
+    sameTurnLogs.length >= 1,
+    `expected at least one "same turn=" log, got logs: ${out.log.filter((l) => l.includes('[orch.commit]')).join(' | ')}`,
+  );
+
+  orch.dispose();
+});
+
+test('orch v0.5.0 (P4): round cap flips routingPaused so continued attempts are cheap drops', () => {
+  // Pre-v0.5.0, enforceRoundCap logged a notice but left routingPaused
+  // alone — the leader often kept trying for several more turns and each
+  // attempt re-entered the dedupe/debounce path. v0.5.0 flips the pause
+  // flag on cap, converting continued attempts into single-line
+  // `[orch.paused]` drops.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    maxRoundsPerTask: 2,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // Three distinct directives; the cap is 2, so the third should trip it
+  // and flip routingPaused.
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: task A\n' });
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: task B\n' });
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: task C\n' });
+
+  assert.equal(
+    orch.isPaused,
+    true,
+    'routingPaused should flip true once round cap is hit',
+  );
+  // resetRound should auto-resume since the pause came from the round cap.
+  orch.resetRound();
+  assert.equal(
+    orch.isPaused,
+    false,
+    'resetRound should clear a round-cap-induced pause',
+  );
+
+  orch.dispose();
+});
+
+test('orch v0.5.0 (P4): manual pause survives resetRound (only round-cap pauses auto-clear)', () => {
+  // If the user explicitly pauses routing, a subsequent resetRound must
+  // NOT silently resume. Only the round-cap-induced pause is auto-cleared.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    maxRoundsPerTask: 5,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // User pauses manually.
+  orch.pause();
+  assert.equal(orch.isPaused, true);
+
+  // resetRound fires — must NOT clear the manual pause.
+  orch.resetRound();
+  assert.equal(orch.isPaused, true, 'manual pause must survive resetRound');
+
+  orch.dispose();
+});

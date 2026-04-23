@@ -410,3 +410,31 @@ test('router v0.4.2: non-terminated first line still folds continuation (v2.7.15
     '"red, blue, green" 세 단어를 한글로 번역해줘. 각 단어당 한 줄씩 적어줘',
   );
 });
+
+// ─── v0.5.0 · bullet-only payload drop ───
+
+test('router v0.5.0 (P3): `●` bullet-only payload is dropped', () => {
+  // Field log showed `worker-1 yielded 1 directive(s): leader=●` — the
+  // assistant bullet character slipped through as payload when Ink's
+  // alt-screen emitted an isolated `● ` row right after `@leader:` on
+  // the previous line. The bullet carries no content and should not
+  // route back to the leader.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@leader: ●\n');
+  assert.equal(msgs.length, 0, '`●` alone must not route');
+});
+
+test('router v0.5.0 (P3): `• ` bullet variant is also dropped', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: •\n');
+  assert.equal(msgs.length, 0);
+});
+
+test('router v0.5.0 (P3): bullet prefix with real content still routes (negative control)', () => {
+  // The bullet-strip at the front of `normalize()` should still allow a
+  // real payload that was typographically prefixed with a bullet to route.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: ● real task body\n');
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload, 'real task body');
+});
