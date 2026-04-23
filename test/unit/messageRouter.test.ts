@@ -278,6 +278,42 @@ test('projector v0.3.6: bare @leader: line from worker re-enters assistant block
   assert.ok(msgs[0].payload.startsWith('구현 완료'));
 });
 
+test('projector v0.7.2: indented @worker-N: directive re-enters closed assistant block', () => {
+  // Field regression from v0.7.1: leader emits a delegation whose "@worker-2:"
+  // line is INDENTED (Ink wraps it under a preceding bullet, but a 'other'
+  // diagnostic narration line has meanwhile closed the assistant block).
+  // Pre-v0.7.2 the indented "@worker-2:" matched only CLAUDE_ASSISTANT_CONT_RE,
+  // which drops when the block is closed — so the whole delegation was
+  // suppressed and worker-2 was never routed to. v0.7.2 relaxes the bare-
+  // directive classifier to allow leading whitespace, so any "@target:"
+  // line anywhere in the stream re-opens the block and reaches the parser.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '● 중간에 진단 문장을 넣었다.\n' +
+    '이건 other 라인이라 assistant 블록을 닫는다.\n' + // 'other' → closes block
+    '    @worker-2: worker-1의 reverseString 초안을 리뷰해줘.\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 1, 'indented @worker-2: directive must route');
+  assert.equal(msgs[0].workerId, 'worker-2');
+  assert.match(msgs[0].payload, /리뷰해줘/);
+});
+
+test('projector v0.7.2: prompt echo still dropped after bare-directive relaxation', () => {
+  // Negative control: prompt echo lines carry a `>` prefix, not a
+  // whitespace-plus-@ prefix, so the relaxed regex does not match them.
+  // Falls through to CLAUDE_PROMPT_RE which drops as before.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '>   @worker-1: I typed this as input, echo only.\n' +
+    '────────────\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 0, 'indented prompt echo must not route');
+});
+
 test('projector v0.3.6: prompt echo with bare @worker- still dropped', () => {
   // Prompt echo ALWAYS carries a `>` prefix, so bare @worker-N at column 0
   // can never be a pasted echo. The new bare-directive classifier must not

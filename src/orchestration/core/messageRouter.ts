@@ -101,16 +101,27 @@ function isProtocolNoise(payload: string): boolean {
 }
 const CLAUDE_ASSISTANT_START_RE = /^\s*●(?:\s+|(?=@(?:worker-|leader:)))/;
 const CLAUDE_ASSISTANT_CONT_RE = /^(?:\s{2,}\S|@(?:worker-\d+|leader):|@end\b)/;
-// v0.3.6 · Bare routing directive at column 0 (no leading `●` bullet, no
-// indent). Claude's assistant output sometimes drops into a new paragraph
-// after a blank line, which classifies as 'other' and kicks the projector
-// out of its assistant block; a subsequent `@worker-N:` / `@leader:`
-// directive on its own line then gets suppressed. Treating such lines as
-// assistant-start lets them both re-enter the block and make it to the
-// WorkerPatternParser. Safe against prompt echo because prompt echoes
-// always carry a `>` or `│ >` prefix (see CLAUDE_PROMPT_RE), so they
-// never match a bare `@target:` start.
-const CLAUDE_BARE_DIRECTIVE_RE = /^@(?:worker-\d+|leader):/;
+// v0.3.6 / v0.7.2 · Bare or indented routing directive. Classify as
+// assistant-start so the projector re-enters the assistant block whenever
+// a `@worker-N:` / `@leader:` directive appears, regardless of leading
+// whitespace.
+//
+// Why the relaxed (v0.7.2) match
+// ------------------------------
+// v0.3.6 required column 0 (no leading whitespace). Field logs of the
+// v0.7.1 reverseString task chain showed Claude leaders frequently emit
+// their delegation lines INDENTED (as part of an Ink-wrapped continuation
+// of a preceding bullet paragraph that the projector has meanwhile closed
+// because a 'other' line — diagnostic narration, status repaint — kicked
+// it out). The subsequent `    @worker-2: ...` line then matched only
+// CLAUDE_ASSISTANT_CONT_RE, which drops when the block is closed. Result:
+// the entire `@worker-2: ...` directive (and its body continuation rows)
+// got suppressed, worker-2 was never routed to, and the leader filled
+// the gap by hallucinating a reply.
+//
+// Safe against prompt echo: echoes always carry a `>` or `│ >` prefix
+// (see CLAUDE_PROMPT_RE), which matches before this check.
+const CLAUDE_BARE_DIRECTIVE_RE = /^[ \t]*@(?:worker-\d+|leader):/;
 const CLAUDE_PROMPT_RE = /^(?:>\s.*|>\s*$|│\s*>\s*.*)$/;
 const CLAUDE_STATUS_RE = /^(?:\[OMC#[\d.]+\].*|⏵⏵\s+bypass permissions.*)$/;
 const CLAUDE_CHROME_RE = /^[\s─━│┃╭╮╰╯┌┐└┘┏┓┗┛]+$/;
@@ -123,6 +134,27 @@ const CLAUDE_CHROME_RE = /^[\s─━│┃╭╮╰╯┌┐└┘┏┓┗┛]+
  */
 export class ClaudeLeaderRoutingProjector {
   private inAssistantBlock = false;
+  /**
+   * v0.7.2 — Last non-blank line classification. Used to disambiguate an
+   * indented `@worker-N:` / `@leader:` line: at column 1+ the pattern
+   * looks identical in two very different contexts:
+   *
+   *   (a) An assistant-emitted delegation whose directive got Ink-
+   *       indented under a preceding bullet — legitimate routing; we
+   *       want to re-open the assistant block.
+   *   (b) The 2nd+ line of a multi-worker PROMPT ECHO. The user's
+   *       original input rendered as:
+   *         > @worker-1: ...
+   *           @worker-2: ...   ← indented, no `>` prefix
+   *       The second line looks like (a) by regex alone, but is in fact
+   *       pure echo and must stay dropped.
+   *
+   * We distinguish them by the most-recent non-blank classification:
+   * after a `prompt` line, any subsequent indented directive is still
+   * prompt-echo territory until we see something clearly not-prompt
+   * (assistant-start, chrome, status, or other).
+   */
+  private lastKind: 'prompt' | 'chrome' | 'status' | 'assistant-start' | 'assistant-cont' | 'other' | null = null;
   /**
    * Partial line held between `feed()` calls. v2.7.14 fix for worker-2 drop:
    *
@@ -179,11 +211,31 @@ export class ClaudeLeaderRoutingProjector {
   }
 
   private processLine(line: string, newline: string): string {
-    const kind = classifyClaudeLine(line);
+    let kind = classifyClaudeLine(line);
+    // v0.7.2 — Prompt-echo continuation guard. A bare directive that was
+    // only matched because of the v0.7.2-relaxed indent allowance must be
+    // re-demoted to `prompt` when we're in a pure-echo context: previous
+    // non-blank line was a prompt AND no assistant block is currently
+    // open. Inside an already-open assistant block (e.g. v2.7.30 repaint
+    // scenario where `●` opened the block, narration continues, then Ink
+    // sneaks a `> @worker-1:` repaint of the input box between narration
+    // and a legitimate `  @worker-1:` directive), the indented directive
+    // IS the assistant's real output and must re-assert as assistant-start
+    // so the token reaches the parser.
+    if (
+      kind === 'assistant-start' &&
+      this.lastKind === 'prompt' &&
+      !this.inAssistantBlock &&
+      /^[ \t]+@(?:worker-\d+|leader):/.test(line)
+    ) {
+      kind = 'prompt';
+    }
     if (kind === 'assistant-start') {
       this.inAssistantBlock = true;
+      this.lastKind = kind;
       return line + newline;
     }
+    if (kind !== 'blank') this.lastKind = kind;
     if (!this.inAssistantBlock) return '';
     if (kind === 'assistant-cont' || kind === 'blank') {
       return line + newline;
@@ -211,6 +263,7 @@ export class ClaudeLeaderRoutingProjector {
 
   reset(): void {
     this.inAssistantBlock = false;
+    this.lastKind = null;
     this.partial = '';
   }
 }
