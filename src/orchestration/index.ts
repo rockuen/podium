@@ -634,15 +634,28 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       leaderEntry.podiumRole = 'leader';
 
       // Require the legacy createPanel via runtime resolution — it's a JS
-      // module and we don't want a hard TS dependency on the file shape.
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const { createPanel } = require('../panel/createPanel') as {
-        createPanel: (
-          ctx: vscode.ExtensionContext,
-          extensionPath: string,
-          session: Record<string, unknown> | null,
-        ) => { tabId: number; entry: LegacyPanelEntry } | undefined;
-      };
+      // module TypeScript doesn't compile (allowJs=false) so it stays in
+      // src/. From `out/orchestration/index.js` (this file's compiled
+      // location) the correct relative path is `../../src/panel/createPanel`.
+      // We wrap in try/catch so a missing module fails loudly instead of
+      // silently aborting Summon Team with zero user-visible feedback.
+      type CreatePanelFn = (
+        ctx: vscode.ExtensionContext,
+        extensionPath: string,
+        session: Record<string, unknown> | null,
+      ) => { tabId: number; entry: LegacyPanelEntry } | undefined;
+      let createPanel: CreatePanelFn;
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        createPanel = require('../../src/panel/createPanel').createPanel as CreatePanelFn;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        output.appendLine(`[orch.summonTeam] FAILED to load createPanel — ${msg}`);
+        vscode.window.showErrorMessage(
+          `Podium: internal error loading chat panel factory — ${msg}`,
+        );
+        return;
+      }
 
       // Factory the bridge uses for dynamic addPane (runtime `addWorker`
       // requests from the orchestrator). Always opens Beside so new
@@ -661,51 +674,74 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       };
 
       const bridge = new LegacyPanelBridge('leader', leaderEntry, spawnPane, output);
+      output.appendLine('[orch.summonTeam] bridge created, leader attached');
 
       // Spawn worker-1 (implementer). ViewColumn.Beside targets whichever
       // column is currently active; the legacy leader webview is active at
       // click time, so worker-1 lands to its right.
       const worker1Sid = randomUUID();
-      const worker1 = createPanel(ctx, ctx.extensionPath, {
-        sessionId: worker1Sid,
-        cwd,
-        title: 'worker-1 (implementer)',
-        viewColumn: vscode.ViewColumn.Beside,
-        extraArgs: buildWorkerExtraArgs({
-          workerId: 'worker-1',
-          role: 'implementer',
-          peers: [{ id: 'worker-2', role: 'critic' }],
-        }),
-        podiumPaneId: 'worker-1',
-        podiumRole: 'implementer',
-      });
+      output.appendLine(`[orch.summonTeam] spawning worker-1 (implementer) sid=${worker1Sid.slice(0, 8)}`);
+      let worker1: { tabId: number; entry: LegacyPanelEntry } | undefined;
+      try {
+        worker1 = createPanel(ctx, ctx.extensionPath, {
+          sessionId: worker1Sid,
+          cwd,
+          title: 'worker-1 (implementer)',
+          viewColumn: vscode.ViewColumn.Beside,
+          extraArgs: buildWorkerExtraArgs({
+            workerId: 'worker-1',
+            role: 'implementer',
+            peers: [{ id: 'worker-2', role: 'critic' }],
+          }),
+          podiumPaneId: 'worker-1',
+          podiumRole: 'implementer',
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        output.appendLine(`[orch.summonTeam] worker-1 spawn THREW — ${msg}`);
+        vscode.window.showErrorMessage(`Podium: worker-1 spawn threw — ${msg}`);
+        return;
+      }
       if (!worker1) {
+        output.appendLine('[orch.summonTeam] worker-1 spawn returned falsy');
         vscode.window.showErrorMessage('Podium: worker-1 spawn failed (see Output → Podium - Orchestration).');
         return;
       }
       bridge.attachEntry('worker-1', worker1.entry);
+      output.appendLine('[orch.summonTeam] worker-1 attached to bridge');
 
       // worker-2 goes in the same column as worker-1 (stacked as a tab).
       // `ViewColumn.Active` after worker-1 spawned is that same column.
       const worker2Sid = randomUUID();
-      const worker2 = createPanel(ctx, ctx.extensionPath, {
-        sessionId: worker2Sid,
-        cwd,
-        title: 'worker-2 (critic)',
-        viewColumn: vscode.ViewColumn.Active,
-        extraArgs: buildWorkerExtraArgs({
-          workerId: 'worker-2',
-          role: 'critic',
-          peers: [{ id: 'worker-1', role: 'implementer' }],
-        }),
-        podiumPaneId: 'worker-2',
-        podiumRole: 'critic',
-      });
+      output.appendLine(`[orch.summonTeam] spawning worker-2 (critic) sid=${worker2Sid.slice(0, 8)}`);
+      let worker2: { tabId: number; entry: LegacyPanelEntry } | undefined;
+      try {
+        worker2 = createPanel(ctx, ctx.extensionPath, {
+          sessionId: worker2Sid,
+          cwd,
+          title: 'worker-2 (critic)',
+          viewColumn: vscode.ViewColumn.Active,
+          extraArgs: buildWorkerExtraArgs({
+            workerId: 'worker-2',
+            role: 'critic',
+            peers: [{ id: 'worker-1', role: 'implementer' }],
+          }),
+          podiumPaneId: 'worker-2',
+          podiumRole: 'critic',
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        output.appendLine(`[orch.summonTeam] worker-2 spawn THREW — ${msg}`);
+        vscode.window.showErrorMessage(`Podium: worker-2 spawn threw — ${msg}`);
+        return;
+      }
       if (!worker2) {
+        output.appendLine('[orch.summonTeam] worker-2 spawn returned falsy');
         vscode.window.showErrorMessage('Podium: worker-2 spawn failed.');
         return;
       }
       bridge.attachEntry('worker-2', worker2.entry);
+      output.appendLine('[orch.summonTeam] worker-2 attached to bridge — team ready');
 
       const orch = new PodiumOrchestrator(bridge, output);
       orch.attach({
