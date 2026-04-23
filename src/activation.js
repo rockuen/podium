@@ -314,10 +314,16 @@ function activate(context) {
   }
 
   // ─── Orchestration status bar entry point (M1, toggle wrapper in M3) ───
-  state.podiumModeActive = false;
+  // v0.4.2 — Podium Mode is the default on activation. The user asked for
+  // the sidebar to boot straight into Podium so the team views (workers,
+  // live teams, snapshots) are visible without a manual toggle click.
+  // The status bar starts with the "Podium Mode" label and we fire
+  // `podium.enter` once after the orchestration module finishes activating
+  // so its context key flip happens after command registration.
+  state.podiumModeActive = true;
   state.orchStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
-  state.orchStatusBar.text = '$(organization) Orchestration';
-  state.orchStatusBar.tooltip = 'Claude: Enter Podium Mode';
+  state.orchStatusBar.text = '$(organization) Podium Mode';
+  state.orchStatusBar.tooltip = 'Claude: Exit Podium Mode';
   state.orchStatusBar.command = 'claudeCodeLauncher.podium.toggle';
   state.orchStatusBar.show();
   context.subscriptions.push(state.orchStatusBar);
@@ -351,6 +357,15 @@ function activate(context) {
         context.subscriptions.push({
           dispose: () => { try { orch.dispose(); } catch (_) { /* ignore */ } }
         });
+        // v0.4.2 — Auto-enter Podium Mode now that orchestration commands
+        // are registered. The status-bar label was already initialized to
+        // the active state above; this just flips the context key so the
+        // conditional Podium views show up in the sidebar immediately.
+        vscode.commands
+          .executeCommand('claudeCodeLauncher.podium.enter')
+          .then(undefined, (err) => {
+            console.warn('[orchestration] auto-enter podium failed:', err?.message || err);
+          });
       })
       .catch((e) => {
         console.warn('[orchestration] activation failed:', e?.message || e);

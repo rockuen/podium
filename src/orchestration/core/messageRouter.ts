@@ -356,7 +356,27 @@ export class WorkerPatternParser {
       const startsWithTarget = /^[ \t]*@(?:worker-\d+|leader):/.test(peek);
       const startsWithEnd = /^[ \t]*@end\b/.test(peek);
       const isBlank = peek.length === 0 || /^[ \t]*(?:\r?\n|\r|$)/.test(peek);
-      const isContinuation = isIndented && !startsWithTarget && !startsWithEnd && !isBlank;
+      // v0.4.2 · (C) Terminal-punctuation guard
+      // ---------------------------------------
+      // If the payload up to this newline already ends with sentence-terminal
+      // punctuation (period, question, exclamation, including CJK variants,
+      // optionally followed by a close quote/paren), the directive is clearly
+      // a complete thought. A 2-space-indented follow-up that Ink wraps onto
+      // the next visual row after a terminated sentence is almost always a
+      // separate assistant paragraph (e.g. "두 워커의 응답을 기다리겠습니다."
+      // tacked after "@worker-2: "banana"이라고만 답하세요."), not a logical
+      // continuation of the directive. Do NOT fold across terminal punctuation.
+      // Multi-line directives that legitimately span sentences can still use
+      // the explicit `@end` sentinel form documented at the top of this file.
+      const payloadSoFar = this.buffer.slice(from, chosen.payloadEnd);
+      const endsWithTerminalPunctuation =
+        /[.!?。！？](?:["'"'')）\]]+)?\s*$/.test(payloadSoFar);
+      const isContinuation =
+        isIndented &&
+        !startsWithTarget &&
+        !startsWithEnd &&
+        !isBlank &&
+        !endsWithTerminalPunctuation;
 
       if (!isContinuation) {
         return { payloadEndPos: chosen.payloadEnd, advanceTo: chosen.advance };

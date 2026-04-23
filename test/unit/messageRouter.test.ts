@@ -347,3 +347,66 @@ test('router v0.4.0: multi-directive chunk drops template, keeps real task', () 
   assert.equal(msgs[1].workerId, 'worker-2');
   assert.match(msgs[1].payload, /banana/);
 });
+
+// ─── v0.4.2 · strategy C — terminal-punctuation guard ───
+
+test('router v0.4.2: period-terminated directive does not fold Ink follow-up narration', () => {
+  // Field reproduction: leader emitted
+  //   @worker-2: "banana"라고만 답하세요. 다른 말은 일절 하지 마세요.
+  //     두 워커의 응답을 기다리겠습니다.
+  // Pre-v0.4.2, the 2-space indented next line was folded into worker-2's
+  // payload, so the dedupe key mutated between the original emission and
+  // the Ink-repaint replay (which dropped the narration tail). v0.4.2
+  // refuses to fold across sentence-terminal punctuation.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-2: "banana"라고만 답하세요. 다른 말은 일절 하지 마세요.\n' +
+    '  두 워커의 응답을 기다리겠습니다.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].workerId, 'worker-2');
+  assert.equal(
+    msgs[0].payload,
+    '"banana"라고만 답하세요. 다른 말은 일절 하지 마세요.',
+    'narration tail must NOT be folded into the directive payload',
+  );
+});
+
+test('router v0.4.2: question/exclamation terminators also block folding', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: 왜 이 코드가 느릴까요?\n' +
+    '  다음 지시를 기다립니다.\n' +
+    '@worker-2: 속도를 개선하세요!\n' +
+    '  그리고 벤치마크를 포함해주세요.\n',
+  );
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0].payload, '왜 이 코드가 느릴까요?');
+  assert.equal(msgs[1].payload, '속도를 개선하세요!');
+});
+
+test('router v0.4.2: CJK full-width terminators (。！？) also block folding', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: 설명해주세요。\n' +
+    '  추가 문장.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload, '설명해주세요。');
+});
+
+test('router v0.4.2: non-terminated first line still folds continuation (v2.7.15 compat)', () => {
+  // Negative control: the pre-existing v2.7.15 behavior (folding legitimate
+  // Ink-wrapped continuation rows of a single logical sentence) must be
+  // preserved when the first visual row does NOT end in terminal punctuation.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: "red, blue, green" 세 단어를 한글로 번역해줘. 각\n' +
+    '  단어당 한 줄씩 적어줘\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(
+    msgs[0].payload,
+    '"red, blue, green" 세 단어를 한글로 번역해줘. 각 단어당 한 줄씩 적어줘',
+  );
+});

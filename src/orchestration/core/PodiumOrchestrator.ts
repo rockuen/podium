@@ -1293,9 +1293,22 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // Redraw dedupe: Claude's Ink UI repaints the same line on every status
     // tick. Suppress any payload we've seen for this worker within the dedupe
     // window. First hit logs as dedup-suppressed; silent for subsequent hits.
+    //
+    // v0.4.2 · (A) Key normalization
+    // -------------------------------
+    // Pre-v0.4.2 the dedupe key was the full payload string. Ink alt-screen
+    // scrollback repaints sometimes shift payload boundaries — e.g. the first
+    // emission folds a trailing narration sentence into the payload
+    // (`"banana"...마세요. 두 워커의 응답을 기다리겠습니다.`) but the repaint
+    // yields the parser a bare `"banana"...마세요.`. Different strings, so
+    // the full-payload key missed and the worker got re-injected.
+    // Normalizing to the first line (up to 100 chars) makes the key stable
+    // across such boundary wobbles while still distinguishing legitimately
+    // different tasks (which virtually always diverge within the first line).
     const nowMs = this.nowFn();
     this.pruneRecent(w, nowMs);
-    const lastSeen = w.recentPayloads.get(payload);
+    const key = this.dedupeKey(payload);
+    const lastSeen = w.recentPayloads.get(key);
     if (lastSeen !== undefined) {
       this.stats.deduped += 1;
       this.output.appendLine(
@@ -1307,7 +1320,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // commit don't exhaust the budget. Once the cap is hit the route is
     // dropped and a single notice fires (see enforceRoundCap).
     if (this.enforceRoundCap(w.cfg.id, payload)) return;
-    w.recentPayloads.set(payload, nowMs);
+    w.recentPayloads.set(key, nowMs);
     this.currentRound += 1;
     this.lastRouteAt = nowMs;
 
@@ -1326,6 +1339,26 @@ export class PodiumOrchestrator implements vscode.Disposable {
     for (const [payload, t] of w.recentPayloads) {
       if (nowMs - t >= this.dedupeWindowMs) w.recentPayloads.delete(payload);
     }
+  }
+
+  /**
+   * v0.4.2 — Dedupe key normalization (strategy "A" from the dedupe ladder).
+   *
+   * Two payloads that represent the same routing intent but differ at the
+   * edges (because the Ink-repaint sometimes folds a trailing narration
+   * sentence into the payload, sometimes doesn't) should collapse to the
+   * same dedupe key. Use the first logical line, trimmed, capped at 100
+   * characters. Legitimate different tasks practically always differ within
+   * the opening line, so false-positive collisions are very rare; the gain
+   * is that Ink boundary wobble stops leaking ghost injections.
+   *
+   * Memo: if this still leaks in the field log, the next rung on the ladder
+   * is strategy "B" (turn-based dedupe — one route per worker per leader
+   * turn, regardless of payload content).
+   */
+  private dedupeKey(payload: string): string {
+    const firstLine = payload.split(/\r?\n/, 1)[0] ?? '';
+    return firstLine.trim().slice(0, 100);
   }
 
   private inject(w: WorkerRuntime, payload: string): void {
