@@ -41,6 +41,8 @@
 // VS Code runtime stub.
 import type * as vscode from 'vscode';
 import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import { stripAnsi } from './ansi';
 import { IdleDetector } from './idleDetector';
 import {
@@ -241,6 +243,17 @@ export interface WorkerRuntime {
    * because no subsequent token arrives to terminate the multi-line form.
    */
   wasIdle: boolean;
+  /**
+   * v0.6.0 — Byte offset into `transcript` where the current in-progress
+   * turn began. On every busy→idle edge, the range [currentTurnStart,
+   * transcript.length) is considered the full reply body for this turn.
+   * If that body exceeds SPILL_THRESHOLD_CHARS, the orchestrator spills
+   * it to a drop file instead of trying to route the body text through
+   * the pty-stdin parser path (which fragments on long replies).
+   */
+  currentTurnStart: number;
+  /** Monotonic seq used for drop filenames; disambiguates multiple spills per turn. */
+  spillSeq: number;
 }
 
 /** Cap per-worker transcript to avoid unbounded memory growth in long runs. */
@@ -272,6 +285,38 @@ const DEFAULT_DEDUPE_WINDOW_MS = 1_800_000;
  * prompts (usually seconds).
  */
 const TURN_COOLDOWN_MS = 1500;
+
+/**
+ * v0.6.0 — Spill threshold for worker replies.
+ *
+ * When a worker's current-turn transcript (bytes since its last busy→idle
+ * edge) grows past this threshold, we abandon the parser-based routing
+ * path for this reply and instead:
+ *   1. Save the full body to `.omc/team/drops/<worker>-turn<N>-seq<S>.md`.
+ *   2. Inject a short pty-safe "[drop from worker-N] …" notice into the
+ *      leader, containing a few preview lines + the file path.
+ *   3. The leader uses its Read tool to ingest the full body.
+ *
+ * Rationale (see field logs from v0.5.2 reverseString task):
+ *   Long multi-line `@leader:` replies from a Claude worker chunk, repaint,
+ *   and fragment as they pass through the pty → ANSI strip → projector →
+ *   parser pipeline. The parser yielded only the first 20–80 bytes of
+ *   real answers, and follow-up retries slotted under an A-strategy
+ *   dedupe key like `"구현"` that collided with the truncated prior
+ *   attempt. By short-circuiting to file IO above a size threshold we
+ *   pay one Read tool call to get the answer across intact.
+ *
+ * 300 chars ≈ 5–8 lines of code or ~100 Korean characters. Short acks
+ * like "대기 중. 작업 지시 주세요." (18 chars) stay on the parser path;
+ * anything that's actually code goes through the spill.
+ */
+const SPILL_THRESHOLD_CHARS = 300;
+
+/** Max number of lines to echo as a preview inside the leader notice. */
+const SPILL_PREVIEW_LINES = 5;
+
+/** Hard cap per preview line so pathological long lines can't inflate the notice. */
+const SPILL_PREVIEW_LINE_CHARS = 80;
 
 // v2.7.13: macrotask gap between writing the body and the Win32 Enter
 // KEY_EVENT for Claude/Windows worker injects. Empirically 25 ms is enough
@@ -501,6 +546,8 @@ export class PodiumOrchestrator implements vscode.Disposable {
         // v0.3.0: only wire worker-side parsers when bidirectional is on.
         parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
         wasIdle: false,
+        currentTurnStart: 0,
+        spillSeq: 0,
         projector:
           this.enableWorkerRouting && w.agent === 'claude'
             ? new ClaudeLeaderRoutingProjector()
@@ -632,6 +679,8 @@ export class PodiumOrchestrator implements vscode.Disposable {
       recentPayloads: new Map(),
       transcript: '',
       wasIdle: false,
+      currentTurnStart: 0,
+      spillSeq: 0,
       // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
       parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
       projector:
@@ -1482,6 +1531,82 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
   }
 
+  /**
+   * v0.6.0 — Save the worker's completed turn body to a drop file and
+   * inject a short pty-safe "[drop from worker-N]" notice into the leader.
+   *
+   * The notice contains up to SPILL_PREVIEW_LINES lines of the body
+   * (each capped at SPILL_PREVIEW_LINE_CHARS) so the user watching the
+   * leader pane has immediate visibility into what the worker wrote,
+   * and the leader itself has enough context to decide whether to Read
+   * the full drop file before synthesizing.
+   *
+   * File path: `<attachedCwd>/.omc/team/drops/<worker>-turn<N>-seq<S>.md`
+   * (`.omc/` is already gitignored at the project root).
+   */
+  private spillAndNotify(w: WorkerRuntime, turnBody: string): void {
+    w.spillSeq += 1;
+    const root = this.attachedCwd ?? process.cwd();
+    const dir = path.join(root, '.omc', 'team', 'drops');
+    const filename = `${w.cfg.id}-turn${this.leaderTurnId}-seq${w.spillSeq}.md`;
+    const absPath = path.join(dir, filename);
+    const relPath = path.posix.join('.omc', 'team', 'drops', filename);
+
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const now = new Date().toISOString();
+      const header =
+        `# Drop: ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
+        `timestamp: ${now}\n` +
+        `bytes: ${turnBody.length}\n` +
+        `---\n\n`;
+      fs.writeFileSync(absPath, header + turnBody, 'utf8');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch.spill] write FAILED for ${filename} — ${msg}`);
+      this.stats.dropped += 1;
+      return;
+    }
+
+    const preview = this.buildSpillPreview(turnBody);
+    const notice =
+      `[drop from ${w.cfg.id} turn ${this.leaderTurnId}] 본문 저장됨: ${relPath}\n\n` +
+      `미리보기:\n${preview}\n\n` +
+      `전체 본문은 위 파일을 Read 해서 확인하고 종합해 주세요.`;
+
+    this.output.appendLine(
+      `[orch.spill] ${w.cfg.id} → ${relPath} (${turnBody.length} bytes); notifying leader`,
+    );
+
+    // Route via the same worker→leader path as a normal `@leader:` directive.
+    // This pays round-counter + dedupe + routing-pause the same as a
+    // parser-yielded message, keeping accounting consistent.
+    this.route({ workerId: 'leader', payload: notice }, w.cfg.paneId);
+  }
+
+  /**
+   * v0.6.0 — Build the preview block shown inside a drop notice.
+   * Up to SPILL_PREVIEW_LINES lines, each prefixed with "> " (markdown
+   * block-quote style so it reads cleanly in the leader's context),
+   * each capped at SPILL_PREVIEW_LINE_CHARS chars with an ellipsis when
+   * truncated. An extra "> …" line indicates the body continues beyond
+   * the preview.
+   */
+  private buildSpillPreview(body: string): string {
+    const lines = body.split(/\r?\n/);
+    const taken: string[] = [];
+    for (let i = 0; i < Math.min(lines.length, SPILL_PREVIEW_LINES); i++) {
+      const raw = lines[i];
+      const trimmed =
+        raw.length > SPILL_PREVIEW_LINE_CHARS
+          ? raw.slice(0, SPILL_PREVIEW_LINE_CHARS - 1) + '…'
+          : raw;
+      taken.push(`> ${trimmed}`);
+    }
+    if (lines.length > SPILL_PREVIEW_LINES) taken.push('> …');
+    return taken.join('\n');
+  }
+
   private pruneRecent(w: WorkerRuntime, nowMs: number): void {
     for (const [payload, entry] of w.recentPayloads) {
       if (nowMs - entry.ts >= this.dedupeWindowMs) w.recentPayloads.delete(payload);
@@ -1688,22 +1813,44 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.leaderWasIdle = false;
     }
     for (const w of this.workers.values()) {
-      // v0.5.2 — Worker idle edge: flush the worker's parser so pending
-      // multi-line `@leader:` / `@worker-N:` directives (started with
-      // `@target:\n<body>` but never terminated with `@end`) finally
-      // drain once the worker stops emitting. Without this, a long
-      // code block reply from a Claude worker would sit in the parser
-      // buffer waiting for a terminator that never comes, and the
-      // leader never sees the answer.
+      // v0.5.2 / v0.6.0 — Worker busy→idle edge
+      // ----------------------------------------
+      // At the moment the worker goes idle, we pick one of two paths
+      // depending on how much it wrote during this turn:
+      //
+      //   (a) Short reply (< SPILL_THRESHOLD_CHARS): run the existing
+      //       parser.flush() path so pending `@leader:` / `@worker-N:`
+      //       directives drain even without an `@end` terminator.
+      //       This is the v0.5.2 behavior.
+      //
+      //   (b) Long reply (>= SPILL_THRESHOLD_CHARS): abandon the
+      //       parser. Long bodies fragment unpredictably through the
+      //       Ink repaint + pty chunk + ANSI strip pipeline; the
+      //       parser yielded only the first 20–80 bytes of real code
+      //       answers in v0.5.2 field tests. Instead, write the entire
+      //       turn body to a drop file and inject a short pty-safe
+      //       notice into the leader with a preview + file path.
+      //       The leader uses its Read tool to ingest the full body.
+      //       See SPILL_THRESHOLD_CHARS for rationale.
       if (w.parser && w.idle.isIdle && !w.wasIdle) {
-        const pending = w.parser.flush();
-        if (pending.length > 0) {
-          this.stats.flushed += pending.length;
-          this.output.appendLine(
-            `[orch] ${w.cfg.id} idle — flushed ${pending.length} pending directive(s)`,
-          );
-          for (const m of pending) this.route(m, w.cfg.paneId);
+        const turnBody = w.transcript.slice(w.currentTurnStart);
+        if (turnBody.length >= SPILL_THRESHOLD_CHARS) {
+          this.spillAndNotify(w, turnBody);
+          // Drain anything the parser had buffered — we just superseded it
+          // via the drop file, and leaving it would let half-parsed
+          // fragments route on the NEXT idle edge.
+          w.parser.flush();
+        } else {
+          const pending = w.parser.flush();
+          if (pending.length > 0) {
+            this.stats.flushed += pending.length;
+            this.output.appendLine(
+              `[orch] ${w.cfg.id} idle — flushed ${pending.length} pending directive(s)`,
+            );
+            for (const m of pending) this.route(m, w.cfg.paneId);
+          }
         }
+        w.currentTurnStart = w.transcript.length;
         w.wasIdle = true;
       } else if (!w.idle.isIdle) {
         w.wasIdle = false;

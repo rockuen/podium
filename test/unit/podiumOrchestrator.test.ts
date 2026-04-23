@@ -516,6 +516,117 @@ test('orch v0.5.0 (P4): round cap flips routingPaused so continued attempts are 
   orch.dispose();
 });
 
+test('orch v0.6.0: long worker turn body spills to drop file + leader notice', async () => {
+  // Pre-v0.6.0, long `@leader:` bodies fragmented through the pty
+  // pipeline and the parser yielded only the first 20–80 bytes. v0.6.0
+  // short-circuits: at the worker's busy→idle edge, if the transcript
+  // accumulated since turn start exceeds SPILL_THRESHOLD_CHARS (300),
+  // write the full body to `.omc/team/drops/<worker>-turnN-seqM.md`
+  // and inject a short notice into the leader.
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-spill-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+  });
+  feedPrompt(ctl, 'L', 'claude');
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // Simulate worker emitting a long multi-line code reply.
+  const longBody =
+    '@leader:\n' +
+    '/**\n' +
+    ' * Grapheme cluster 단위로 문자열을 뒤집는다.\n' +
+    ' * surrogate pair, ZWJ 시퀀스, combining mark 모두 보존.\n' +
+    ' */\n' +
+    'function reverseString(str) {\n' +
+    "  if (typeof str !== 'string') throw new TypeError('expected a string');\n" +
+    '  const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });\n' +
+    '  const graphemes = [];\n' +
+    '  for (const { segment } of segmenter.segment(str)) graphemes.push(segment);\n' +
+    '  return graphemes.reverse().join("");\n' +
+    '}\n';
+  assert.ok(longBody.length > 300, 'test body must exceed spill threshold');
+
+  ctl.firePaneData({ paneId: 'W1', data: longBody });
+  // Let the worker go idle so the idle-edge spill fires in tick(). The
+  // IdleDetector needs a recognized prompt pattern in its rolling tail
+  // to flip to idle — fire one after the reply body.
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+  (orch as any).tick();
+
+  // Drop file should exist.
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  const dropFiles = files.filter((f) => f.startsWith('worker-1-turn') && f.endsWith('.md'));
+  assert.equal(dropFiles.length, 1, `expected 1 drop file, got ${dropFiles.length}: ${files.join(', ')}`);
+
+  const content = await fsPromises.readFile(pathMod.join(dropDir, dropFiles[0]), 'utf8');
+  assert.ok(content.includes('reverseString'), 'drop file must contain the full body');
+  assert.ok(content.includes('# Drop: worker-1'), 'drop file must have the header');
+
+  // Leader should have received a drop notice (written to its pane).
+  const leaderWrites = ctl.writes.filter((w) => w.paneId === 'L').map((w) => w.data).join('');
+  assert.ok(
+    leaderWrites.includes('[drop from worker-1'),
+    `leader did not receive drop notice. writes: ${JSON.stringify(ctl.writes.map((w) => w.paneId))}`,
+  );
+  assert.ok(leaderWrites.includes('미리보기'), 'drop notice should include preview block');
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
+test('orch v0.6.0: short worker reply stays on parser path (no drop file)', async () => {
+  // Negative control: body under threshold routes via parser as before.
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-spill-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  ctl.firePaneData({ paneId: 'W1', data: '@leader: 짧은 확인 답변.\n' });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+  (orch as any).tick();
+
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  assert.equal(files.length, 0, 'short reply must not spill');
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
 test('orch v0.5.0 (P4): manual pause survives resetRound (only round-cap pauses auto-clear)', () => {
   // If the user explicitly pauses routing, a subsequent resetRound must
   // NOT silently resume. Only the round-cap-induced pause is auto-cleared.
