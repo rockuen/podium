@@ -1,11 +1,13 @@
-// Phase 2 · v2.7.9 — `@worker-N` routing token parser + Claude leader-output
-// projector.
+// Phase 2 · v2.7.9 / v0.3.0 — `@leader:` and `@worker-N:` routing token parser
+// + Claude pane-output projector. v0.3.0 extended the token set so workers
+// can also emit directives (ping-pong + worker-to-worker discussion).
 //
 // Syntax (Option A — our own, no OMC compat):
 //
 //   Single-line form:
 //       @worker-1: Summarize the plan in three bullets.
 //       @worker-2: Meanwhile draft a name for the product.
+//       @leader: Done. Summary: ...
 //
 //   Multi-line form (for longer prompts):
 //       @worker-1:
@@ -54,16 +56,20 @@
 // unambiguously.
 
 export interface RoutedMessage {
-  /** Worker identifier, e.g. `worker-1`. */
+  /**
+   * Target identifier. `'leader'` for @leader: directives, otherwise a
+   * worker id like `'worker-1'`. v0.3.0 widened this from worker-only so
+   * workers can route back to the leader or a peer.
+   */
   workerId: string;
   /** Payload text (multi-line bodies joined with `\n`). Never has trailing newline. */
   payload: string;
 }
 
-const TOKEN_RE = /@(worker-\d+):/g;
+const TOKEN_RE = /@(leader|worker-\d+):/g;
 const END_RE = /@end\b/;
-const CLAUDE_ASSISTANT_START_RE = /^\s*●(?:\s+|(?=@worker-))/;
-const CLAUDE_ASSISTANT_CONT_RE = /^(?:\s{2,}\S|@worker-\d+:|@end\b)/;
+const CLAUDE_ASSISTANT_START_RE = /^\s*●(?:\s+|(?=@(?:worker-|leader:)))/;
+const CLAUDE_ASSISTANT_CONT_RE = /^(?:\s{2,}\S|@(?:worker-\d+|leader):|@end\b)/;
 const CLAUDE_PROMPT_RE = /^(?:>\s.*|>\s*$|│\s*>\s*.*)$/;
 const CLAUDE_STATUS_RE = /^(?:\[OMC#[\d.]+\].*|⏵⏵\s+bypass permissions.*)$/;
 const CLAUDE_CHROME_RE = /^[\s─━│┃╭╮╰╯┌┐└┘┏┓┗┛]+$/;
@@ -306,10 +312,10 @@ export class WorkerPatternParser {
       const afterNl = chosen.advance;
       const peek = this.buffer.slice(afterNl, afterNl + 40);
       const isIndented = /^[ \t]{2,}\S/.test(peek);
-      const startsWithWorker = /^[ \t]*@worker-\d+:/.test(peek);
+      const startsWithTarget = /^[ \t]*@(?:worker-\d+|leader):/.test(peek);
       const startsWithEnd = /^[ \t]*@end\b/.test(peek);
       const isBlank = peek.length === 0 || /^[ \t]*(?:\r?\n|\r|$)/.test(peek);
-      const isContinuation = isIndented && !startsWithWorker && !startsWithEnd && !isBlank;
+      const isContinuation = isIndented && !startsWithTarget && !startsWithEnd && !isBlank;
 
       if (!isContinuation) {
         return { payloadEndPos: chosen.payloadEnd, advanceTo: chosen.advance };
@@ -408,3 +414,8 @@ function classifyClaudeLine(
   if (CLAUDE_ASSISTANT_CONT_RE.test(line)) return 'assistant-cont';
   return 'other';
 }
+
+// v0.3.0 — workers emit the same Ink TUI output as the leader, so the
+// projector is agent-role-agnostic. This alias makes the reuse explicit
+// at worker-side call sites without breaking legacy imports.
+export { ClaudeLeaderRoutingProjector as ClaudeRoutingProjector };

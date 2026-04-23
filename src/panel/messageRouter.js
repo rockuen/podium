@@ -82,6 +82,20 @@ function routeWebviewMessage(msg, ctx) {
       handleToolbar(msg.action, entry, context, extensionPath, createPanel);
       return;
 
+    // v0.3.0 · Summon Team — the legacy single-session webview hands its
+    // claude `--session-id` off to the orchestration layer, which spawns a
+    // fresh LiveMultiPanel with that session as the leader (via --resume)
+    // and 2 role-typed worker panes alongside. The current panel is then
+    // disposed. Seamless enough that the conversation carries over.
+    case 'summon-team':
+      vscode.commands.executeCommand('claudeCodeLauncher.podium.summonTeam', {
+        sessionId: entry.sessionId,
+        cwd: entry.cwd,
+        title: entry.title,
+        panel: panel,
+      });
+      return;
+
     case 'paste-image':
       if (entry.pty) handlePasteImage(msg.data, entry, panel);
       return;

@@ -2,7 +2,7 @@
   "name": "podium",
   "displayName": "Podium — Multi-Agent Stage for Claude Code",
   "description": "Orchestrate multi-agent Claude teams from one stage — leader + worker panes with structured routing, idle detection, team snapshots, and dissolve-with-summary. Or run a solo Claude Code session in a rich Webview tab. No external multiplexer required.",
-  "version": "0.2.3",
+  "version": "0.3.0",
   "keywords": [
     "claude",
     "claude-code",
@@ -171,6 +171,30 @@
         "command": "claudeCodeLauncher.podium.dissolve",
         "title": "Dissolve Team (v2.7.8 — summarize workers, kill panes, inject into leader)",
         "icon": "$(close-all)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.summonTeam",
+        "title": "Summon Team (extend current Claude session with workers)",
+        "icon": "$(organization)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.pause",
+        "title": "Pause Routing",
+        "icon": "$(debug-pause)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.resume",
+        "title": "Resume Routing",
+        "icon": "$(debug-start)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.resetRound",
+        "title": "Reset Round Counter",
+        "icon": "$(refresh)",
         "category": "Podium"
       },
       {
@@ -455,6 +479,21 @@
           "command": "claudeCodeLauncher.podium.dissolve",
           "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
           "group": "inline@3"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.pause",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "1_ping_pong@1"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.resume",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "1_ping_pong@2"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.resetRound",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "1_ping_pong@3"
         }
       ],
       "view/title": [

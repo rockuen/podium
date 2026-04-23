@@ -52,6 +52,7 @@ import { buildSubmitPayload, splitSubmitPayload, needsWin32KeyEvents } from './c
 import type { AgentKind } from './agentSpawn';
 import type { LiveMultiPanel, LivePaneSpec } from '../ui/LiveMultiPanel';
 import { claudeBareSummarizer, type Summarizer } from './summarizer';
+import type { WorkerRole } from './workerProtocol';
 
 export interface WorkerConfig {
   /** Stable logical id referenced in leader output, e.g. `worker-1`. */
@@ -74,6 +75,15 @@ export interface WorkerConfig {
    * so snapshot save/restore preserves user-assigned names.
    */
   label?: string;
+  /**
+   * v0.3.0 · Worker role for hub-and-spoke orchestration. The role shapes
+   * the worker's system prompt (via `workerProtocol.buildWorkerSystemPrompt`)
+   * and lets the leader pick the right worker for each sub-task. Routing
+   * still uses `id`; `role` is for prompting + leader-side reasoning only.
+   * Absent when the caller spawns a plain worker (legacy `podium.orchestrate`
+   * command); present when the caller uses the role-aware spawn path.
+   */
+  role?: WorkerRole;
 }
 
 export interface LeaderConfig {
@@ -147,6 +157,34 @@ export interface OrchestratorAttachOptions {
    * Ink to settle after the resume-driven repaint.
    */
   restoreGraceMs?: number;
+  /**
+   * v0.3.0 · Enable bidirectional routing. When true, each worker's output
+   * is ALSO parsed for `@leader:` / `@worker-N:` directives, enabling
+   * workers to reply to the leader (hub-and-spoke) and route to peers.
+   * Default false preserves the legacy one-way (leader → worker) flow so
+   * existing tests and the baseline `podium.orchestrate` command behave
+   * identically.
+   */
+  enableWorkerRouting?: boolean;
+  /**
+   * v0.3.0 · Maximum number of routed directives per "task" before the
+   * orchestrator force-converges. Each committed routing event (leader→worker,
+   * worker→leader, worker→worker) counts as one. When the cap is hit a
+   * single `[system] round cap reached, please converge` notice is injected
+   * into the leader and further routing is dropped until `resetRound()` is
+   * called or the team goes idle for `autoResetRoundMs`.
+   *
+   * 0 disables the cap (legacy behavior). Default 5, tuned against the
+   * multi-agent literature's convergence sweet spot.
+   */
+  maxRoundsPerTask?: number;
+  /**
+   * v0.3.0 · When both leader and all workers have been idle this long with
+   * no further routing, the round counter auto-resets to 0 so the next user
+   * prompt starts fresh without requiring a manual `resetRound()`.
+   * Default 30_000 (30s). Set to 0 to disable auto-reset.
+   */
+  autoResetRoundMs?: number;
 }
 
 /** Minimal snapshot payload surfaced by `PodiumOrchestrator.captureSnapshot`. */
@@ -168,6 +206,17 @@ export interface WorkerRuntime {
   recentPayloads: Map<string, number>;
   /** Accumulated stripped output. Tail is kept when the buffer exceeds cap. */
   transcript: string;
+  /**
+   * v0.3.0 · Per-worker bidirectional parser. Parses the worker's own
+   * output for `@leader:` / `@worker-N:` directives so workers can route
+   * replies back to the leader (hub-and-spoke) or to peers. Only attached
+   * when `opts.enableWorkerRouting` is set (new flag in AttachOptions) —
+   * legacy attach calls leave it null so existing tests' single-direction
+   * behavior is preserved.
+   */
+  parser: WorkerPatternParser | null;
+  /** v0.3.0 · Claude TUI projector for Claude worker output. Null for non-claude agents. */
+  projector: ClaudeLeaderRoutingProjector | null;
 }
 
 /** Cap per-worker transcript to avoid unbounded memory growth in long runs. */
@@ -278,6 +327,30 @@ export class PodiumOrchestrator implements vscode.Disposable {
    */
   private readonly recentAdds = new Map<string, number>();
 
+  // ── v0.3.0 bidirectional / ping-pong state ──────────────────────────────
+
+  /** Whether worker output is also parsed for routing directives. */
+  private enableWorkerRouting = false;
+  /** Routing kill-switch. When true, all route() calls drop silently. */
+  private routingPaused = false;
+  /** Cap on routed directives per task. 0 = unlimited. */
+  private maxRoundsPerTask = 0;
+  /** Idle window after which the round counter auto-resets to 0. */
+  private autoResetRoundMs = 30_000;
+  /** Current round count. Incremented on each commit (post-dedupe). */
+  private currentRound = 0;
+  /** Wall-clock ms of the most recent successful commit. Drives auto-reset. */
+  private lastRouteAt = 0;
+  /** Prevents the cap-reached notice from firing every subsequent dropped route. */
+  private roundCapNotifyFired = false;
+  /**
+   * Payload → last-seen ms for directives aimed at the LEADER. Mirrors
+   * `WorkerRuntime.recentPayloads` but for the leader target (which has no
+   * WorkerRuntime of its own). Keeps Claude's Ink redraw duplicates from
+   * re-injecting the same reply N times into the leader stdin.
+   */
+  private readonly leaderRecentPayloads = new Map<string, number>();
+
   constructor(
     private readonly panel: LiveMultiPanel,
     private readonly output: vscode.OutputChannel,
@@ -297,6 +370,15 @@ export class PodiumOrchestrator implements vscode.Disposable {
     this.attachedCwd = opts.cwd ?? process.cwd();
     this.onAutoSnapshot = opts.onAutoSnapshot ?? null;
     this.autoSnapshotFired = false;
+    // v0.3.0 bidirectional + round cap wiring
+    this.enableWorkerRouting = opts.enableWorkerRouting ?? false;
+    this.maxRoundsPerTask = opts.maxRoundsPerTask ?? 0;
+    if (opts.autoResetRoundMs !== undefined) this.autoResetRoundMs = opts.autoResetRoundMs;
+    this.currentRound = 0;
+    this.roundCapNotifyFired = false;
+    this.lastRouteAt = 0;
+    this.routingPaused = false;
+    this.leaderRecentPayloads.clear();
     // v2.7.28: arm the restore grace window if caller requested one.
     if (opts.restoreGraceMs && opts.restoreGraceMs > 0) {
       this.restoreGraceEndsAt = this.nowFn() + opts.restoreGraceMs;
@@ -321,6 +403,12 @@ export class PodiumOrchestrator implements vscode.Disposable {
         queue: [],
         recentPayloads: new Map(),
         transcript: '',
+        // v0.3.0: only wire worker-side parsers when bidirectional is on.
+        parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
+        projector:
+          this.enableWorkerRouting && w.agent === 'claude'
+            ? new ClaudeLeaderRoutingProjector()
+            : null,
       });
     }
 
@@ -365,6 +453,11 @@ export class PodiumOrchestrator implements vscode.Disposable {
     for (const { timer } of this.pendingRoute.values()) clearTimeout(timer);
     this.pendingRoute.clear();
     this.recentAdds.clear();
+    // v0.3.0: reset per-worker projector state + leader dedupe cache.
+    for (const w of this.workers.values()) {
+      w.projector?.reset();
+    }
+    this.leaderRecentPayloads.clear();
     for (const s of this.subscriptions) s.dispose();
     this.subscriptions.length = 0;
     this.output.appendLine(
@@ -439,6 +532,12 @@ export class PodiumOrchestrator implements vscode.Disposable {
       queue: [],
       recentPayloads: new Map(),
       transcript: '',
+      // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
+      parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
+      projector:
+        this.enableWorkerRouting && cfg.agent === 'claude'
+          ? new ClaudeLeaderRoutingProjector()
+          : null,
     };
     this.workers.set(cfg.id, runtime);
 
@@ -549,6 +648,49 @@ export class PodiumOrchestrator implements vscode.Disposable {
   }
 
   /**
+   * v0.3.0 · Pause all routing. Directives parsed from leader or worker
+   * output are dropped silently until `resume()` is called. Does NOT kill
+   * panes or clear pending debounce timers — this is a soft kill-switch the
+   * user can toggle when a ping-pong is going off the rails.
+   */
+  pause(): void {
+    if (this.routingPaused) return;
+    this.routingPaused = true;
+    this.output.appendLine('[orch] routing paused');
+  }
+
+  resume(): void {
+    if (!this.routingPaused) return;
+    this.routingPaused = false;
+    this.output.appendLine('[orch] routing resumed');
+  }
+
+  get isPaused(): boolean {
+    return this.routingPaused;
+  }
+
+  /**
+   * v0.3.0 · Reset the round counter to 0 and re-arm the cap-reached
+   * notice. Called manually (command) or automatically when the team has
+   * been idle for `autoResetRoundMs`.
+   */
+  resetRound(): void {
+    if (this.currentRound === 0 && !this.roundCapNotifyFired) return;
+    const prior = this.currentRound;
+    this.currentRound = 0;
+    this.roundCapNotifyFired = false;
+    this.output.appendLine(`[orch] round reset (was ${prior})`);
+  }
+
+  get roundState(): { current: number; max: number; paused: boolean } {
+    return {
+      current: this.currentRound,
+      max: this.maxRoundsPerTask,
+      paused: this.routingPaused,
+    };
+  }
+
+  /**
    * v2.7.19 · Capture the current team as a plain data structure suitable
    * for `teamSnapshot.saveSnapshot`. Safe to call at any point while the
    * orchestrator is attached. Workers' sessionIds come from the attach
@@ -631,9 +773,34 @@ export class PodiumOrchestrator implements vscode.Disposable {
         if (w.transcript.length > MAX_TRANSCRIPT_CHARS) {
           w.transcript = w.transcript.slice(-MAX_TRANSCRIPT_CHARS);
         }
+        // v0.3.0: if bidirectional routing is enabled, parse this worker's
+        // output for `@leader:` / `@worker-N:` directives and route them.
+        this.consumeWorkerOutput(w, rawData);
         return;
       }
     }
+  }
+
+  /**
+   * v0.3.0 · Parse one worker's output chunk for routing directives and
+   * dispatch them. No-op when `enableWorkerRouting` is false (legacy mode).
+   * Mirrors `consumeLeaderOutput` but uses the worker's own parser +
+   * projector pair so multiple workers stream in parallel without
+   * cross-contaminating each other's directive buffers.
+   */
+  private consumeWorkerOutput(w: WorkerRuntime, rawData: string): void {
+    if (!this.enableWorkerRouting || !w.parser) return;
+    const cleaned = stripAnsi(rawData);
+    const projected = w.projector ? w.projector.feed(cleaned) : cleaned;
+    if (!projected) return;
+    const msgs = w.parser.feed(projected);
+    if (msgs.length === 0) return;
+    this.output.appendLine(
+      `[orch.trace] ${w.cfg.id} yielded ${msgs.length} directive(s): ${msgs
+        .map((m) => `${m.workerId}=${preview(m.payload, 30)}`)
+        .join(', ')}`,
+    );
+    for (const m of msgs) this.route(m, w.cfg.paneId);
   }
 
   /**
@@ -791,7 +958,24 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
   }
 
-  private route(msg: RoutedMessage): void {
+  /**
+   * v0.3.0 · `sourcePaneId` identifies whoever emitted the directive.
+   * Defaults to the leader's paneId for backward compatibility with the
+   * original leader-only routing path. Worker-emitted directives pass the
+   * worker's paneId so self-route and hub-and-spoke checks apply.
+   */
+  private route(msg: RoutedMessage, sourcePaneId?: string): void {
+    const source = sourcePaneId ?? this.leader?.paneId ?? '';
+
+    // v0.3.0 · Pause kill-switch — drops without any side effect.
+    if (this.routingPaused) {
+      this.stats.dropped += 1;
+      this.output.appendLine(
+        `[orch.paused] dropped routing to "${msg.workerId}": ${preview(msg.payload)}`,
+      );
+      return;
+    }
+
     this.stats.routed += 1;
 
     // v2.7.29: restore grace is idle-gated but the state transition lives in
@@ -808,36 +992,37 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.output.appendLine(
         `[orch.restoreGrace] dropped routing to "${msg.workerId}": ${preview(msg.payload)}`,
       );
-      // v2.7.33: seed the worker's dedupe cache with the dropped payload so
-      // post-grace Ink redraws don't re-route it.
-      //
-      // Field log 2026-04-22 after v2.7.32: grace correctly dropped 2
-      // directives from scrollback replay, but when the user typed a NEW
-      // leader request (`worker-1한테는 바나나, worker-2는 1부터 5까지`),
-      // Claude's Ink UI repainted the whole alt-screen on every keystroke.
-      // The repaint stream contained BOTH the new response AND the previous
-      // session's response (`@worker-1: "apple"`, `@worker-2: 1부터 10까지`)
-      // because Ink alt-screen keeps scrollback above the input box. The
-      // parser yielded 4 msgs; the 2 live ones routed immediately, the 2
-      // replayed-from-scrollback ones queued behind them and executed once
-      // workers went idle — re-running the prior turn.
-      //
-      // Fix: when grace drops a directive, record it in the target worker's
-      // `recentPayloads` with the current timestamp. commitRoute() already
-      // consults this map and returns early with `stats.deduped += 1` when
-      // a payload is present. `dedupeWindowMs` defaults to 30_000ms and
-      // grace is 15_000ms, so the seeded entry survives ≥15s past grace
-      // close — well beyond the typical window in which Ink redraws the
-      // prior assistant turn.
-      const w = this.workers.get(msg.workerId);
-      if (w) w.recentPayloads.set(msg.payload, this.nowFn());
+      // Seed the target's dedupe cache so post-grace Ink redraws don't re-route.
+      if (msg.workerId === 'leader') {
+        this.leaderRecentPayloads.set(msg.payload, this.nowFn());
+      } else {
+        const w = this.workers.get(msg.workerId);
+        if (w) w.recentPayloads.set(msg.payload, this.nowFn());
+      }
+      return;
+    }
+
+    // v0.3.0 · @leader target handling (hub-and-spoke reply path).
+    if (msg.workerId === 'leader') {
+      if (!this.leader) {
+        this.stats.dropped += 1;
+        return;
+      }
+      if (source === this.leader.paneId) {
+        this.output.appendLine(
+          `[orch] leader emitted @leader: — self-route dropped (payload: ${preview(msg.payload)})`,
+        );
+        this.stats.dropped += 1;
+        return;
+      }
+      this.commitLeaderInject(msg.payload, source);
       return;
     }
 
     const w = this.workers.get(msg.workerId);
     if (!w) {
       this.output.appendLine(
-        `[orch] leader referenced unknown "${msg.workerId}" — dropped (payload: ${preview(msg.payload)})`,
+        `[orch] ${sourcePaneId ? `${sourcePaneId} referenced` : 'leader referenced'} unknown "${msg.workerId}" — dropped (payload: ${preview(msg.payload)})`,
       );
       // v2.7.25: if this id was `addWorker`'d very recently, the leader may
       // have referenced the new id before our `workers.set` landed. Surface
@@ -851,6 +1036,15 @@ export class PodiumOrchestrator implements vscode.Disposable {
           );
         }
       }
+      this.stats.dropped += 1;
+      return;
+    }
+
+    // v0.3.0 · Self-route guard (worker-1 cannot send to worker-1).
+    if (w.cfg.paneId === source) {
+      this.output.appendLine(
+        `[orch] ${msg.workerId} self-routed — dropped (payload: ${preview(msg.payload)})`,
+      );
       this.stats.dropped += 1;
       return;
     }
@@ -894,6 +1088,82 @@ export class PodiumOrchestrator implements vscode.Disposable {
     this.armDispatchTimer(w.cfg.id, msg.payload);
   }
 
+  /**
+   * v0.3.0 · Inject a `@leader:` payload into the leader pane. Shares the
+   * round-cap and dedupe enforcement model with `commitRoute` (the worker-
+   * side path), which keeps both directions of the bidirectional routing
+   * under the same convergence budget.
+   */
+  private commitLeaderInject(payload: string, sourcePaneId: string): void {
+    if (!this.leader) {
+      this.stats.dropped += 1;
+      return;
+    }
+    const nowMs = this.nowFn();
+    this.pruneLeaderRecent(nowMs);
+    if (this.leaderRecentPayloads.has(payload)) {
+      this.stats.deduped += 1;
+      return;
+    }
+    if (this.enforceRoundCap(`leader (from ${sourcePaneId})`, payload)) return;
+    this.leaderRecentPayloads.set(payload, nowMs);
+    this.currentRound += 1;
+    this.lastRouteAt = nowMs;
+    const agent = this.leader.agent;
+    const opts = { agent };
+    try {
+      if (needsWin32KeyEvents(opts)) {
+        const { body, submit } = splitSubmitPayload(payload, opts);
+        this.panel.writeToPane(this.leader.paneId, body);
+        setTimeout(() => {
+          try {
+            this.panel.writeToPane(this.leader!.paneId, submit);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.output.appendLine(`[orch] inject submit → leader FAILED — ${msg}`);
+          }
+        }, INJECT_SUBMIT_DELAY_MS);
+      } else {
+        this.panel.writeToPane(this.leader.paneId, buildSubmitPayload(payload, opts));
+      }
+      this.stats.injected += 1;
+      this.output.appendLine(
+        `[orch] → leader (from ${sourcePaneId}, round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}): ${preview(payload)}`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch] inject → leader FAILED — ${msg}`);
+      this.stats.dropped += 1;
+    }
+  }
+
+  private pruneLeaderRecent(nowMs: number): void {
+    for (const [payload, t] of this.leaderRecentPayloads) {
+      if (nowMs - t >= this.dedupeWindowMs) this.leaderRecentPayloads.delete(payload);
+    }
+  }
+
+  /**
+   * Returns true when the round cap has been hit (caller should drop).
+   * The cap-reached notice is injected into the leader exactly once per
+   * capped window; `resetRound()` or auto-reset re-arms the notice.
+   */
+  private enforceRoundCap(targetLabel: string, payload: string): boolean {
+    if (this.maxRoundsPerTask <= 0) return false;
+    if (this.currentRound < this.maxRoundsPerTask) return false;
+    this.stats.dropped += 1;
+    this.output.appendLine(
+      `[orch.roundCap] dropped → ${targetLabel} (round ${this.currentRound} ≥ cap ${this.maxRoundsPerTask}): ${preview(payload)}`,
+    );
+    if (!this.roundCapNotifyFired) {
+      this.roundCapNotifyFired = true;
+      this.scheduleLeaderNotify(
+        `round cap reached (${this.maxRoundsPerTask}). Further worker routing is paused — summarize what you have and reply to the user, or ask to reset.`,
+      );
+    }
+    return true;
+  }
+
   private armDispatchTimer(workerId: string, payload: string): void {
     const existing = this.pendingRoute.get(workerId);
     if (existing) clearTimeout(existing.timer);
@@ -933,7 +1203,13 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.stats.deduped += 1;
       return;
     }
+    // v0.3.0: enforce round cap AFTER dedupe so Ink redraws of a single
+    // commit don't exhaust the budget. Once the cap is hit the route is
+    // dropped and a single notice fires (see enforceRoundCap).
+    if (this.enforceRoundCap(w.cfg.id, payload)) return;
     w.recentPayloads.set(payload, nowMs);
+    this.currentRound += 1;
+    this.lastRouteAt = nowMs;
 
     if (w.idle.isIdle) {
       this.inject(w, payload);
@@ -941,7 +1217,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
       w.queue.push(payload);
       this.stats.queued += 1;
       this.output.appendLine(
-        `[orch] queue ${w.cfg.id} (busy, queue=${w.queue.length}): ${preview(payload)}`,
+        `[orch] queue ${w.cfg.id} (busy, queue=${w.queue.length}, round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}): ${preview(payload)}`,
       );
     }
   }
@@ -1136,6 +1412,22 @@ export class PodiumOrchestrator implements vscode.Disposable {
         const next = w.queue.shift();
         if (next !== undefined) this.inject(w, next);
       }
+    }
+
+    // v0.3.0 · Auto-reset the round counter when the team has been quiet
+    // for `autoResetRoundMs`. Lets the user's next prompt start from round
+    // 0 without manual resetRound(). Gated on: (a) currentRound > 0 or cap
+    // notice fired, (b) leader idle, (c) all workers idle, (d) no routing
+    // activity within the window.
+    if (
+      this.autoResetRoundMs > 0 &&
+      (this.currentRound > 0 || this.roundCapNotifyFired) &&
+      this.lastRouteAt > 0 &&
+      this.nowFn() - this.lastRouteAt >= this.autoResetRoundMs &&
+      (!this.leaderIdle || this.leaderIdle.isIdle) &&
+      [...this.workers.values()].every((w) => w.idle.isIdle && w.queue.length === 0)
+    ) {
+      this.resetRound();
     }
   }
 

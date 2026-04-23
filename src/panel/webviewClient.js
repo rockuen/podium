@@ -418,6 +418,15 @@ function getClientScript(ctx) {
     document.getElementById('btn-new').addEventListener('click', () => {
       vscode.postMessage({ type: 'toolbar', action: 'new-tab' });
     });
+    // v0.3.0 · Summon Team — hands the current session off to a multi-pane
+    // orchestrated team (leader + implementer + critic) via --resume, so the
+    // conversation continues with workers alongside.
+    const btnSummon = document.getElementById('btn-summon-team');
+    if (btnSummon) {
+      btnSummon.addEventListener('click', () => {
+        vscode.postMessage({ type: 'summon-team' });
+      });
+    }
     document.getElementById('btn-paste-img').addEventListener('click', () => {
       vscode.postMessage({ type: 'check-clipboard-image' });
       showToast(T.clipboardChecking);

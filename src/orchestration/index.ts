@@ -43,6 +43,21 @@ import {
 import { LiveMultiPanel } from './ui/LiveMultiPanel';
 import { MAX_RUNTIME_WORKERS, PodiumOrchestrator } from './core/PodiumOrchestrator';
 import { buildLeaderExtraArgs } from './core/leaderProtocol';
+import { buildWorkerExtraArgs, type WorkerRole } from './core/workerProtocol';
+
+// v0.3.0 · Default 3-agent team layout for the `orchestrate*` commands.
+// worker-1 implements, worker-2 critiques. This pairs an executor with a
+// reviewer so the leader always gets a "draft + critique" signal without
+// the user having to pick roles explicitly. Runtime-added workers default
+// to `generalist` and can be role-renamed by the user later.
+const DEFAULT_TEAM_ROLES: { id: string; role: WorkerRole }[] = [
+  { id: 'worker-1', role: 'implementer' },
+  { id: 'worker-2', role: 'critic' },
+];
+
+// v0.3.0 · Shared routing budget for the bidirectional orchestrator.
+const DEFAULT_MAX_ROUNDS = 5;
+const DEFAULT_AUTO_RESET_ROUND_MS = 30_000;
 import { pickClaudeSession, isClaudeSessionResumable } from './core/sessionPicker';
 import {
   makeSnapshotId,
@@ -380,33 +395,50 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         agent: 'claude',
         cwd,
         sessionId: leaderSid,
-        extraArgs: buildLeaderExtraArgs(),
+        extraArgs: buildLeaderExtraArgs({
+          workers: DEFAULT_TEAM_ROLES,
+          maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
+        }),
       });
       panel.addPane({
         paneId: 'worker-1',
-        label: 'worker-1 (claude)',
+        label: 'worker-1 (implementer)',
         agent: 'claude',
         cwd,
         sessionId: worker1Sid,
+        extraArgs: buildWorkerExtraArgs({
+          workerId: 'worker-1',
+          role: 'implementer',
+          peers: [{ id: 'worker-2', role: 'critic' }],
+        }),
       });
       panel.addPane({
         paneId: 'worker-2',
-        label: 'worker-2 (claude)',
+        label: 'worker-2 (critic)',
         agent: 'claude',
         cwd,
         sessionId: worker2Sid,
+        extraArgs: buildWorkerExtraArgs({
+          workerId: 'worker-2',
+          role: 'critic',
+          peers: [{ id: 'worker-1', role: 'implementer' }],
+        }),
       });
 
       const orch = new PodiumOrchestrator(panel, output);
       orch.attach({
         leader: { paneId: 'leader', agent: 'claude', sessionId: leaderSid, label: 'leader (claude)' },
         workers: [
-          { id: 'worker-1', paneId: 'worker-1', agent: 'claude', sessionId: worker1Sid },
-          { id: 'worker-2', paneId: 'worker-2', agent: 'claude', sessionId: worker2Sid },
+          { id: 'worker-1', paneId: 'worker-1', agent: 'claude', sessionId: worker1Sid, role: 'implementer', label: 'worker-1 (implementer)' },
+          { id: 'worker-2', paneId: 'worker-2', agent: 'claude', sessionId: worker2Sid, role: 'critic', label: 'worker-2 (critic)' },
         ],
         dispatchDebounceMs: 1200,
         cwd,
         onAutoSnapshot: makeAutoSnapshotHook(output, `team ${new Date().toLocaleString()}`),
+        // v0.3.0: bidirectional routing + round cap for hub-and-spoke quality.
+        enableWorkerRouting: true,
+        maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
+        autoResetRoundMs: DEFAULT_AUTO_RESET_ROUND_MS,
       });
 
       const sessionKey = `orch-${Date.now()}`;
@@ -477,33 +509,50 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         agent: 'claude',
         cwd,
         autoSessionId: false,
-        extraArgs: buildLeaderExtraArgs({ resumeSessionId: sessionId }),
+        extraArgs: buildLeaderExtraArgs({
+          resumeSessionId: sessionId,
+          workers: DEFAULT_TEAM_ROLES,
+          maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
+        }),
       });
       panel.addPane({
         paneId: 'worker-1',
-        label: 'worker-1 (claude)',
+        label: 'worker-1 (implementer)',
         agent: 'claude',
         cwd,
         sessionId: worker1Sid,
+        extraArgs: buildWorkerExtraArgs({
+          workerId: 'worker-1',
+          role: 'implementer',
+          peers: [{ id: 'worker-2', role: 'critic' }],
+        }),
       });
       panel.addPane({
         paneId: 'worker-2',
-        label: 'worker-2 (claude)',
+        label: 'worker-2 (critic)',
         agent: 'claude',
         cwd,
         sessionId: worker2Sid,
+        extraArgs: buildWorkerExtraArgs({
+          workerId: 'worker-2',
+          role: 'critic',
+          peers: [{ id: 'worker-1', role: 'implementer' }],
+        }),
       });
 
       const orch = new PodiumOrchestrator(panel, output);
       orch.attach({
         leader: { paneId: 'leader', agent: 'claude', sessionId, label: `leader (resumed ${sessionId.slice(0, 8)})` },
         workers: [
-          { id: 'worker-1', paneId: 'worker-1', agent: 'claude', sessionId: worker1Sid },
-          { id: 'worker-2', paneId: 'worker-2', agent: 'claude', sessionId: worker2Sid },
+          { id: 'worker-1', paneId: 'worker-1', agent: 'claude', sessionId: worker1Sid, role: 'implementer', label: 'worker-1 (implementer)' },
+          { id: 'worker-2', paneId: 'worker-2', agent: 'claude', sessionId: worker2Sid, role: 'critic', label: 'worker-2 (critic)' },
         ],
         dispatchDebounceMs: 1200,
         cwd,
         onAutoSnapshot: makeAutoSnapshotHook(output, `resumed ${sessionId.slice(0, 8)}`),
+        enableWorkerRouting: true,
+        maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
+        autoResetRoundMs: DEFAULT_AUTO_RESET_ROUND_MS,
       });
 
       const sessionKey = `orch-resume-${Date.now()}`;
@@ -531,6 +580,160 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       panel.reveal();
       vscode.window.showInformationMessage(
         `Podium orchestrator attached (resumed ${sessionId.slice(0, 8)}). Leader has prior context; delegate with @worker-N: directives.`,
+      );
+    }),
+  );
+
+  // ─── v0.3.0 — Summon Team: hand off legacy single-session webview ───
+  // Invoked from the 🎭 toolbar button in the base Claude Code window
+  // (ctrl+shift+;). Picks up the running session's uuid + cwd, disposes the
+  // legacy panel, and spawns a LiveMultiPanel with that session as the
+  // leader (--resume) plus an implementer + critic worker alongside.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.summonTeam', async (arg?: unknown) => {
+      output.appendLine('[orch.summonTeam] invoked');
+      const payload = (arg ?? {}) as {
+        sessionId?: string;
+        cwd?: string;
+        title?: string;
+        panel?: vscode.WebviewPanel;
+      };
+      const sessionId = payload.sessionId;
+      const cwd = payload.cwd ?? currentCwd();
+      if (!sessionId) {
+        vscode.window.showErrorMessage(
+          'Podium: Summon Team needs a live Claude session. Open a chat window first (Ctrl+Shift+;), then click 🎭.',
+        );
+        return;
+      }
+      const resumable = isClaudeSessionResumable(cwd, sessionId);
+      output.appendLine(
+        `[orch.summonTeam] sessionId=${sessionId.slice(0, 8)} cwd=${cwd} resumable=${resumable}`,
+      );
+
+      const panel = LiveMultiPanel.create(
+        ctx,
+        output,
+        `Podium · Team (summoned from ${sessionId.slice(0, 8)})`,
+      );
+
+      const worker1Sid = randomUUID();
+      const worker2Sid = randomUUID();
+
+      // Leader: resume the live session and apply the role-aware prompt.
+      // If Claude hasn't written the JSONL yet (user never submitted in the
+      // base window), fall back to spawning fresh with the same session-id
+      // so the protocol still applies — same strategy as snapshot.load.
+      if (resumable) {
+        panel.addPane({
+          paneId: 'leader',
+          label: `leader (summoned ${sessionId.slice(0, 8)})`,
+          agent: 'claude',
+          cwd,
+          autoSessionId: false,
+          extraArgs: buildLeaderExtraArgs({
+            resumeSessionId: sessionId,
+            workers: DEFAULT_TEAM_ROLES,
+            maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
+          }),
+        });
+      } else {
+        output.appendLine(
+          `[orch.summonTeam] leader session has no JSONL yet — spawning fresh with same session-id + protocol`,
+        );
+        panel.addPane({
+          paneId: 'leader',
+          label: `leader (fresh ${sessionId.slice(0, 8)})`,
+          agent: 'claude',
+          cwd,
+          sessionId,
+          extraArgs: buildLeaderExtraArgs({
+            workers: DEFAULT_TEAM_ROLES,
+            maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
+          }),
+        });
+      }
+      panel.addPane({
+        paneId: 'worker-1',
+        label: 'worker-1 (implementer)',
+        agent: 'claude',
+        cwd,
+        sessionId: worker1Sid,
+        extraArgs: buildWorkerExtraArgs({
+          workerId: 'worker-1',
+          role: 'implementer',
+          peers: [{ id: 'worker-2', role: 'critic' }],
+        }),
+      });
+      panel.addPane({
+        paneId: 'worker-2',
+        label: 'worker-2 (critic)',
+        agent: 'claude',
+        cwd,
+        sessionId: worker2Sid,
+        extraArgs: buildWorkerExtraArgs({
+          workerId: 'worker-2',
+          role: 'critic',
+          peers: [{ id: 'worker-1', role: 'implementer' }],
+        }),
+      });
+
+      const orch = new PodiumOrchestrator(panel, output);
+      orch.attach({
+        leader: { paneId: 'leader', agent: 'claude', sessionId, label: `leader (summoned ${sessionId.slice(0, 8)})` },
+        workers: [
+          { id: 'worker-1', paneId: 'worker-1', agent: 'claude', sessionId: worker1Sid, role: 'implementer', label: 'worker-1 (implementer)' },
+          { id: 'worker-2', paneId: 'worker-2', agent: 'claude', sessionId: worker2Sid, role: 'critic', label: 'worker-2 (critic)' },
+        ],
+        dispatchDebounceMs: 1200,
+        cwd,
+        onAutoSnapshot: makeAutoSnapshotHook(output, `summoned ${sessionId.slice(0, 8)}`),
+        enableWorkerRouting: true,
+        maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
+        autoResetRoundMs: DEFAULT_AUTO_RESET_ROUND_MS,
+        // If the leader actually resumes, Ink will replay scrollback — give
+        // the same 15s wall-clock grace as snapshot.load to prevent re-routing.
+        restoreGraceMs: resumable ? 15000 : 0,
+      });
+
+      const sessionKey = `orch-summon-${Date.now()}`;
+      orchestratorRegistry.set(sessionKey, orch);
+      panel.onPaneExit(() => {
+        const existing = orchestratorRegistry.get(sessionKey);
+        if (existing) {
+          existing.dispose();
+          orchestratorRegistry.delete(sessionKey);
+          teamsProvider.refresh();
+        }
+      });
+      panel.onDidDispose(() => {
+        const existing = orchestratorRegistry.get(sessionKey);
+        if (existing) {
+          existing.dispose();
+          orchestratorRegistry.delete(sessionKey);
+          teamsProvider.refresh();
+          output.appendLine(`[orch] panel disposed → ${sessionKey} removed from registry`);
+        }
+      });
+
+      panel.reveal();
+
+      // Dispose the legacy panel that summoned us. Deferred so the new panel
+      // has time to render before the old one tears down its terminal and
+      // the user briefly sees blank space.
+      if (payload.panel) {
+        setTimeout(() => {
+          try {
+            payload.panel!.dispose();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            output.appendLine(`[orch.summonTeam] legacy panel dispose failed — ${msg}`);
+          }
+        }, 800);
+      }
+
+      vscode.window.showInformationMessage(
+        `Podium: team summoned — leader continues from ${sessionId.slice(0, 8)} with implementer + critic.`,
       );
     }),
   );
@@ -1011,6 +1214,60 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         },
       );
     }),
+  );
+
+  // ─── v0.3.0 · Ping-pong guardrails: pause / resume / reset-round ───
+  // These commands operate on whichever team the user targets. The tree
+  // context passes a PodiumLiveTeamNode; the Command Palette falls back
+  // to the most-recent team (matching dissolve's UX).
+  function resolveTargetOrch(arg: unknown): PodiumOrchestrator | undefined {
+    if (arg instanceof PodiumLiveTeamNode) {
+      return lookupOrchestratorByKey(arg.sessionKey);
+    }
+    const active = [...orchestratorRegistry.values()];
+    return active.length > 0 ? active[active.length - 1] : undefined;
+  }
+
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand(
+      'claudeCodeLauncher.podium.pause',
+      async (arg?: unknown) => {
+        const orch = resolveTargetOrch(arg);
+        if (!orch) {
+          vscode.window.showInformationMessage('Podium: no active team to pause.');
+          return;
+        }
+        orch.pause();
+        vscode.window.showInformationMessage('Podium: routing paused. Click Resume to continue.');
+        teamsProvider.refresh();
+      },
+    ),
+    vscode.commands.registerCommand(
+      'claudeCodeLauncher.podium.resume',
+      async (arg?: unknown) => {
+        const orch = resolveTargetOrch(arg);
+        if (!orch) {
+          vscode.window.showInformationMessage('Podium: no active team to resume.');
+          return;
+        }
+        orch.resume();
+        vscode.window.showInformationMessage('Podium: routing resumed.');
+        teamsProvider.refresh();
+      },
+    ),
+    vscode.commands.registerCommand(
+      'claudeCodeLauncher.podium.resetRound',
+      async (arg?: unknown) => {
+        const orch = resolveTargetOrch(arg);
+        if (!orch) {
+          vscode.window.showInformationMessage('Podium: no active team to reset.');
+          return;
+        }
+        orch.resetRound();
+        vscode.window.showInformationMessage('Podium: round counter reset.');
+        teamsProvider.refresh();
+      },
+    ),
   );
 
   // ─── Podium Mode dashboard ───

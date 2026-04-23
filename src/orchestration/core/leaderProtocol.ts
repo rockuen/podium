@@ -1,9 +1,18 @@
-// Phase 3.3 · v2.7.11 — Podium leader system prompt + tool policy.
+// Phase 3.3 · v2.7.11 / v0.3.0 — Podium leader system prompt + tool policy.
 //
 // Injected into the Claude CLI via `--append-system-prompt` when Podium
 // spawns a leader pane. Combined with `--disallowedTools Task`, this teaches
 // the leader to delegate through external worker panes instead of spawning
 // internal subagents.
+//
+// v0.3.0 — role-aware dynamic prompt
+// ----------------------------------
+// The legacy `PODIUM_LEADER_SYSTEM_PROMPT` export stays for back-compat
+// (legacy `podium.orchestrate` command, existing tests). New callers use
+// `buildLeaderSystemPrompt({ workers })` which bakes per-worker role
+// information into the roster so the leader routes by role, not blindly.
+// Bidirectional routing is announced too: workers may reply with
+// `@leader: ...` directives which the orchestrator delivers back.
 //
 // Why this layering
 // -----------------
@@ -14,13 +23,8 @@
 //   asks the leader to delegate, it must emit `@worker-N:` directives. An
 //   external projector/parser in PodiumOrchestrator then routes those lines
 //   to the matching worker pane's stdin.
-//
-// Scope
-// -----
-// This prompt and the tool policy are applied ONLY to the leader pane that
-// the `claudeCodeLauncher.podium.orchestrate` command spawns. Worker panes
-// and standalone `claude` sessions are untouched — users keep their normal
-// Task-enabled workflow everywhere else.
+
+import type { WorkerRole } from './workerProtocol';
 
 export const PODIUM_LEADER_SYSTEM_PROMPT = `PODIUM TEAM PROTOCOL
 
@@ -54,9 +58,89 @@ first instruction.`;
 
 export const PODIUM_LEADER_DISALLOWED_TOOLS = ['Task'] as const;
 
+export interface LeaderRosterEntry {
+  id: string;
+  role: WorkerRole;
+  label?: string;
+}
+
+export interface LeaderSystemPromptOpts {
+  /** Worker roster to embed in the prompt. Empty array → legacy prompt text. */
+  workers: readonly LeaderRosterEntry[];
+  /**
+   * Optional cap mirrored from PodiumOrchestrator. When set, the leader is
+   * told explicitly how many routing turns are budgeted per task.
+   */
+  maxRoundsPerTask?: number;
+}
+
+export function buildLeaderSystemPrompt(opts: LeaderSystemPromptOpts): string {
+  if (!opts.workers || opts.workers.length === 0) {
+    return PODIUM_LEADER_SYSTEM_PROMPT;
+  }
+  const roster = opts.workers
+    .map((w) => {
+      const name = w.label && w.label !== w.id ? ` — "${w.label}"` : '';
+      return `  - ${w.id}${name} · role: ${w.role}`;
+    })
+    .join('\n');
+  const roundBudget =
+    opts.maxRoundsPerTask && opts.maxRoundsPerTask > 0
+      ? `\nROUND BUDGET\nEach user task gets ~${opts.maxRoundsPerTask} total routing turns (leader→worker, worker→leader, worker→worker combined). Converge within that budget. After the cap, the orchestrator stops routing and you must summarize with what you have.`
+      : '';
+
+  return `PODIUM TEAM PROTOCOL
+
+You are the leader of a Podium team. Independent worker CLI processes are
+running in separate panes alongside you. You cannot see their screens; they
+receive work only through routing directives you emit in your assistant
+output.
+
+TEAM ROSTER
+${roster}
+
+DELEGATION SYNTAX
+When the user asks you to assign work, respond with one line per target,
+each starting at column zero of a new line:
+
+  @worker-1: <task for worker-1>
+  @worker-2: <task for worker-2>
+
+Exact format: literal '@', target id, ':', space, task text. The external
+orchestrator dispatches each directive to the matching pane.
+
+BIDIRECTIONAL ROUTING (v0.3.0)
+Workers can reply to you with "@leader: <message>" directives. Those
+replies are injected into your own stdin so you see them as user input.
+Use them to iterate: critique an implementer's draft, ask a tester for
+more cases, or synthesize multiple workers' outputs into a final answer.
+
+RULES
+1. The Task tool is disabled. Use @worker-N: routing for all delegation.
+2. Assign work based on ROLE. Implementer gets code, critic gets review,
+   tester gets test cases, researcher gets doc lookup, generalist flexes.
+3. Parallelize by default — emit multiple @worker-N: directives in one
+   turn so workers run simultaneously. Serialize only when B depends on A.
+4. For non-delegation tasks (analysis, writing, short answers), answer
+   directly without routing.
+5. Converge. Once you have enough worker output, summarize and reply to
+   the user. Do not ping-pong indefinitely.${roundBudget}
+
+Acknowledge this protocol briefly on your first turn, then wait for the
+first instruction.`;
+}
+
 export interface LeaderExtraArgOpts {
   /** If set, prefix argv with `--resume <uuid>` to continue an existing session. */
   resumeSessionId?: string;
+  /**
+   * v0.3.0 · When provided, the leader system prompt is generated from the
+   * roster instead of using the legacy static string. Back-compat: omitting
+   * `workers` (the legacy callers) keeps the original prompt byte-for-byte.
+   */
+  workers?: readonly LeaderRosterEntry[];
+  /** v0.3.0 · Mirror of PodiumOrchestrator's round cap for leader awareness. */
+  maxRoundsPerTask?: number;
 }
 
 /**
@@ -73,11 +157,14 @@ export function buildLeaderExtraArgs(opts: LeaderExtraArgOpts = {}): string[] {
   if (opts.resumeSessionId) {
     args.push('--resume', opts.resumeSessionId);
   }
+  const prompt = opts.workers && opts.workers.length > 0
+    ? buildLeaderSystemPrompt({ workers: opts.workers, maxRoundsPerTask: opts.maxRoundsPerTask })
+    : PODIUM_LEADER_SYSTEM_PROMPT;
   args.push(
     '--disallowedTools',
     ...PODIUM_LEADER_DISALLOWED_TOOLS,
     '--append-system-prompt',
-    PODIUM_LEADER_SYSTEM_PROMPT,
+    prompt,
   );
   return args;
 }
