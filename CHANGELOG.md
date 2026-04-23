@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.8.2] - 2026-04-24
+
+### Fix · Leader now uses every worker in the roster by default
+
+Field feedback after v0.8.1: in a reverseString relay session with an
+implementer + critic roster, the leader delegated to the implementer,
+received the code, then stopped to ask the user "finalize, or another
+improvement round?" The critic was never invoked, defeating the point
+of running a multi-role team.
+
+Root cause was purely prompt-shaped, not a routing bug. The previous
+leader system prompt said "parallelize by default" but gave no rule
+against early-stopping a task when other relevant roles existed in
+the roster, and the implementer-first / critic-second sequential
+pattern was not required.
+
+`buildLeaderSystemPrompt` now embeds an explicit COLLABORATION DEFAULT
+section:
+
+- Every role in the roster must contribute. Implementer → critic →
+  revision → done is the minimum viable cycle for a multi-role team.
+- Pausing to ask the user between worker steps is disallowed except
+  when a requirement is genuinely ambiguous, the round budget is
+  exhausted, or a worker reports a real blocker.
+- Role-to-role routing guidance: when passing an implementer's reply
+  to a critic, embed the content directly in `@critic:` — the
+  orchestrator's auto-spill (v0.8.0) handles length safely.
+- Parallel vs serial distinction kept, but clarified: parallel when
+  roles are independent, serial when role B needs role A's output.
+
+No code paths changed; all 190 tests pass as-is (test fixtures don't
+lock the prompt text).
+
 ## [0.8.1] - 2026-04-24
 
 ### Fix · Route-time dedupe kills the re-inject storm
