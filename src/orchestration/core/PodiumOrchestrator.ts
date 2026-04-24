@@ -311,6 +311,21 @@ export interface WorkerRuntime {
     ts: number;
     chainLength: number;
   }>;
+  /**
+   * v0.9.4 — ACK-mismatch-keyed retry chain. When the worker's most
+   * recent reply echoed an `ACK bytes=... tail=...` that didn't match
+   * the spilled fingerprint, we record the mismatched drop's path and
+   * arm the NEXT spill to this worker to be tagged as a retry. On a
+   * subsequent match we clear the chain (delivery succeeded); on
+   * another mismatch we advance `priorDropPath` and `nextCount` to
+   * keep the chain going.
+   *
+   * This trigger composes with v0.9.3's content-hash-match trigger:
+   * whichever signal fires first tags the drop. mismatch-keyed is the
+   * realistic real-world catch because retries usually rewrite content
+   * slightly (prefix/suffix) so content-hash-match misses them.
+   */
+  retryChain: { priorDropPath: string; nextCount: number; ts: number } | null;
 }
 
 /** Cap per-worker transcript to avoid unbounded memory growth in long runs. */
@@ -675,6 +690,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
         hasPendingReply: false,
         pendingAckFp: null,
         recentSpills: [],
+        retryChain: null,
         // v0.7.4 — Projector instantiated for all Claude agents (not
         // gated on routing) so transcript capture gets the same
         // assistant-only filtering as parser routing. Spill files
@@ -815,6 +831,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
       hasPendingReply: false,
       pendingAckFp: null,
       recentSpills: [],
+      retryChain: null,
       // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
       parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
       // v0.7.4 — see attach() site for rationale.
@@ -1665,12 +1682,25 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.output.appendLine(
         `[orch.ack] match ${w.cfg.id} bytes=${gotBytes} tail=${gotTail} (drop=${expected.dropPath})`,
       );
+      // v0.9.4 — successful delivery ends any active retry chain.
+      w.retryChain = null;
       return;
     }
 
     this.output.appendLine(
       `[orch.ack] MISMATCH ${w.cfg.id} expected bytes=${expected.bytes} tail=${expected.tail_sha8}, got bytes=${gotBytes} tail=${gotTail} (drop=${expected.dropPath}) — directive likely truncated in transit; consider re-sending the full body`,
     );
+    // v0.9.4 — arm the retry chain. If a chain already exists, extend
+    // it (the prior retry failed too); otherwise start a fresh chain
+    // rooted at this failed drop.
+    const nowMs = this.nowFn();
+    if (w.retryChain) {
+      w.retryChain.priorDropPath = expected.dropPath;
+      w.retryChain.nextCount += 1;
+      w.retryChain.ts = nowMs;
+    } else {
+      w.retryChain = { priorDropPath: expected.dropPath, nextCount: 2, ts: nowMs };
+    }
   }
 
   private findWorkerByPaneId(paneId: string): WorkerRuntime | null {
@@ -2118,19 +2148,54 @@ export class PodiumOrchestrator implements vscode.Disposable {
       const tail_sha8 = computeTailSha8(payload);
       const bytes = Buffer.byteLength(payload, 'utf8');
 
-      // v0.9.3 — Redelivery detection. Prune stale entries first so
-      // comparisons only look at the active window, then search for a
-      // content-hash match. If we find one, the new drop is tagged with
-      // the path of the match (the most-recent prior in the chain) and
-      // a chain-length counter incremented by one.
+      // v0.9.3 / v0.9.4 — Redelivery detection. Two triggers compose:
+      //
+      //   (A) v0.9.4 ACK-mismatch chain. If the worker's last reply
+      //       echoed an ACK that didn't match the spilled fingerprint,
+      //       maybeConsumeAck armed `w.retryChain`. The next spill
+      //       within the window is the leader's retry — tag it. This
+      //       is the realistic real-world trigger because retries
+      //       usually rewrite content (prefix/suffix) so their
+      //       `tail_sha8` differs from the original.
+      //
+      //   (B) v0.9.3 Content-hash chain. If the exact same tail is
+      //       spilled again within the window, tag as retry of the
+      //       prior matching drop. This catches orchestrator-initiated
+      //       re-sends or synthetic duplicates.
+      //
+      // (A) takes priority when both fire: the mismatch signal is
+      // more specific about intent. Both update per-worker state.
       w.recentSpills = w.recentSpills.filter((e) => nowMs - e.ts < REDELIVERY_WINDOW_MS);
-      const prior = [...w.recentSpills]
-        .reverse()
-        .find((e) => e.tail_sha8 === tail_sha8);
-      const chainLength = prior ? prior.chainLength + 1 : 1;
+      if (w.retryChain && nowMs - w.retryChain.ts >= REDELIVERY_WINDOW_MS) {
+        w.retryChain = null; // prune stale
+      }
+
+      let redeliveryOf: string | null = null;
+      let chainLength = 1;
+
+      if (w.retryChain) {
+        // (A) ACK-mismatch-keyed retry.
+        redeliveryOf = w.retryChain.priorDropPath;
+        chainLength = w.retryChain.nextCount;
+        // This new drop becomes the anchor for any subsequent mismatch
+        // that extends the chain. The mismatch handler will still
+        // increment nextCount on the next failure.
+        w.retryChain.priorDropPath = relPath;
+        w.retryChain.ts = nowMs;
+      } else {
+        // (B) Content-hash match fallback.
+        const prior = [...w.recentSpills]
+          .reverse()
+          .find((e) => e.tail_sha8 === tail_sha8);
+        if (prior) {
+          redeliveryOf = prior.dropPath;
+          chainLength = prior.chainLength + 1;
+        }
+      }
+
       const redeliveryLines =
-        chainLength > 1 && prior
-          ? `redelivery_of: ${prior.dropPath}\nredelivery_count: ${chainLength}\n`
+        chainLength > 1 && redeliveryOf
+          ? `redelivery_of: ${redeliveryOf}\nredelivery_count: ${chainLength}\n`
           : '';
 
       const header =
@@ -2147,9 +2212,9 @@ export class PodiumOrchestrator implements vscode.Disposable {
       // Record THIS spill for future retry checks. Append after write so
       // we don't leak state if the write failed.
       w.recentSpills.push({ tail_sha8, dropPath: relPath, ts: nowMs, chainLength });
-      if (chainLength > 1) {
+      if (chainLength > 1 && redeliveryOf) {
         this.output.appendLine(
-          `[orch.redelivery] ${w.cfg.id} drop tagged redelivery_count=${chainLength} (prior=${prior!.dropPath})`,
+          `[orch.redelivery] ${w.cfg.id} drop tagged redelivery_count=${chainLength} (prior=${redeliveryOf})`,
         );
       }
     } catch (err) {

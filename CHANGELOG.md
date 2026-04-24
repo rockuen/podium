@@ -1,5 +1,61 @@
 # Changelog
 
+## [0.9.4] - 2026-04-25
+
+### Feature · ACK-mismatch-keyed retry chain (closes N2)
+
+v0.9.3 shipped redelivery infrastructure but the content-hash trigger
+rarely fires in production — real-world retries always rewrite the
+payload slightly (leader prepends "retry:" or appends an EOI marker)
+so the `tail_sha8` differs. v0.9.4 adds a stronger, semantically
+correct trigger keyed on the v0.9.2 ACK-mismatch signal.
+
+Flow:
+  1. `maybeConsumeAck` MISMATCH branch now arms `w.retryChain =
+     {priorDropPath, nextCount: 2, ts}` if no chain exists, or extends
+     it (priorDropPath = this latest failed drop, nextCount++) if one
+     is active.
+  2. `maybeConsumeAck` MATCH branch clears `w.retryChain` —
+     successful delivery breaks the chain.
+  3. `maybeSpillLeaderToWorker` checks `w.retryChain` BEFORE the
+     content-hash check. If the chain is live and within the 5-min
+     window, the new drop is tagged `redelivery_of=priorDropPath,
+     redelivery_count=nextCount` regardless of content similarity.
+  4. This new drop becomes the anchor for the next potential retry
+     (priorDropPath updated to the new relPath); the mismatch handler
+     will extend the chain if another ACK fails.
+
+The two triggers compose: v0.9.4 (mismatch-keyed) fires first when
+available, v0.9.3 (content-hash) is the fallback for synthetic or
+orchestrator-initiated exact re-sends.
+
+### Tests
+
+Six new v0.9.4 cases in test/unit/ackRetryChain.test.ts:
+
+- "ACK match → next spill NOT tagged as retry" — negative baseline.
+- "ACK mismatch → next spill tagged redelivery_count=2" — primary
+  positive case with DIFFERENT content between spills (realistic).
+- "repeated mismatches extend the chain (count=3)" — chain extends
+  through multiple failed deliveries.
+- "MATCH after earlier mismatch breaks the chain" — recovery clears
+  state; subsequent unrelated spill is not tagged.
+- "mismatch past window → new chain starts fresh" — 5-min window
+  enforced on the retryChain ts field.
+- "mismatch on worker-1 does NOT tag spill to worker-2" — per-worker
+  scope preserved (consistent with v0.9.3 semantics).
+
+Test-scaffolding notes (documented in-file):
+  - payloads end with terminal punctuation to avoid v0.8.7 end-of-
+    buffer hold which blocks yield on unterminated multi-line text
+  - `● ` bullet prefix on spill data so the Claude leader projector
+    stays in assistant-block state across consecutive spills
+  - `dedupeWindowMs: 0` to bypass production's cross-turn dedupe for
+    back-to-back scenarios (same rationale as v0.9.3 tests)
+
+234/234 tests green. No regressions in v0.8.x / v0.9.0 / v0.9.1 /
+v0.9.2 / v0.9.3 suites.
+
 ## [0.9.3] - 2026-04-25
 
 ### Feature · Drop redelivery metadata (N2 from 2026-04-24 parseCSV retro)
