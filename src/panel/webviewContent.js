@@ -53,6 +53,7 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
       <button class="toolbar-btn" id="btn-export" title="${T.exportTip}">&#x1F4BE;</button>
       <button class="toolbar-btn" id="btn-sound" title="${T.soundToggleTip}" style="display:none">&#x1F514;</button>
       <button class="toolbar-btn" id="btn-settings" title="Settings" style="font-size:13px;">&#x2699;</button>
+      <button class="toolbar-btn" id="btn-summon-team" title="Summon Team (extends this session with an implementer + critic worker)" style="font-size:14px;">&#x1F3AD;</button>
       <button class="toolbar-btn new-tab" id="btn-new" title="${T.newTabTip}">&#x2795;</button>
     </div>
     <div id="search-bar">

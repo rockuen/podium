@@ -80,9 +80,16 @@ test('orch: leader assistant token → immediate injection to correct worker', (
 
   ctl.firePaneData({ paneId: 'L', data: '● @worker-1: hello there\n' });
 
+  // v0.8.0 — EVERY leader→worker delegation now auto-spills to a file
+  // and the worker pane receives ONLY a path-first notice. The raw body
+  // ('hello there') is written to the drop file, never to the worker's
+  // stdin. Fragmentation survival: path is the first token on line 1.
   assert.equal(ctl.writes.length, 1);
   assert.equal(ctl.writes[0].paneId, 'W1');
-  assert.ok(ctl.writes[0].data.startsWith('hello there'));
+  assert.ok(
+    ctl.writes[0].data.startsWith('.omc/team/drops/to-worker-1-turn'),
+    `expected path-first notice, got: ${ctl.writes[0].data.slice(0, 80)}`,
+  );
   assert.equal(orch.snapshot.stats.injected, 1);
 
   orch.dispose();
@@ -150,11 +157,12 @@ test('orch: assistant continuation routes clean worker payloads without border c
       '────────────────────────────────────\n',
   });
 
+  // v0.8.0 — each delegation auto-spills; workers receive path-first notices.
   assert.equal(ctl.writes.length, 2);
   assert.equal(ctl.writes[0].paneId, 'W1');
   assert.equal(ctl.writes[1].paneId, 'W2');
-  assert.ok(ctl.writes[0].data.startsWith('"apple, banana, cherry"를 한글로 번역해서 답해줘.'));
-  assert.ok(ctl.writes[1].data.startsWith('1부터 10까지 합을 계산해서 답만 숫자로 줘.'));
+  assert.ok(ctl.writes[0].data.startsWith('.omc/team/drops/to-worker-1-turn'));
+  assert.ok(ctl.writes[1].data.startsWith('.omc/team/drops/to-worker-2-turn'));
   assert.ok(!ctl.writes[1].data.includes('─'));
 
   orch.dispose();
@@ -207,8 +215,12 @@ test('orch: strips ANSI from leader output before parsing', () => {
     data: '\x1b[38;5;117m● @worker-1: go\x1b[0m\n',
   });
 
+  // v0.8.0 — body still routes (proving ANSI was stripped and the
+  // parser saw `@worker-1: go`), but delivery is via auto-spill so
+  // the worker pane receives the path-first notice, and the original
+  // body 'go' lands in the drop file.
   assert.equal(ctl.writes.length, 1);
-  assert.ok(ctl.writes[0].data.startsWith('go'));
+  assert.ok(ctl.writes[0].data.startsWith('.omc/team/drops/to-worker-1-turn'));
 
   orch.dispose();
 });
@@ -368,6 +380,540 @@ test('orch: dedup suppresses redraw repeats within the window', () => {
 
   assert.equal(ctl.writes.length, 1);
   assert.equal(orch.snapshot.stats.deduped, 4);
+
+  orch.dispose();
+});
+
+test('orch v0.5.1: rapid idle→busy flips within cooldown are coalesced into one turn', () => {
+  // Field bug: Claude's Ink TUI takes 500–800ms mid-response pauses
+  // (status ticks, internal re-renders) that the 500ms idle detector
+  // treats as idle→busy flips. Pre-v0.5.1 each flip bumped turnId,
+  // which scattered same-turn dedupe entries across 3–4 turnIds per
+  // user prompt and made B strategy useless. The cooldown coalesces
+  // those flips into a single logical turn.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // Simulate the failure mode: force multiple idle→busy transitions by
+  // flipping leaderWasIdle manually between pane data events, each one
+  // spaced less than the cooldown window (1500ms) apart.
+  const anyOrch = orch as any;
+  const bumpEdge = (dataHex: string) => {
+    anyOrch.leaderWasIdle = true;
+    ctl.firePaneData({ paneId: 'L', data: dataHex });
+  };
+
+  bumpEdge('● @worker-1: first chunk\n'); // turnId: 0 → 1
+  clock.advance(200);
+  bumpEdge('● continuation one\n');        // within cooldown → coalesced
+  clock.advance(200);
+  bumpEdge('● continuation two\n');        // still within cooldown → coalesced
+  clock.advance(200);
+  bumpEdge('● continuation three\n');      // still within cooldown → coalesced
+
+  const turnLogs = out.log.filter((l) => l.startsWith('[orch.turn]'));
+  const advanceLogs = turnLogs.filter((l) => l.includes('turnId advanced'));
+  const coalesceLogs = turnLogs.filter((l) => l.includes('coalesced'));
+
+  assert.equal(
+    advanceLogs.length,
+    1,
+    `expected exactly 1 advance log; got ${advanceLogs.length}: ${turnLogs.join(' | ')}`,
+  );
+  assert.ok(
+    coalesceLogs.length >= 1,
+    `expected at least 1 coalesce log; got ${coalesceLogs.length}: ${turnLogs.join(' | ')}`,
+  );
+
+  // Now advance past the cooldown and fire another edge — this one
+  // IS a new turn.
+  clock.advance(TURN_COOLDOWN_MS_EXPORTED_FOR_TEST + 100);
+  bumpEdge('● new turn content\n');
+  const advanceLogsAfter = out.log
+    .filter((l) => l.startsWith('[orch.turn]'))
+    .filter((l) => l.includes('turnId advanced'));
+  assert.equal(advanceLogsAfter.length, 2, 'second real turn should advance again');
+
+  orch.dispose();
+});
+
+// The orchestrator's TURN_COOLDOWN_MS is not exported; we mirror the
+// value here for test clarity. If the value in the source changes,
+// update this constant too — the test above relies on crossing it.
+const TURN_COOLDOWN_MS_EXPORTED_FOR_TEST = 1500;
+
+test('orch v0.5.0 (B): same-turn dedupe uses the new "same turn=" log format', () => {
+  // The commit log for a dedupe hit now includes the turnId so field
+  // debugging can distinguish same-turn suppression (correct) from
+  // cross-turn leakage (wrong). Verify the format change is wired.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: run task X\n' });
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: run task X\n' });
+
+  assert.equal(ctl.writes.length, 1);
+  assert.equal(orch.snapshot.stats.deduped, 1);
+  const sameTurnLogs = out.log.filter((l) => l.includes('same turn='));
+  assert.ok(
+    sameTurnLogs.length >= 1,
+    `expected at least one "same turn=" log, got logs: ${out.log.filter((l) => l.includes('[orch.commit]')).join(' | ')}`,
+  );
+
+  orch.dispose();
+});
+
+test('orch v0.5.0 (P4): round cap flips routingPaused so continued attempts are cheap drops', () => {
+  // Pre-v0.5.0, enforceRoundCap logged a notice but left routingPaused
+  // alone — the leader often kept trying for several more turns and each
+  // attempt re-entered the dedupe/debounce path. v0.5.0 flips the pause
+  // flag on cap, converting continued attempts into single-line
+  // `[orch.paused]` drops.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    maxRoundsPerTask: 2,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // Three distinct directives; the cap is 2, so the third should trip it
+  // and flip routingPaused.
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: task A\n' });
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: task B\n' });
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: task C\n' });
+
+  assert.equal(
+    orch.isPaused,
+    true,
+    'routingPaused should flip true once round cap is hit',
+  );
+  // resetRound should auto-resume since the pause came from the round cap.
+  orch.resetRound();
+  assert.equal(
+    orch.isPaused,
+    false,
+    'resetRound should clear a round-cap-induced pause',
+  );
+
+  orch.dispose();
+});
+
+test('orch v0.6.0: long worker turn body spills to drop file + leader notice', async () => {
+  // Pre-v0.6.0, long `@leader:` bodies fragmented through the pty
+  // pipeline and the parser yielded only the first 20–80 bytes. v0.6.0
+  // short-circuits: at the worker's busy→idle edge, if the transcript
+  // accumulated since turn start exceeds SPILL_THRESHOLD_CHARS (300),
+  // write the full body to `.omc/team/drops/<worker>-turnN-seqM.md`
+  // and inject a short notice into the leader.
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-spill-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  // v0.11.0 — These pre-v0.11 spill assertions are about the legacy
+  // shape (drop file at .omc/team/drops/<worker>-turn<N>-seq<S>.md plus
+  // a leader preview notice). Force legacy mode; the new artifact mode
+  // is exercised by separate tests in podiumArtifactSpill.test.ts.
+  orch.setWorkerReplyMode('legacy-auto-spill');
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+    dispatchDebounceMs: 0,
+  });
+  feedPrompt(ctl, 'L', 'claude');
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // v0.6.1 — Spill is now gated on `hasPendingReply` being true,
+  // which is set when the orchestrator injects into the worker.
+  // Fire an initial `@worker-1:` directive from the leader so the
+  // worker is marked as having a pending reply; otherwise the spill
+  // branch is skipped (treated as boot/repaint noise).
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: 구현해줘.\n' });
+  clock.advance(200);
+
+  // Simulate worker emitting a long multi-line code reply.
+  // v0.7.4: body lines must be 2-space indented so the projector
+  // classifies them as assistant-cont (otherwise 'other' closes the
+  // block and the body is filtered out of the transcript). Real
+  // Claude output wraps multi-line assistant content this way.
+  const longBody =
+    '@leader:\n' +
+    '  /**\n' +
+    '   * Grapheme cluster 단위로 문자열을 뒤집는다.\n' +
+    '   * surrogate pair, ZWJ 시퀀스, combining mark 모두 보존.\n' +
+    '   */\n' +
+    '  function reverseString(str) {\n' +
+    "    if (typeof str !== 'string') throw new TypeError('expected a string');\n" +
+    '    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });\n' +
+    '    const graphemes = [];\n' +
+    '    for (const { segment } of segmenter.segment(str)) graphemes.push(segment);\n' +
+    '    return graphemes.reverse().join("");\n' +
+    '  }\n';
+  assert.ok(longBody.length > 300, 'test body must exceed spill threshold');
+
+  ctl.firePaneData({ paneId: 'W1', data: longBody });
+  // Let the worker go idle so the idle-edge spill fires in tick(). The
+  // IdleDetector needs a recognized prompt pattern in its rolling tail
+  // to flip to idle — fire one after the reply body.
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+  (orch as any).tick();
+
+  // Drop file should exist.
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  const dropFiles = files.filter((f) => f.startsWith('worker-1-turn') && f.endsWith('.md'));
+  assert.equal(dropFiles.length, 1, `expected 1 drop file, got ${dropFiles.length}: ${files.join(', ')}`);
+
+  const content = await fsPromises.readFile(pathMod.join(dropDir, dropFiles[0]), 'utf8');
+  assert.ok(content.includes('reverseString'), 'drop file must contain the full body');
+  assert.ok(content.includes('# Drop: worker-1'), 'drop file must have the header');
+
+  // Leader should have received a drop notice (written to its pane).
+  const leaderWrites = ctl.writes.filter((w) => w.paneId === 'L').map((w) => w.data).join('');
+  assert.ok(
+    leaderWrites.includes('[drop from worker-1'),
+    `leader did not receive drop notice. writes: ${JSON.stringify(ctl.writes.map((w) => w.paneId))}`,
+  );
+  assert.ok(leaderWrites.includes('미리보기'), 'drop notice should include preview block');
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
+test('orch v0.7.0: long leader → worker payload spills to to-*.md + short notice injected', async () => {
+  // v0.6.x solved worker→leader long replies via drop files. v0.7.0
+  // applies the symmetric treatment to leader→worker delegations: when
+  // the leader sends a long payload (e.g. code review request with an
+  // embedded snippet), inject() diverts to a drop file and writes only
+  // a short notice to the worker pane.
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-l2w-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+    dispatchDebounceMs: 0,
+  });
+  feedPrompt(ctl, 'L', 'claude');
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // Leader emits a multi-line `@worker-1:` with a long body. This must
+  // trigger inject() with a > 300-char payload.
+  // Projector requires continuation lines to be 2-space indented
+  // (CLAUDE_ASSISTANT_CONT_RE). Body lines at column 0 classify as 'other'
+  // and close the assistant block, so we indent the body to keep the
+  // whole delegation inside the assistant block and reach the parser.
+  const longCodeDelegation =
+    '@worker-1:\n' +
+    '  다음 JavaScript reverseString 구현을 리뷰해줘. Intl.Segmenter 사용.\n\n' +
+    '  function reverseString(str) {\n' +
+    "    if (typeof str !== 'string') throw new TypeError('expected a string');\n" +
+    '    const segmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });\n' +
+    '    const graphemes = [];\n' +
+    '    for (const { segment } of segmenter.segment(str)) graphemes.push(segment);\n' +
+    '    return graphemes.reverse().join("");\n' +
+    '  }\n\n' +
+    '  특히 ZWJ emoji, surrogate pair, combining mark 관점에서 결함 찾아줘.\n' +
+    '  @end\n';
+  assert.ok(longCodeDelegation.length > 300, 'test delegation must exceed spill threshold');
+  ctl.firePaneData({ paneId: 'L', data: '● ' + longCodeDelegation });
+  clock.advance(200);
+
+  // Drop file with `to-worker-1-turn*.md` naming should exist.
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  const toFiles = files.filter((f) => f.startsWith('to-worker-1-turn') && f.endsWith('.md'));
+  assert.equal(
+    toFiles.length,
+    1,
+    `expected 1 leader→worker drop file, got ${toFiles.length}: ${files.join(', ')}`,
+  );
+
+  const content = await fsPromises.readFile(pathMod.join(dropDir, toFiles[0]), 'utf8');
+  assert.ok(content.includes('reverseString'), 'drop file must contain the full body');
+  assert.ok(
+    content.includes('direction: leader → worker-1'),
+    'drop file must record direction',
+  );
+
+  // Worker pane should have received a path-first notice rather than the full body.
+  const workerWrites = ctl.writes.filter((w) => w.paneId === 'W1').map((w) => w.data).join('');
+  assert.ok(
+    workerWrites.includes('.omc/team/drops/to-worker-1-turn'),
+    `worker did not receive path-first drop notice. writes: ${JSON.stringify(ctl.writes.map((w) => ({ p: w.paneId, d: w.data.slice(0, 80) })))}`,
+  );
+  assert.ok(
+    !workerWrites.includes('for (const { segment } of segmenter.segment(str))'),
+    'worker pane must NOT receive the full code body (spill failed to divert)',
+  );
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
+test('orch v0.8.0: EVERY leader → worker payload spills (unconditional, path-first notice)', async () => {
+  // v0.7.x had a 300-char threshold under which payloads went inline;
+  // v0.8.0 removes the threshold entirely. EVERY delegation is written
+  // to a file and the worker receives only a short path-first notice.
+  // Rationale: even short inline payloads fragment when Ink TUI
+  // classifies preceding context as 'other' and closes the assistant
+  // block mid-stream. The file-mediated path is the only reliable one.
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-l2w-v080-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+    dispatchDebounceMs: 0,
+  });
+  feedPrompt(ctl, 'L', 'claude');
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: run quick task.\n' });
+  clock.advance(200);
+
+  // Even this tiny 'run quick task.' payload MUST spill to a file.
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  const toFiles = files.filter((f) => f.startsWith('to-worker-1-turn'));
+  assert.equal(toFiles.length, 1, `short payload must also spill. files: ${files.join(', ')}`);
+
+  // File must contain the original body.
+  const dropContent = await fsPromises.readFile(pathMod.join(dropDir, toFiles[0]), 'utf8');
+  assert.ok(dropContent.includes('run quick task'), 'drop file must contain original body');
+
+  // Worker pane receives the path-first notice, NOT the body itself.
+  const workerWrites = ctl.writes.filter((w) => w.paneId === 'W1').map((w) => w.data).join('');
+  assert.ok(
+    workerWrites.includes('.omc/team/drops/to-worker-1-turn'),
+    `worker did not receive path-first notice. writes: ${JSON.stringify(ctl.writes.map((w) => ({ p: w.paneId, d: w.data.slice(0, 80) })))}`,
+  );
+  assert.ok(
+    !workerWrites.includes('run quick task'),
+    'worker pane must NOT receive the raw body — only the path-first notice',
+  );
+
+  // And the notice must START with the path (first 100 chars of the
+  // first inject to W1 must contain the path within). This is the
+  // fragmentation-survival invariant.
+  const firstW1Inject = ctl.writes.find((w) => w.paneId === 'W1' && w.data.includes('.omc/team/drops/'));
+  assert.ok(firstW1Inject, 'expected a W1 inject containing the drop path');
+  const pathOffset = firstW1Inject!.data.indexOf('.omc/team/drops/');
+  assert.ok(pathOffset < 50, `path must be near the START of the notice (got offset ${pathOffset})`);
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
+test('orch v0.6.1: worker boot output without preceding inject must NOT spill', async () => {
+  // Field bug v0.6.0: on summonTeam, Claude workers emit a multi-kilobyte
+  // boot UI (welcome screen, status bar, bypass-permissions notice) that
+  // accumulated in `transcript` and crossed SPILL_THRESHOLD_CHARS. Tick's
+  // idle-edge handler then spilled it as if it were a reply, injecting
+  // spurious `[drop from worker-N turn 0]` notices into the leader, which
+  // triggered a runaway meta-analysis cascade (leader tried to explain
+  // why workers had produced empty frames, delegating investigation back
+  // to workers, recursively).
+  //
+  // v0.6.1 gates spill/flush on `hasPendingReply` — only set by inject().
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-boot-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+  });
+
+  // Simulate a long boot-time burst from the worker — no inject preceded it.
+  const bootNoise =
+    '╭──────────────────────────────────────────────────╮\n' +
+    '│  Claude Code v2.1.118                           │\n' +
+    '│  Opus 4.7 (1M context) — Claude Max             │\n' +
+    "│  c:\\\\obsidian\\\\Won's 2nd Brain                    │\n" +
+    '╰──────────────────────────────────────────────────╯\n' +
+    '[OMC#4.12.0] | 5h:5%(4h4m) wk:46%(4d20h) sn:0%(5d15h)\n' +
+    '⏵⏵ bypass permissions on (shift+tab to cycle)\n' +
+    '>\n'.repeat(10);
+  assert.ok(bootNoise.length > 300, 'boot noise must exceed spill threshold to exercise the gate');
+
+  ctl.firePaneData({ paneId: 'W1', data: bootNoise });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+  (orch as any).tick();
+
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  assert.equal(
+    files.length,
+    0,
+    `boot noise must not spill. files: ${files.join(', ')}`,
+  );
+
+  // And the leader must not have been poked with a drop notice.
+  const leaderWrites = ctl.writes.filter((w) => w.paneId === 'L').map((w) => w.data).join('');
+  assert.ok(
+    !leaderWrites.includes('[drop from worker-1'),
+    `boot noise produced a drop notice: ${leaderWrites}`,
+  );
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
+test('orch v0.8.3: short worker reply ALSO spills (threshold removed)', async () => {
+  // v0.8.3 dropped the SPILL_THRESHOLD_CHARS gate for worker→leader.
+  // Rationale: field logs (reverseString relay) showed workers writing
+  // `@leader: <header>\n<long body>` — parser yielded only the header
+  // (single-line form) and the flush branch silently dropped the body.
+  // The user's review never reached the leader. Same symmetry argument
+  // that motivated v0.8.0's leader→worker unconditional spill applies
+  // the other way: the drop file is the robust channel; always use it.
+  const os = await import('node:os');
+  const fsPromises = await import('node:fs/promises');
+  const pathMod = await import('node:path');
+  const tmpRoot = await fsPromises.mkdtemp(pathMod.join(os.tmpdir(), 'podium-spill-'));
+
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  // v0.11.0 — Legacy spill assertions; same rationale as the v0.6.0 test.
+  orch.setWorkerReplyMode('legacy-auto-spill');
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    cwd: tmpRoot,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    enableWorkerRouting: true,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // Prime hasPendingReply via an inject; then emit short reply.
+  ctl.firePaneData({ paneId: 'L', data: '● @worker-1: say ok.\n' });
+  clock.advance(200);
+  ctl.firePaneData({ paneId: 'W1', data: '@leader: 짧은 확인 답변.\n' });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+  (orch as any).tick();
+
+  const dropDir = pathMod.join(tmpRoot, '.omc', 'team', 'drops');
+  const files = await fsPromises.readdir(dropDir).catch(() => [] as string[]);
+  const workerToLeaderFiles = files.filter(
+    (f) => f.startsWith('worker-1-turn') && !f.startsWith('to-'),
+  );
+  assert.ok(
+    workerToLeaderFiles.length >= 1,
+    `short worker→leader reply must spill too (all files: ${files.join(', ')})`,
+  );
+
+  await fsPromises.rm(tmpRoot, { recursive: true, force: true });
+  orch.dispose();
+});
+
+test('orch v0.5.0 (P4): manual pause survives resetRound (only round-cap pauses auto-clear)', () => {
+  // If the user explicitly pauses routing, a subsequent resetRound must
+  // NOT silently resume. Only the round-cap-induced pause is auto-cleared.
+  const ctl = makeFakePanel();
+  const out = makeOutputChannel();
+  const clock = mkClock();
+  const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  orch.attach({
+    leader: { paneId: 'L', agent: 'claude' },
+    workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
+    now: clock.now,
+    skipAutoTick: true,
+    dedupeWindowMs: 30_000,
+    maxRoundsPerTask: 5,
+  });
+  feedPrompt(ctl, 'W1', 'claude');
+  clock.advance(200);
+
+  // User pauses manually.
+  orch.pause();
+  assert.equal(orch.isPaused, true);
+
+  // resetRound fires — must NOT clear the manual pause.
+  orch.resetRound();
+  assert.equal(orch.isPaused, true, 'manual pause must survive resetRound');
 
   orch.dispose();
 });

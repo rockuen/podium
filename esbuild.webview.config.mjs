@@ -25,7 +25,6 @@ const entries = [
   ['src/orchestration/webview/hud-dashboard-main.ts',      'out/orchestration/webview/hud-dashboard.js'],
   ['src/orchestration/webview/team-conversation-main.ts',  'out/orchestration/webview/team-conversation.js'],
   ['src/orchestration/webview/spawn-team-main.ts',         'out/orchestration/webview/spawn-team.js'],
-  ['src/orchestration/webview/multipane-main.ts',          'out/orchestration/webview/multipane.js'],
   ['src/orchestration/webview/terminal-main.ts',           'out/orchestration/webview/terminal.js'],
   ['src/orchestration/webview/ccg-viewer-main.ts',         'out/orchestration/webview/ccg-viewer.js'],
   // Phase 1 (v2.7.0) — LiveMultiPanel: N live node-pty panes in one webview.

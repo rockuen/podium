@@ -1,8 +1,8 @@
 {
   "name": "podium",
   "displayName": "Podium — Multi-Agent Stage for Claude Code",
-  "description": "Orchestrate multi-agent Claude teams from one stage — leader + worker panes with structured routing, idle detection, team snapshots, and dissolve-with-summary. Or run a solo Claude Code session in a rich Webview tab.",
-  "version": "0.1.0",
+  "description": "Orchestrate multi-agent Claude teams from one stage — leader + worker panes with structured routing, idle detection, team snapshots, and dissolve-with-summary. Or run a solo Claude Code session in a rich Webview tab. No external multiplexer required.",
+  "version": "0.11.0",
   "keywords": [
     "claude",
     "claude-code",
@@ -13,8 +13,8 @@
     "orchestration",
     "team",
     "terminal",
-    "tmux",
-    "webview"
+    "webview",
+    "node-pty"
   ],
   "publisher": "rockuen",
   "license": "MIT",
@@ -42,12 +42,6 @@
           "light": "./icons/claude-robot.svg",
           "dark": "./icons/claude-robot.svg"
         },
-        "category": "Claude"
-      },
-      {
-        "command": "claudeCodeLauncher.createPodiumSession",
-        "title": "New Podium-ready Session",
-        "icon": "$(organization)",
         "category": "Claude"
       },
       {
@@ -156,40 +150,6 @@
         "category": "Claude"
       },
       {
-        "command": "claudeCodeLauncher.team.create",
-        "title": "New Team",
-        "icon": "$(add)",
-        "category": "Claude"
-      },
-      {
-        "command": "claudeCodeLauncher.team.createIntegrated",
-        "title": "New Team (Integrated Terminal)",
-        "category": "Claude"
-      },
-      {
-        "command": "claudeCodeLauncher.team.quickCreate",
-        "title": "Quick Create Team",
-        "category": "Claude"
-      },
-      {
-        "command": "claudeCodeLauncher.team.attach",
-        "title": "Attach Team",
-        "icon": "$(link)",
-        "category": "Claude"
-      },
-      {
-        "command": "claudeCodeLauncher.team.kill",
-        "title": "Kill Team",
-        "icon": "$(trash)",
-        "category": "Claude"
-      },
-      {
-        "command": "claudeCodeLauncher.orchestration.killAll",
-        "title": "Kill All Orchestration Sessions (Emergency Reset)",
-        "icon": "$(warning)",
-        "category": "Podium"
-      },
-      {
         "command": "claudeCodeLauncher.podium.liveTest",
         "title": "Live Multi-Pane Test (v2.7.0 prototype — 2 Claudes)",
         "icon": "$(beaker)",
@@ -214,6 +174,30 @@
         "category": "Podium"
       },
       {
+        "command": "claudeCodeLauncher.podium.summonTeam",
+        "title": "Summon Team (extend current Claude session with workers)",
+        "icon": "$(organization)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.pause",
+        "title": "Pause Routing",
+        "icon": "$(debug-pause)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.resume",
+        "title": "Resume Routing",
+        "icon": "$(debug-start)",
+        "category": "Podium"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.resetRound",
+        "title": "Reset Round Counter",
+        "icon": "$(refresh)",
+        "category": "Podium"
+      },
+      {
         "command": "claudeCodeLauncher.podium.snapshot.save",
         "title": "Save Team Snapshot (v2.7.19)",
         "icon": "$(save)",
@@ -228,12 +212,6 @@
       {
         "command": "claudeCodeLauncher.podium.snapshot.rename",
         "title": "Rename Saved Team... (v2.7.21)",
-        "icon": "$(edit)",
-        "category": "Podium"
-      },
-      {
-        "command": "claudeCodeLauncher.team.rename",
-        "title": "Rename Team Display Name",
         "icon": "$(edit)",
         "category": "Podium"
       },
@@ -256,17 +234,6 @@
         "icon": "$(edit)"
       },
       {
-        "command": "claudeCodeLauncher.team.missions.focus",
-        "title": "Show Missions",
-        "category": "Claude"
-      },
-      {
-        "command": "claudeCodeLauncher.team.missions.refresh",
-        "title": "Refresh Missions",
-        "icon": "$(refresh)",
-        "category": "Claude"
-      },
-      {
         "command": "claudeCodeLauncher.podium.enter",
         "title": "Enter Podium Mode",
         "category": "Claude"
@@ -282,16 +249,16 @@
         "category": "Claude"
       },
       {
-        "command": "claudeCodeLauncher.podium.grid",
-        "title": "Show Multi-pane",
-        "icon": "$(layout)",
-        "category": "Claude"
-      },
-      {
         "command": "claudeCodeLauncher.podium.dashboard",
         "title": "Show Team Dashboard",
         "icon": "$(dashboard)",
         "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.consultOthers",
+        "title": "Podium: Consult Other Models",
+        "icon": "$(comment-discussion)",
+        "category": "Podium"
       },
       {
         "command": "claudeCodeLauncher.hud.focus",
@@ -404,11 +371,6 @@
           "when": "claudeCodeLauncher.podiumModeActive"
         },
         {
-          "id": "claudeCodeLauncher.missionsPanel",
-          "name": "Missions",
-          "when": "claudeCodeLauncher.podiumModeActive"
-        },
-        {
           "id": "claudeCodeLauncher.historyPanel",
           "name": "Session History",
           "when": "claudeCodeLauncher.podiumModeActive"
@@ -495,31 +457,6 @@
           "group": "1_order@2"
         },
         {
-          "command": "claudeCodeLauncher.conversation.focus",
-          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == omcSession",
-          "group": "inline@1"
-        },
-        {
-          "command": "claudeCodeLauncher.podium.grid",
-          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == omcSession",
-          "group": "inline@2"
-        },
-        {
-          "command": "claudeCodeLauncher.team.attach",
-          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == omcSession",
-          "group": "inline@3"
-        },
-        {
-          "command": "claudeCodeLauncher.team.kill",
-          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == omcSession",
-          "group": "inline@4"
-        },
-        {
-          "command": "claudeCodeLauncher.team.rename",
-          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == omcSession",
-          "group": "1_order@3"
-        },
-        {
           "command": "claudeCodeLauncher.session.openDir",
           "when": "view == claudeCodeLauncher.historyPanel && (viewItem == historyEntry || viewItem == historyEntryActive)",
           "group": "inline@1"
@@ -538,6 +475,31 @@
           "command": "claudeCodeLauncher.podium.worker.rename",
           "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumWorker",
           "group": "inline@2"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.snapshot.save",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "inline@2"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.dissolve",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "inline@3"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.pause",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "1_ping_pong@1"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.resume",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "1_ping_pong@2"
+        },
+        {
+          "command": "claudeCodeLauncher.podium.resetRound",
+          "when": "view == claudeCodeLauncher.teamsOrchestration && viewItem == podiumLiveTeam",
+          "group": "1_ping_pong@3"
         }
       ],
       "view/title": [
@@ -547,28 +509,33 @@
           "when": "view == claudeCodeLauncher.sessionList"
         },
         {
-          "command": "claudeCodeLauncher.createPodiumSession",
+          "command": "claudeCodeLauncher.refreshSessions",
           "group": "navigation@2",
           "when": "view == claudeCodeLauncher.sessionList"
         },
         {
-          "command": "claudeCodeLauncher.refreshSessions",
-          "group": "navigation@3",
-          "when": "view == claudeCodeLauncher.sessionList"
+          "command": "claudeCodeLauncher.podium.orchestrate",
+          "group": "navigation@0",
+          "when": "view == claudeCodeLauncher.teamsOrchestration"
         },
         {
-          "command": "claudeCodeLauncher.team.create",
+          "command": "claudeCodeLauncher.podium.orchestrate.resume",
           "group": "navigation@1",
           "when": "view == claudeCodeLauncher.teamsOrchestration"
         },
         {
-          "command": "claudeCodeLauncher.session.filter",
+          "command": "claudeCodeLauncher.podium.snapshot.load",
           "group": "navigation@2",
           "when": "view == claudeCodeLauncher.teamsOrchestration"
         },
         {
-          "command": "claudeCodeLauncher.orchestration.killAll",
+          "command": "claudeCodeLauncher.podium.snapshot.rename",
           "group": "navigation@3",
+          "when": "view == claudeCodeLauncher.teamsOrchestration"
+        },
+        {
+          "command": "claudeCodeLauncher.session.filter",
+          "group": "navigation@9",
           "when": "view == claudeCodeLauncher.teamsOrchestration"
         },
         {
@@ -580,11 +547,6 @@
           "command": "claudeCodeLauncher.hud.refresh",
           "group": "navigation@2",
           "when": "view == claudeCodeLauncher.hudPanel"
-        },
-        {
-          "command": "claudeCodeLauncher.team.missions.refresh",
-          "group": "navigation@1",
-          "when": "view == claudeCodeLauncher.missionsPanel"
         },
         {
           "command": "claudeCodeLauncher.history.refresh",
@@ -601,6 +563,19 @@
     "configuration": {
       "title": "Podium CLI Launcher for Claude",
       "properties": {
+        "podium.workerReplyMode": {
+          "type": "string",
+          "enum": [
+            "artifact",
+            "legacy-auto-spill"
+          ],
+          "enumDescriptions": [
+            "v0.11+ default — workers must Write explicit markdown files under .omc/team/artifacts/. Only those files are inject into the leader (path notice). Worker pty thinking/noise stays out of the leader's context. Raw turn body archived to .omc/team/drops/raw/ for debugging.",
+            "Pre-v0.11 behaviour — every worker turn's raw pty body is dumped to .omc/team/drops/<worker>-turn<N>-seq<S>.md and a preview notice is inject into the leader. Use only as a regression escape hatch."
+          ],
+          "default": "artifact",
+          "description": "Worker → leader reply mode. 'artifact' (default) makes workers author deliberate markdown files; 'legacy-auto-spill' restores the pre-v0.11 raw pty dump behaviour."
+        },
         "claudeCodeLauncher.defaultTheme": {
           "type": "string",
           "default": "default",
@@ -725,30 +700,10 @@
           },
           "description": "File extension → open method. Values: 'editor' (IDE), 'system' (OS default), 'obsidian', 'browser', 'excel', or full app path."
         },
-        "claudeCodeLauncher.orchestration.sessionPrefix": {
-          "type": "string",
-          "default": "omc-team-",
-          "description": "Prefix used to identify OMC team sessions in tmux/psmux."
-        },
         "claudeCodeLauncher.orchestration.claudeCommand": {
           "type": "string",
           "default": "",
           "description": "Override path to the `claude` CLI for orchestration. Empty = auto-detect."
-        },
-        "claudeCodeLauncher.orchestration.backend": {
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "auto",
-            "tmux",
-            "psmux"
-          ],
-          "description": "Multiplexer backend for orchestration (auto: psmux on win32, tmux elsewhere)."
-        },
-        "claudeCodeLauncher.orchestration.sessionFilter": {
-          "type": "string",
-          "default": "",
-          "description": "Substring filter for orchestration session names (empty = no filter)."
         }
       }
     },

@@ -35,63 +35,16 @@
 // Non-Podium multi-line sends are still a known gap — pty.write + CR is
 // kept to avoid the v2.6.20-style lockup.
 
-const { execFile } = require('child_process');
-const { findMuxBinary } = require('./tmuxWrap');
-
-// Win32-input-mode Shift+Enter key event (down + up). See MS ConPTY spec:
-// https://github.com/microsoft/terminal/blob/main/doc/specs/%234999%20-%20Improved%20keyboard%20handling%20in%20Conpty.md
-const SHIFT_ENTER_KEY_EVENT =
-  '\x1b[13;28;10;1;16;1_' +   // keydown: vk=13 (VK_RETURN), sc=28, uc=10 (LF), kd=1, cs=16 (SHIFT), rc=1
-  '\x1b[13;28;10;0;16;1_';    // keyup:   same with kd=0
-
 function autoSendToEntry(entry, text) {
   if (!entry || !entry.pty) return;
   if (text == null) return;
   // Strip any trailing CR/LF — this helper is responsible for appending Enter.
-  let body = String(text).replace(/[\r\n]+$/, '');
-  const multiline = body.includes('\n') || body.includes('\r');
-
-  const podiumReady = !!(entry.podiumReady && entry.tmuxSession);
-  if (!podiumReady) {
-    try { entry.pty.write(body + '\r'); } catch (e) {
-      console.warn('[auto-send] pty.write failed:', e && e.message);
-    }
-    return;
+  const body = String(text).replace(/[\r\n]+$/, '');
+  try {
+    entry.pty.write(body + '\r');
+  } catch (e) {
+    console.warn('[auto-send] pty.write failed:', e && e.message);
   }
-
-  const muxBin = findMuxBinary(process.platform === 'win32' ? 'psmux' : 'tmux',
-    process.platform === 'win32' ? 'tmux' : null);
-  const target = entry.tmuxSession + ':0';
-  const fallback = () => {
-    try { entry.pty.write(body + '\r'); } catch (e) {
-      console.warn('[auto-send] pty.write fallback failed:', e && e.message);
-    }
-  };
-  if (!muxBin) {
-    console.warn('[auto-send] mux binary not found; falling back to pty.write for', target);
-    fallback();
-    return;
-  }
-
-  // Payload: lines joined by Win32 Shift+Enter key events. Single-line bodies
-  // produce no SHIFT_ENTER insertions (lines.length === 1). `-l` keeps psmux
-  // from parsing embedded ESC sequences as key names — it types every byte.
-  const lines = body.split(/\r?\n/);
-  const payload = lines.join(SHIFT_ENTER_KEY_EVENT);
-
-  execFile(muxBin, ['send-keys', '-l', '-t', target, payload], { windowsHide: true }, (err) => {
-    if (err) {
-      console.warn('[auto-send] send-keys -l failed, falling back:', err && err.message);
-      fallback();
-      return;
-    }
-    execFile(muxBin, ['send-keys', '-t', target, 'Enter'], { windowsHide: true }, (err2) => {
-      if (err2) {
-        console.warn('[auto-send] submit Enter failed:', err2 && err2.message);
-        try { entry.pty.write('\r'); } catch (_) {}
-      }
-    });
-  });
 }
 
 module.exports = { autoSendToEntry };

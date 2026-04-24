@@ -43,14 +43,6 @@ function activate(context) {
     })
   );
 
-  // v2.6.12: Podium-ready session — wraps Claude in a tmux/psmux session so
-  // `omc team` can use this pane as leader. Opt-in only; default stays direct.
-  context.subscriptions.push(
-    vscode.commands.registerCommand('claudeCodeLauncher.createPodiumSession', () => {
-      createPanel(context, extensionPath, { podiumReady: true });
-    })
-  );
-
   context.subscriptions.push(
     vscode.commands.registerCommand('claudeCodeLauncher.renameTab', async () => {
       let activeEntry = null;
@@ -106,13 +98,7 @@ function activate(context) {
       if (filtered.length !== saved.length) {
         sessionStoreUpdate('claudeSavedSessions', filtered);
       }
-      // v2.6.12: re-apply Podium-ready flag when resuming a previously-wrapped
-      // session so the restart spawns back into its tmux session.
-      const podiumMap = sessionStoreGet('claudePodiumReadySessions', {});
-      const podiumInfo = podiumMap[sessionId];
-      const seed = { sessionId, title };
-      if (podiumInfo) seed.podiumReady = true;
-      createPanel(context, extensionPath, seed);
+      createPanel(context, extensionPath, { sessionId, title });
     })
   );
 
@@ -328,10 +314,16 @@ function activate(context) {
   }
 
   // ─── Orchestration status bar entry point (M1, toggle wrapper in M3) ───
-  state.podiumModeActive = false;
+  // v0.4.2 — Podium Mode is the default on activation. The user asked for
+  // the sidebar to boot straight into Podium so the team views (workers,
+  // live teams, snapshots) are visible without a manual toggle click.
+  // The status bar starts with the "Podium Mode" label and we fire
+  // `podium.enter` once after the orchestration module finishes activating
+  // so its context key flip happens after command registration.
+  state.podiumModeActive = true;
   state.orchStatusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 99);
-  state.orchStatusBar.text = '$(organization) Orchestration';
-  state.orchStatusBar.tooltip = 'Claude: Enter Podium Mode';
+  state.orchStatusBar.text = '$(organization) Podium Mode';
+  state.orchStatusBar.tooltip = 'Claude: Exit Podium Mode';
   state.orchStatusBar.command = 'claudeCodeLauncher.podium.toggle';
   state.orchStatusBar.show();
   context.subscriptions.push(state.orchStatusBar);
@@ -365,6 +357,15 @@ function activate(context) {
         context.subscriptions.push({
           dispose: () => { try { orch.dispose(); } catch (_) { /* ignore */ } }
         });
+        // v0.4.2 — Auto-enter Podium Mode now that orchestration commands
+        // are registered. The status-bar label was already initialized to
+        // the active state above; this just flips the context key so the
+        // conditional Podium views show up in the sidebar immediately.
+        vscode.commands
+          .executeCommand('claudeCodeLauncher.podium.enter')
+          .then(undefined, (err) => {
+            console.warn('[orchestration] auto-enter podium failed:', err?.message || err);
+          });
       })
       .catch((e) => {
         console.warn('[orchestration] activation failed:', e?.message || e);
@@ -385,11 +386,8 @@ function activate(context) {
 function deactivate() {
   state.isDeactivating = true;
 
-  // v2.6.32: reuse saveSessions() so podiumReady / tmuxSession / titleMap /
-  // claudePodiumReadySessions all get persisted identically to the in-flight
-  // path (rename-tab etc). Previously this block hand-rolled the entry object
-  // and dropped the podium fields, so psmux-wrapped sessions restored as
-  // plain pty after VSCode reload.
+  // Persist session metadata (titles, sessionIds) before shutdown so
+  // Reload Window can restore tabs.
   if (state.context && state.panels.size > 0) {
     try {
       saveSessions();

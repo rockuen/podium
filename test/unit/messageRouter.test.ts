@@ -68,6 +68,166 @@ test('router: flush returns dangling single-line token', () => {
   assert.deepEqual(p.flush(), []);
 });
 
+test('router v0.8.7: long directive wrapped across two pty chunks is NOT truncated', () => {
+  // Field bug: leader emitted a long directive Ink-wrapped at a comma.
+  // First pty chunk ended exactly at the wrap newline; second chunk
+  // carried the 2-space-indented continuation. Pre-v0.8.7 the parser
+  // terminated single-line at the first `\n` (peek empty → isBlank
+  // treated as non-continuation), yielded the truncated row, advanced
+  // past the token, and then had no way to pick up the continuation —
+  // it hit the stream with no `@worker-N:` prefix and got absorbed
+  // as narrative. Drop file carried the comma-cut payload unusable to
+  // the worker. Reference: session 2026-04-24, drop
+  // `to-worker-2-turn6-seq1.md` = 69 bytes mid-sentence.
+  //
+  // Fix: when (a) we are on the first iteration (no folding yet), (b)
+  // the chosen newline is the LAST byte in the buffer, and (c) the
+  // payload is long (>=30 chars) and not sentence-terminated, hold
+  // the partial in the buffer and wait for the next feed.
+  const p = new WorkerPatternParser();
+  // Chunk 1 mimics the field capture: directive, 69-ish bytes, comma
+  // at end, newline is buffer's last byte.
+  const msgs1 = p.feed(
+    '@worker-2: .omc/team/artifacts/reverseString.js 파일을 읽고 두 버전(reverseStringSimple,\n',
+  );
+  assert.equal(msgs1.length, 0, 'must hold until continuation arrives');
+
+  // Chunk 2 brings the 2-space-indented wrap continuation + final
+  // period which terminates the directive.
+  const msgs2 = p.feed(
+    '  reverseStringUnicode)을 검토해줘.\n',
+  );
+  assert.equal(msgs2.length, 1);
+  assert.equal(msgs2[0].workerId, 'worker-2');
+  assert.match(msgs2[0].payload, /reverseStringSimple/);
+  assert.match(msgs2[0].payload, /reverseStringUnicode/);
+  assert.match(msgs2[0].payload, /검토해줘/);
+});
+
+test('router v0.8.7: short directive at end-of-buffer still yields (no hold regression)', () => {
+  // Guard: the v0.8.7 hold must NOT fire for short, sentence-complete
+  // directives that happen to land a newline at the buffer tail. This
+  // is the pattern of the legacy single-directive tests.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: say ok.\n');
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload, 'say ok.');
+});
+
+test('router v0.8.7: held partial is released by flush on leader idle', () => {
+  // If the continuation never arrives (e.g. leader stops emitting),
+  // the held partial must still surface via flush() on the idle edge.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: implement reverseString with Intl.Segmenter and full test coverage,\n',
+  );
+  assert.equal(msgs.length, 0, 'hold until further data');
+  const flushed = p.flush();
+  assert.equal(flushed.length, 1);
+  assert.match(flushed[0].payload, /Intl\.Segmenter/);
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// v0.8.9 — indent-less wrap continuation.
+//
+// Field evidence (2026-04-23 session, drop `to-worker-2-turn4-seq1.md`,
+// 60B): leader emitted
+//     @worker-2: .omc/team/artifacts/reverseString.js의 구현을 리뷰해줘. 체크할 포인트: (1)\nIntl.Seg...
+// in a SINGLE pty chunk. The `\n` after "(1)" was an Ink visual wrap,
+// but the wrapped row `Intl.Seg...` had NO 2-space indent. v0.8.7's
+// continuation rule required indent AND end-of-buffer hold only fires
+// when `\n` is buffer-last — neither matched, so parser yielded the
+// truncated "체크할 포인트: (1)" payload. Worker-2 received unusable
+// instructions and had to reconstruct from context.
+//
+// Fix: when (a) payload-so-far is wrap-suspect (≥30 chars, no terminal
+// punctuation), and (b) next line is not a new `@target:` / `@end` /
+// blank, fold into the directive even without the 2-space indent. The
+// legitimate leader-multi-line-prose case is handled by the terminal-
+// punctuation guard (v0.4.2) and the blank-line guard.
+//
+// Pairs with `normalize()` update: single-line folded `\n` (with any
+// or no indent) collapses to a single space.
+// ─────────────────────────────────────────────────────────────────────
+
+test('router v0.8.9: indent-less wrap continuation in same chunk folds', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-2: .omc/team/artifacts/reverseString.js의 구현을 리뷰해줘. 체크할 포인트: (1)\nIntl.Segmenter fallback을 확인해줘.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].workerId, 'worker-2');
+  assert.match(msgs[0].payload, /체크할 포인트: \(1\)/);
+  assert.match(msgs[0].payload, /Intl\.Segmenter fallback/);
+});
+
+test('router v0.8.9: indent-less wrap across two pty chunks folds', () => {
+  // Stronger form: the v0.8.7 chunk-split fix required indent on the
+  // continuation. This asserts no-indent continuation also works.
+  const p = new WorkerPatternParser();
+  const msgs1 = p.feed(
+    '@worker-2: .omc/team/artifacts/reverseString.js의 구현을 리뷰해줘. 체크할 포인트: (1)\n',
+  );
+  assert.equal(msgs1.length, 0, 'v0.8.7 end-of-buffer hold must fire');
+  const msgs2 = p.feed('Intl.Segmenter fallback을 확인해줘.\n');
+  assert.equal(msgs2.length, 1);
+  assert.match(msgs2[0].payload, /체크할 포인트: \(1\)/);
+  assert.match(msgs2[0].payload, /Intl\.Segmenter fallback/);
+});
+
+test('router v0.8.9: short payload without terminal punct does NOT force-fold', () => {
+  // Guard against over-holding. "apple" is too short to be mid-wrap —
+  // a real wrap only happens when the line is long enough for Ink to
+  // break it. Threshold = 30 chars (consistent with v0.8.7).
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: apple\nother text\n');
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload, 'apple');
+});
+
+test('router v0.8.9: terminal punct ends directive even with long no-indent follow', () => {
+  // Payload ends with `.` — clearly complete. Follow-up line must NOT
+  // be folded regardless of length.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: this is a long enough directive ending with a period.\nseparate narrative that should not be folded in.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(
+    msgs[0].payload,
+    'this is a long enough directive ending with a period.',
+  );
+});
+
+test('router v0.8.9: next @target directive terminates a long no-punct payload', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: long directive without terminal punct but another target follows\n@worker-2: second task.\n',
+  );
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0].workerId, 'worker-1');
+  assert.equal(
+    msgs[0].payload,
+    'long directive without terminal punct but another target follows',
+  );
+  assert.equal(msgs[1].workerId, 'worker-2');
+  assert.equal(msgs[1].payload, 'second task.');
+});
+
+test('router v0.8.9: blank line after long no-punct payload still terminates', () => {
+  // Blank line is a stronger signal than absence of terminal punct —
+  // it says "paragraph ended here". Do not fold across blank lines.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: long directive without terminal punct that keeps going\n\nfollowing paragraph is separate.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(
+    msgs[0].payload,
+    'long directive without terminal punct that keeps going',
+  );
+});
+
 // ─── Claude leader projector ───
 
 test('projector: ignores user prompt echo and input-box chrome', () => {
@@ -233,4 +393,244 @@ test('projector+parser: chunk-boundary split still dispatches both workers', () 
   assert.equal(msgs[0].payload, 'apple');
   assert.equal(msgs[1].workerId, 'worker-2');
   assert.equal(msgs[1].payload, 'banana is the answer.');
+});
+
+test('projector v0.3.6: bare @worker-N: after plain paragraph is emitted', () => {
+  // Regression for v0.3.5 field log: leader opened with `●` bullet, wrote a
+  // multi-paragraph reply, then emitted a bare `@worker-1:` directive on
+  // its own line. Pre-fix, the plain-paragraph line ("먼저 worker-1에게…")
+  // classified as 'other' and kicked the projector out of its assistant
+  // block; the subsequent directive was dropped and never reached the
+  // parser. v0.3.6 classifies bare `@target:` lines as assistant-start so
+  // they re-enter the block.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '● 좋습니다. 이 볼트 환경과 관련된 작업입니다.\n' +
+    '  파일명 파서가 필요합니다.\n' +
+    '\n' +
+    '먼저 worker-1에게 초안을 맡기겠습니다.\n' +
+    '\n' +
+    '@worker-1: TypeScript 함수 초안을 작성해줘.\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 1, `expected 1 routed msg, got ${msgs.length}; projected=${JSON.stringify(projected)}`);
+  assert.equal(msgs[0].workerId, 'worker-1');
+  assert.ok(msgs[0].payload.startsWith('TypeScript 함수'));
+});
+
+test('projector v0.3.6: bare @leader: line from worker re-enters assistant block', () => {
+  // Symmetric case on the worker side. Worker's reply contains a plain
+  // paragraph followed by a `@leader:` reply directive — must not be
+  // suppressed.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '● 구현 완료했습니다. 함수 2개 작성함.\n' +
+    '\n' +
+    '결과를 리더에게 전달하겠습니다.\n' +
+    '\n' +
+    '@leader: 구현 완료, 함수 2개.\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 1, `expected 1 routed msg, got ${msgs.length}; projected=${JSON.stringify(projected)}`);
+  assert.equal(msgs[0].workerId, 'leader');
+  assert.ok(msgs[0].payload.startsWith('구현 완료'));
+});
+
+test('projector v0.7.2: indented @worker-N: directive re-enters closed assistant block', () => {
+  // Field regression from v0.7.1: leader emits a delegation whose "@worker-2:"
+  // line is INDENTED (Ink wraps it under a preceding bullet, but a 'other'
+  // diagnostic narration line has meanwhile closed the assistant block).
+  // Pre-v0.7.2 the indented "@worker-2:" matched only CLAUDE_ASSISTANT_CONT_RE,
+  // which drops when the block is closed — so the whole delegation was
+  // suppressed and worker-2 was never routed to. v0.7.2 relaxes the bare-
+  // directive classifier to allow leading whitespace, so any "@target:"
+  // line anywhere in the stream re-opens the block and reaches the parser.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '● 중간에 진단 문장을 넣었다.\n' +
+    '이건 other 라인이라 assistant 블록을 닫는다.\n' + // 'other' → closes block
+    '    @worker-2: worker-1의 reverseString 초안을 리뷰해줘.\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 1, 'indented @worker-2: directive must route');
+  assert.equal(msgs[0].workerId, 'worker-2');
+  assert.match(msgs[0].payload, /리뷰해줘/);
+});
+
+test('projector v0.7.2: prompt echo still dropped after bare-directive relaxation', () => {
+  // Negative control: prompt echo lines carry a `>` prefix, not a
+  // whitespace-plus-@ prefix, so the relaxed regex does not match them.
+  // Falls through to CLAUDE_PROMPT_RE which drops as before.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '>   @worker-1: I typed this as input, echo only.\n' +
+    '────────────\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 0, 'indented prompt echo must not route');
+});
+
+test('projector v0.3.6: prompt echo with bare @worker- still dropped', () => {
+  // Prompt echo ALWAYS carries a `>` prefix, so bare @worker-N at column 0
+  // can never be a pasted echo. The new bare-directive classifier must not
+  // accidentally admit prompt echoes.
+  const proj = new ClaudeLeaderRoutingProjector();
+  const input =
+    '> @worker-1: I typed this as input, echo only.\n' +
+    '────────────\n';
+  const projected = proj.feed(input);
+  const parser = new WorkerPatternParser();
+  const msgs = parser.feed(projected);
+  assert.equal(msgs.length, 0, 'prompt echo must not route');
+});
+
+// ─── v0.4.0 · protocol-template noise guard ───
+
+test('router v0.4.0: placeholder-only payload `... /` is dropped', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: ... /\n');
+  assert.equal(msgs.length, 0, 'ellipsis-slash placeholder must not route');
+});
+
+test('router v0.4.0: pure ellipsis payload is dropped', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: ...\n');
+  assert.equal(msgs.length, 0, 'pure ellipsis must not route');
+});
+
+test('router v0.4.0: protocol meta keywords drop the directive', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-2: ... (컬럼 0에서 시작) - 라운드 예산: 작업당 10회 - Effort: max\n',
+  );
+  assert.equal(msgs.length, 0, 'protocol meta payload must not route');
+});
+
+test('router v0.4.0: system-prompt template row `<task for worker-1>` is dropped', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: <task for worker-1>\n');
+  assert.equal(msgs.length, 0, 'template placeholder must not route');
+});
+
+test('router v0.4.0: real task mentioning ellipsis still routes', () => {
+  // Negative control: payloads with real content that happens to CONTAIN
+  // ellipsis must still go through — only payloads that are ENTIRELY
+  // placeholder text should be suppressed.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: 피보나치 수열을 1, 1, 2, 3, 5, ... 로 출력해줘.\n');
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].workerId, 'worker-1');
+  assert.match(msgs[0].payload, /피보나치/);
+});
+
+test('router v0.4.0: multi-directive chunk drops template, keeps real task', () => {
+  // Reproduces the v0.3.9 field log where a single projected chunk yielded
+  // both a template row and a real task row. Only the real task survives.
+  const p = new WorkerPatternParser();
+  const chunk =
+    '@worker-1: ... /\n' +
+    '@worker-2: ... (컬럼 0에서 시작) - 라운드 예산: 작업당 10회 - Effort: max\n' +
+    '@worker-1: "apple"이라고만 말해줘. 다른 말은 붙이지 말고.\n' +
+    '@worker-2: "banana"라고만 말해줘. 다른 말은 붙이지 말고.\n';
+  const msgs = p.feed(chunk);
+  assert.equal(msgs.length, 2, 'only the two real task directives survive');
+  assert.equal(msgs[0].workerId, 'worker-1');
+  assert.match(msgs[0].payload, /apple/);
+  assert.equal(msgs[1].workerId, 'worker-2');
+  assert.match(msgs[1].payload, /banana/);
+});
+
+// ─── v0.4.2 · strategy C — terminal-punctuation guard ───
+
+test('router v0.4.2: period-terminated directive does not fold Ink follow-up narration', () => {
+  // Field reproduction: leader emitted
+  //   @worker-2: "banana"라고만 답하세요. 다른 말은 일절 하지 마세요.
+  //     두 워커의 응답을 기다리겠습니다.
+  // Pre-v0.4.2, the 2-space indented next line was folded into worker-2's
+  // payload, so the dedupe key mutated between the original emission and
+  // the Ink-repaint replay (which dropped the narration tail). v0.4.2
+  // refuses to fold across sentence-terminal punctuation.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-2: "banana"라고만 답하세요. 다른 말은 일절 하지 마세요.\n' +
+    '  두 워커의 응답을 기다리겠습니다.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].workerId, 'worker-2');
+  assert.equal(
+    msgs[0].payload,
+    '"banana"라고만 답하세요. 다른 말은 일절 하지 마세요.',
+    'narration tail must NOT be folded into the directive payload',
+  );
+});
+
+test('router v0.4.2: question/exclamation terminators also block folding', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: 왜 이 코드가 느릴까요?\n' +
+    '  다음 지시를 기다립니다.\n' +
+    '@worker-2: 속도를 개선하세요!\n' +
+    '  그리고 벤치마크를 포함해주세요.\n',
+  );
+  assert.equal(msgs.length, 2);
+  assert.equal(msgs[0].payload, '왜 이 코드가 느릴까요?');
+  assert.equal(msgs[1].payload, '속도를 개선하세요!');
+});
+
+test('router v0.4.2: CJK full-width terminators (。！？) also block folding', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: 설명해주세요。\n' +
+    '  추가 문장.\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload, '설명해주세요。');
+});
+
+test('router v0.4.2: non-terminated first line still folds continuation (v2.7.15 compat)', () => {
+  // Negative control: the pre-existing v2.7.15 behavior (folding legitimate
+  // Ink-wrapped continuation rows of a single logical sentence) must be
+  // preserved when the first visual row does NOT end in terminal punctuation.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed(
+    '@worker-1: "red, blue, green" 세 단어를 한글로 번역해줘. 각\n' +
+    '  단어당 한 줄씩 적어줘\n',
+  );
+  assert.equal(msgs.length, 1);
+  assert.equal(
+    msgs[0].payload,
+    '"red, blue, green" 세 단어를 한글로 번역해줘. 각 단어당 한 줄씩 적어줘',
+  );
+});
+
+// ─── v0.5.0 · bullet-only payload drop ───
+
+test('router v0.5.0 (P3): `●` bullet-only payload is dropped', () => {
+  // Field log showed `worker-1 yielded 1 directive(s): leader=●` — the
+  // assistant bullet character slipped through as payload when Ink's
+  // alt-screen emitted an isolated `● ` row right after `@leader:` on
+  // the previous line. The bullet carries no content and should not
+  // route back to the leader.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@leader: ●\n');
+  assert.equal(msgs.length, 0, '`●` alone must not route');
+});
+
+test('router v0.5.0 (P3): `• ` bullet variant is also dropped', () => {
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: •\n');
+  assert.equal(msgs.length, 0);
+});
+
+test('router v0.5.0 (P3): bullet prefix with real content still routes (negative control)', () => {
+  // The bullet-strip at the front of `normalize()` should still allow a
+  // real payload that was typographically prefixed with a bullet to route.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: ● real task body\n');
+  assert.equal(msgs.length, 1);
+  assert.equal(msgs[0].payload, 'real task body');
 });

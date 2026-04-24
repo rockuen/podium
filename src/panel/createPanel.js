@@ -19,7 +19,6 @@ const { saveSessions } = require('../store/sessionManager');
 const { resolveClaudeCli } = require('../pty/resolveCli');
 const { killPtyProcess } = require('../pty/kill');
 const { createContextParser } = require('../pty/contextParser');
-const { buildTmuxSpawnArgs } = require('../pty/tmuxWrap');
 const { getWebviewContent } = require('./webviewContent');
 const { showDesktopNotification } = require('../handlers/desktopNotification');
 const { setTabIcon, setStatusBar, updateStatusBar } = require('./statusIndicator');
@@ -116,7 +115,11 @@ function createPanel(context, extensionPath, session) {
 
   // Spawn claude CLI
   const cwd = session?.cwd || vscode.workspace.workspaceFolders?.[0]?.uri?.fsPath || os.homedir();
-  const sessionId = session?.sessionId || crypto.randomUUID();
+  // v0.3.3 · `sessionId` = resume target, `newSessionId` = fresh session with
+  // a caller-chosen UUID. Workers need the latter (no prior JSONL exists, so
+  // `--resume` errors with "No conversation found with session ID"). Legacy
+  // callers that only set `sessionId` continue to hit the resume path.
+  const sessionId = session?.newSessionId || session?.sessionId || crypto.randomUUID();
   const resolved = resolveClaudeCli();
   if (!resolved) {
     const install = 'Install Claude Code';
@@ -133,36 +136,20 @@ function createPanel(context, extensionPath, session) {
   }
 
   const claudeShell = resolved.shell;
+  // v0.3.1: session.extraArgs lets callers (e.g. Summon Team) inject the
+  // Podium worker/leader system prompt via `--append-system-prompt` and
+  // disable the Task tool via `--disallowedTools Task`. Prepended before
+  // the session flag so Claude CLI parses them as pre-session options.
+  const podiumExtraArgs = Array.isArray(session?.extraArgs) ? session.extraArgs : [];
   const claudeArgs = session?.sessionId
     ? ['--resume', session.sessionId]
     : ['--session-id', sessionId];
-  const directArgs = [...resolved.args, ...claudeArgs];
+  const directArgs = [...resolved.args, ...podiumExtraArgs, ...claudeArgs];
 
-  // v2.6.12: Podium-ready sessions wrap Claude in a tmux session so an
-  // `omc team …` can later use this pane as leader. When false (default),
-  // behavior is unchanged — direct node-pty spawn of Claude CLI.
-  const podiumReady = !!session?.podiumReady;
-  let spawnShell = claudeShell;
-  let spawnArgs = directArgs;
-  let tmuxSessionName = null;
-  if (podiumReady) {
-    const cols = 120;
-    const rows = 30;
-    const wrap = buildTmuxSpawnArgs({ sessionId, cols, rows, claudeShell, claudeArgs: directArgs });
-    if (wrap) {
-      spawnShell = wrap.shell;
-      spawnArgs = wrap.args;
-      tmuxSessionName = wrap.tmuxName;
-      console.log('[Podium] Podium-ready spawn via', wrap.muxBin, '| tmux:', tmuxSessionName);
-    } else {
-      vscode.window.showWarningMessage(
-        'Podium-ready session requested but tmux/psmux not found on PATH. Falling back to direct spawn (not team-capable).'
-      );
-    }
-  }
+  const spawnShell = claudeShell;
+  const spawnArgs = directArgs;
 
   console.log('[Podium] Spawning:', spawnShell, spawnArgs.join(' '), '| cwd:', cwd);
-  console.log('[Podium] resolved shell:', spawnShell, '| podiumReady:', podiumReady);
 
   let ptyProcess;
   try {
@@ -195,6 +182,14 @@ function createPanel(context, extensionPath, session) {
     return;
   }
 
+  // v0.3.1 · Orchestrator taps. The legacy panel is now addressable by
+  // PodiumOrchestrator via LegacyPanelBridge: every pty chunk fires
+  // `onPtyData`, and panel-close fires `onPaneDispose(exitCode)`.
+  // When session.podiumRole / session.podiumPaneId are set, the entry is
+  // a participant in a summoned team and the bridge uses those for routing.
+  const onPtyDataEmitter = new vscode.EventEmitter();
+  const onPaneDisposeEmitter = new vscode.EventEmitter();
+
   const entry = {
     panel,
     pty: ptyProcess,
@@ -204,10 +199,14 @@ function createPanel(context, extensionPath, session) {
     sessionId: sessionId,
     state: 'running',
     idleTimer: null,
-    // v2.6.12: Podium-ready metadata. podiumReady gates tmux wrapping; tmuxSession
-    // is the actual multiplexer session name used for leader injection.
-    podiumReady: podiumReady && !!tmuxSessionName,
-    tmuxSession: tmuxSessionName
+    tabId: tabId,
+    // v0.3.1 orchestrator metadata (absent for plain chat windows).
+    podiumRole: session?.podiumRole,
+    podiumPaneId: session?.podiumPaneId,
+    onPtyData: onPtyDataEmitter.event,
+    onPaneDispose: onPaneDisposeEmitter.event,
+    _onPtyDataEmitter: onPtyDataEmitter,
+    _onPaneDisposeEmitter: onPaneDisposeEmitter,
   };
   state.panels.set(tabId, entry);
   saveSessions();
@@ -247,6 +246,9 @@ function createPanel(context, extensionPath, session) {
     if (entry.pty !== initialPty) return; // stale handler guard
     dataCount++;
     if (dataCount <= 3) console.log('[Podium] PTY data #' + dataCount + ' (' + data.length + ' bytes):', data.substring(0, 100));
+    // v0.3.1: fan out to orchestrator taps (LegacyPanelBridge). Cheap when
+    // no one is subscribed — vscode.EventEmitter short-circuits empty lists.
+    try { onPtyDataEmitter.fire(data); } catch (_) {}
     if (!webviewReady) {
       outputBuffer.push(data);
     } else {
@@ -401,7 +403,18 @@ function createPanel(context, extensionPath, session) {
       saveSessions();
     }
     updateStatusBar();
+    // v0.3.1 · orchestrator tap — fire AFTER pty kill so any pending
+    // routing commits have already been attempted. Exit code is 0 for a
+    // user-driven close (we don't have a real pty exit code at this path).
+    try { onPaneDisposeEmitter.fire(0); } catch (_) {}
+    try { onPtyDataEmitter.dispose(); } catch (_) {}
+    try { onPaneDisposeEmitter.dispose(); } catch (_) {}
   }, undefined, context.subscriptions);
+
+  // v0.3.1: return a handle so callers (Summon Team command) can bind the
+  // entry to the orchestrator bridge. Legacy callers that ignore the return
+  // value (status-bar click, Ctrl+Shift+;) are unaffected.
+  return { tabId: tabId, entry: entry };
 }
 
 module.exports = { createPanel };

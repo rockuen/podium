@@ -82,6 +82,16 @@ function routeWebviewMessage(msg, ctx) {
       handleToolbar(msg.action, entry, context, extensionPath, createPanel);
       return;
 
+    // v0.3.1 · Summon Team — keep this legacy chat window as the leader
+    // and open 2 role-typed worker chat windows to the right (ViewColumn
+    // .Beside). The orchestrator binds all three via LegacyPanelBridge.
+    // The user keeps the familiar chat UI in every pane.
+    case 'summon-team':
+      vscode.commands.executeCommand('claudeCodeLauncher.podium.summonTeam', {
+        leaderEntry: entry,
+      });
+      return;
+
     case 'paste-image':
       if (entry.pty) handlePasteImage(msg.data, entry, panel);
       return;

@@ -41,8 +41,11 @@
 // VS Code runtime stub.
 import type * as vscode from 'vscode';
 import { randomUUID } from 'node:crypto';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { stripAnsi } from './ansi';
-import { IdleDetector } from './idleDetector';
+import { IdleDetector, isCosmeticLine, isInkNoise } from './idleDetector';
 import {
   ClaudeLeaderRoutingProjector,
   WorkerPatternParser,
@@ -50,8 +53,10 @@ import {
 } from './messageRouter';
 import { buildSubmitPayload, splitSubmitPayload, needsWin32KeyEvents } from './cliInput';
 import type { AgentKind } from './agentSpawn';
-import type { LiveMultiPanel, LivePaneSpec } from '../ui/LiveMultiPanel';
+import type { LivePaneSpec, OrchestratorPanel } from '../ui/LiveMultiPanel';
 import { claudeBareSummarizer, type Summarizer } from './summarizer';
+import type { WorkerRole } from './workerProtocol';
+import { EventLogger, type EventEndpoint } from './EventLogger';
 
 export interface WorkerConfig {
   /** Stable logical id referenced in leader output, e.g. `worker-1`. */
@@ -74,6 +79,15 @@ export interface WorkerConfig {
    * so snapshot save/restore preserves user-assigned names.
    */
   label?: string;
+  /**
+   * v0.3.0 · Worker role for hub-and-spoke orchestration. The role shapes
+   * the worker's system prompt (via `workerProtocol.buildWorkerSystemPrompt`)
+   * and lets the leader pick the right worker for each sub-task. Routing
+   * still uses `id`; `role` is for prompting + leader-side reasoning only.
+   * Absent when the caller spawns a plain worker (legacy `podium.orchestrate`
+   * command); present when the caller uses the role-aware spawn path.
+   */
+  role?: WorkerRole;
 }
 
 export interface LeaderConfig {
@@ -147,6 +161,50 @@ export interface OrchestratorAttachOptions {
    * Ink to settle after the resume-driven repaint.
    */
   restoreGraceMs?: number;
+  /**
+   * v0.3.0 · Enable bidirectional routing. When true, each worker's output
+   * is ALSO parsed for `@leader:` / `@worker-N:` directives, enabling
+   * workers to reply to the leader (hub-and-spoke) and route to peers.
+   * Default false preserves the legacy one-way (leader → worker) flow so
+   * existing tests and the baseline `podium.orchestrate` command behave
+   * identically.
+   */
+  enableWorkerRouting?: boolean;
+  /**
+   * v0.3.0 · Maximum number of routed directives per "task" before the
+   * orchestrator force-converges. Each committed routing event (leader→worker,
+   * worker→leader, worker→worker) counts as one. When the cap is hit a
+   * single `[system] round cap reached, please converge` notice is injected
+   * into the leader and further routing is dropped until `resetRound()` is
+   * called or the team goes idle for `autoResetRoundMs`.
+   *
+   * 0 disables the cap (legacy behavior). Default 5, tuned against the
+   * multi-agent literature's convergence sweet spot.
+   */
+  maxRoundsPerTask?: number;
+  /**
+   * v0.3.0 · When both leader and all workers have been idle this long with
+   * no further routing, the round counter auto-resets to 0 so the next user
+   * prompt starts fresh without requiring a manual `resetRound()`.
+   * Default 30_000 (30s). Set to 0 to disable auto-reset.
+   */
+  autoResetRoundMs?: number;
+  /**
+   * v0.9.5 · Event ledger. When supplied, the orchestrator mirrors core
+   * orchestration events (session start, route commits, drops, ACK
+   * match/mismatch, redelivery tags) into the logger. Absent in tests that
+   * don't care about the ledger; production (`index.ts`) constructs one per
+   * attach with `cwd` set so events land in `.omc/team/logs/orchestrator.ndjson`.
+   *
+   * Provider-neutral: the logger takes a Podium-assigned `podiumSessionId`,
+   * not a Claude CLI session id, so a future Codex/Gemini leader can emit
+   * identical envelope shapes.
+   *
+   * Writes never throw back into the routing path — EventLogger internally
+   * guards all I/O and silently disables itself after a persistent failure
+   * (single warning line). Callers therefore do not need their own guard.
+   */
+  eventLogger?: EventLogger;
 }
 
 /** Minimal snapshot payload surfaced by `PodiumOrchestrator.captureSnapshot`. */
@@ -164,22 +222,243 @@ export interface WorkerRuntime {
   cfg: WorkerConfig;
   idle: IdleDetector;
   queue: string[];
-  /** payload → last-seen ms timestamp. Used to suppress redraw duplicates. */
-  recentPayloads: Map<string, number>;
+  /**
+   * payload-key → { turnId, ts } used for dedupe.
+   *
+   * v0.5.0 (strategy "B"): entries carry the leader turnId at which the
+   * route was first committed. commitRoute drops incoming payloads whose
+   * key was already routed IN THE SAME TURN, regardless of how many
+   * times Ink repaints the scrollback. Different-turn reuses of the same
+   * key are allowed through (the turnId changed → legitimate new
+   * delegation of the same task in a later user prompt).
+   *
+   * v0.4.2 (strategy "A") still applies at key level (dedupeKey() returns
+   * the normalized first line, capped at 100 chars). B is the stronger
+   * dominant filter; A remains as a safety net against minor boundary
+   * wobbles inside the same turn that nonetheless produce slightly
+   * different raw payload strings.
+   */
+  recentPayloads: Map<string, { turnId: number; ts: number }>;
   /** Accumulated stripped output. Tail is kept when the buffer exceeds cap. */
   transcript: string;
+  /**
+   * v0.3.0 · Per-worker bidirectional parser. Parses the worker's own
+   * output for `@leader:` / `@worker-N:` directives so workers can route
+   * replies back to the leader (hub-and-spoke) or to peers. Only attached
+   * when `opts.enableWorkerRouting` is set (new flag in AttachOptions) —
+   * legacy attach calls leave it null so existing tests' single-direction
+   * behavior is preserved.
+   */
+  parser: WorkerPatternParser | null;
+  /** v0.3.0 · Claude TUI projector for Claude worker output. Null for non-claude agents. */
+  projector: ClaudeLeaderRoutingProjector | null;
+  /**
+   * v0.5.2 — Mirror of `leaderWasIdle` but per-worker. Used by `tick()` to
+   * detect the worker's busy → idle transition and flush its parser so
+   * multi-line `@leader:\n<body>\n` directives that have no `@end`
+   * sentinel finally drain. Without this, a worker that replies with a
+   * long code block gets its payload stuck in its parser buffer forever
+   * because no subsequent token arrives to terminate the multi-line form.
+   */
+  wasIdle: boolean;
+  /**
+   * v0.6.0 — Byte offset into `transcript` where the current in-progress
+   * turn began. On every busy→idle edge, the range [currentTurnStart,
+   * transcript.length) is considered the full reply body for this turn.
+   * If that body exceeds SPILL_THRESHOLD_CHARS, the orchestrator spills
+   * it to a drop file instead of trying to route the body text through
+   * the pty-stdin parser path (which fragments on long replies).
+   */
+  currentTurnStart: number;
+  /**
+   * v0.8.4 — Raw-stripped transcript (no projector). The routing projector
+   * closes the assistant block on any `other`-classified line, which in
+   * practice means code blocks, Korean prose without known prefixes, and
+   * most of what a worker actually wants the leader to read got dropped
+   * from `transcript`. Field evidence: `worker-1-turn3-seq2.md` was 728
+   * bytes but contained only the `@leader:` header and no code. We keep
+   * `transcript` for parser/dedupe (it must stay stable and routing-safe)
+   * but ADDITIONALLY accumulate `rawTranscript` — raw `stripAnsi` output
+   * minus cosmetic UI lines (prompt row, OMC status, bypass hint). This
+   * is what the spill file writes, so the leader actually sees the code.
+   */
+  rawTranscript: string;
+  /** Parallel marker for rawTranscript, advanced in lockstep with currentTurnStart. */
+  rawCurrentTurnStart: number;
+  /** Monotonic seq used for drop filenames; disambiguates multiple spills per turn. */
+  spillSeq: number;
+  /**
+   * v0.6.1 — True when the worker has received an orchestrator-initiated
+   * inject since its last busy→idle edge. Gates spill/flush: if a worker
+   * transitions idle without ever having been addressed (boot output
+   * settling, Ink repaint, anything else that is NOT a reply to a
+   * delegated task), we skip both spill and parser.flush so we do not
+   * emit spurious drop notices into the leader and trigger runaway
+   * meta-analysis loops. `inject()` sets it true. The idle-edge handler
+   * resets it to false after handling.
+   */
+  hasPendingReply: boolean;
+  /**
+   * v0.9.2 — Last-sent leader→worker fingerprint, awaiting echo from
+   * this worker's next `@leader:` reply. Set by `maybeSpillLeaderToWorker`.
+   * Consumed (cleared) once by `commitLeaderInject`'s ACK check on the
+   * very next reply — whether the ACK was present, matching, or absent.
+   * One-shot: we don't accumulate a queue, because the leader is
+   * expected to wait for each reply before issuing another directive
+   * (round-cap semantics enforce this too).
+   */
+  pendingAckFp: { bytes: number; tail_sha8: string; dropPath: string; ts: number } | null;
+  /**
+   * v0.9.3 — Recent leader→worker spill fingerprints, used for
+   * redelivery (retry) detection. When the orchestrator is about to
+   * spill a new directive, it searches this array for an entry whose
+   * `tail_sha8` matches — within REDELIVERY_WINDOW_MS — and, if found,
+   * annotates the new drop's header with `redelivery_of:` and a
+   * chain-length `redelivery_count:`. Entries older than the window
+   * are pruned lazily at each spill.
+   *
+   * Per-worker scope is deliberate: cross-worker spills with identical
+   * content are NOT a redelivery. The forensic question the 2026-04-24
+   * parseCSV retrospective asked was "did worker-N see retries?" —
+   * not "did the leader resend similar content to different workers?".
+   */
+  recentSpills: Array<{
+    tail_sha8: string;
+    dropPath: string;
+    ts: number;
+    chainLength: number;
+  }>;
+  /**
+   * v0.9.4 — ACK-mismatch-keyed retry chain. When the worker's most
+   * recent reply echoed an `ACK bytes=... tail=...` that didn't match
+   * the spilled fingerprint, we record the mismatched drop's path and
+   * arm the NEXT spill to this worker to be tagged as a retry. On a
+   * subsequent match we clear the chain (delivery succeeded); on
+   * another mismatch we advance `priorDropPath` and `nextCount` to
+   * keep the chain going.
+   *
+   * This trigger composes with v0.9.3's content-hash-match trigger:
+   * whichever signal fires first tags the drop. mismatch-keyed is the
+   * realistic real-world catch because retries usually rewrite content
+   * slightly (prefix/suffix) so content-hash-match misses them.
+   */
+  retryChain: { priorDropPath: string; nextCount: number; ts: number } | null;
+  /**
+   * v0.11.0 — Snapshot of `.omc/team/artifacts/` filenames captured at
+   * the start of this worker's current turn (i.e. right after the
+   * orchestrator delivered a leader→worker directive). When the worker
+   * goes idle we diff the current artifact set against this snapshot;
+   * any new file is what the worker DELIBERATELY produced and gets
+   * inject into the leader as a path notice. The raw pty turn body is
+   * still archived to `.omc/team/drops/raw/` for debugging but is no
+   * longer inject into the leader (artifact mode).
+   *
+   * In `legacy-auto-spill` mode this field is unused.
+   */
+  turnStartArtifactSnapshot: Set<string>;
 }
 
 /** Cap per-worker transcript to avoid unbounded memory growth in long runs. */
 const MAX_TRANSCRIPT_CHARS = 50_000;
 
+/**
+ * v0.9.3 — Window for redelivery detection. If the leader spills the
+ * exact same directive to the exact same worker within this window,
+ * the new drop is tagged as a retry of the older one. 5 minutes is
+ * wider than the parseCSV retrospective's recovery window (~30 s) but
+ * narrow enough that unrelated next-day dogfood sessions don't link.
+ */
+const REDELIVERY_WINDOW_MS = 5 * 60 * 1000;
+
 const DEFAULT_POLL_MS = 250;
-// Claude Code v2.1+ uses an Ink TUI that repaints the alt-screen periodically
-// (every few seconds, driven by its status-row refresh). Each repaint re-emits
-// the same `@worker-N: …` line through the pty, which our line-based parser
-// sees as a fresh token. Within this window we suppress exact duplicates per
-// worker so a single routing directive doesn't spawn a 10-deep queue.
-const DEFAULT_DEDUPE_WINDOW_MS = 30_000;
+// Claude Code v2.1+ uses an Ink TUI that repaints the alt-screen periodically,
+// and crucially it can re-emit the ENTIRE visible scrollback on a full
+// refresh (scroll, resize, next-turn replay). Each repaint surfaces every
+// earlier `@worker-N: ...` directive from prior turns as a "fresh" parser
+// token. Within this window we suppress exact duplicates per worker.
+//
+// v0.3.9 bumped from 30_000 → 1_800_000 (30 min). Field log showed the
+// previous 30s window cleared between user turns, so on each new prompt
+// the leader's scrollback replay re-injected the PREVIOUS turn's tasks
+// back into the workers. 30 minutes covers realistic scrollback retention
+// in typical multi-turn sessions without blocking the user from explicitly
+// re-asking the same task after a long pause.
+const DEFAULT_DEDUPE_WINDOW_MS = 1_800_000;
+
+/**
+ * v0.5.1 — Minimum gap between two `leaderTurnId` bumps.
+ *
+ * An idle→busy edge that fires within this window of the previous bump
+ * is treated as the same logical user turn (Ink mid-response pause /
+ * status-tick flicker) and is NOT counted as a new turn. Picked so it
+ * comfortably exceeds typical intra-response pauses (~500–800ms) while
+ * staying well below realistic intervals between consecutive user
+ * prompts (usually seconds).
+ */
+const TURN_COOLDOWN_MS = 1500;
+
+/**
+ * v0.7.3 — Cross-turn dedupe window.
+ *
+ * B strategy (v0.5.0) dedupes same-turn repeats but allows legitimately
+ * different turns to re-route the same payload. Field logs from the
+ * v0.7.2 reverseString task chain showed that this opens a loophole
+ * for Ink alt-screen scrollback repaints: as the leader emits new
+ * delegations, Ink periodically re-emits the ENTIRE scrollback of past
+ * turns. Since those past `@worker-N:` lines now arrive in a later
+ * turnId, the B-only dedupe lets them through and the orchestrator
+ * re-routes a task that was already delivered and answered two turns
+ * ago.
+ *
+ * Fix: even across turns, if the exact same normalized key was routed
+ * within CROSS_TURN_DEDUPE_MS (2 min), suppress. Legitimate user
+ * re-delegations of identical text within 2 min are rare and almost
+ * always an explicit retry that the user can trivially rephrase.
+ */
+const CROSS_TURN_DEDUPE_MS = 120_000;
+
+/**
+ * v0.7.3 — Maximum time leader→worker / worker→leader injects wait for
+ * the leader to be idle before firing anyway. Claude's Ink TUI does
+ * not always honor the submit key (`\r`) while it is streaming a long
+ * response — the body lands in the bottom input box but stays
+ * unsubmitted until the user presses Enter manually. Holding the
+ * inject until leader idle sidesteps that. The upper bound prevents
+ * indefinite buildup if the leader is stuck.
+ */
+const LEADER_IDLE_WAIT_MAX_MS = 3000;
+
+/**
+ * v0.6.0 — Spill threshold for worker replies.
+ *
+ * When a worker's current-turn transcript (bytes since its last busy→idle
+ * edge) grows past this threshold, we abandon the parser-based routing
+ * path for this reply and instead:
+ *   1. Save the full body to `.omc/team/drops/<worker>-turn<N>-seq<S>.md`.
+ *   2. Inject a short pty-safe "[drop from worker-N] …" notice into the
+ *      leader, containing a few preview lines + the file path.
+ *   3. The leader uses its Read tool to ingest the full body.
+ *
+ * Rationale (see field logs from v0.5.2 reverseString task):
+ *   Long multi-line `@leader:` replies from a Claude worker chunk, repaint,
+ *   and fragment as they pass through the pty → ANSI strip → projector →
+ *   parser pipeline. The parser yielded only the first 20–80 bytes of
+ *   real answers, and follow-up retries slotted under an A-strategy
+ *   dedupe key like `"구현"` that collided with the truncated prior
+ *   attempt. By short-circuiting to file IO above a size threshold we
+ *   pay one Read tool call to get the answer across intact.
+ *
+ * 300 chars ≈ 5–8 lines of code or ~100 Korean characters. Short acks
+ * like "대기 중. 작업 지시 주세요." (18 chars) stay on the parser path;
+ * anything that's actually code goes through the spill.
+ */
+const SPILL_THRESHOLD_CHARS = 300;
+
+/** Max number of lines to echo as a preview inside the leader notice. */
+const SPILL_PREVIEW_LINES = 5;
+
+/** Hard cap per preview line so pathological long lines can't inflate the notice. */
+const SPILL_PREVIEW_LINE_CHARS = 80;
 
 // v2.7.13: macrotask gap between writing the body and the Win32 Enter
 // KEY_EVENT for Claude/Windows worker injects. Empirically 25 ms is enough
@@ -236,18 +515,61 @@ const ADD_WORKER_RACE_WINDOW_MS = 500;
 // match a prompt pattern. Paired with `restoreGraceMs` as a hard wall-clock
 // cap (15s default in production).
 
+export type WorkerReplyMode = 'artifact' | 'legacy-auto-spill';
+
 export class PodiumOrchestrator implements vscode.Disposable {
   private readonly parser = new WorkerPatternParser();
   private readonly workers = new Map<string, WorkerRuntime>();
   private readonly subscriptions: vscode.Disposable[] = [];
   private leader: LeaderConfig | null = null;
   private leaderProjector: ClaudeLeaderRoutingProjector | null = null;
+  /**
+   * v0.11.0 — Worker→leader reply mode.
+   *   'artifact'         — DEFAULT. Worker turns must produce explicit
+   *                        markdown files in `.omc/team/artifacts/`. The
+   *                        orchestrator inject only the artifact paths
+   *                        (path notice). Raw pty turn body archived to
+   *                        `.omc/team/drops/raw/` for debugging.
+   *   'legacy-auto-spill'— Pre-v0.11 behaviour: rawTranscript turn body is
+   *                        dumped to `.omc/team/drops/<worker>-turn<N>...md`
+   *                        and the leader receives a preview notice.
+   *
+   * Toggle via `setWorkerReplyMode()` from the host (typically driven by
+   * the `podium.workerReplyMode` user setting).
+   */
+  private workerReplyMode: WorkerReplyMode = 'artifact';
   // The leader's own idle detector — used to trigger parser.flush() when the
   // leader's output stream goes quiet, so compact-form pending tokens that
   // lack a trailing newline/next-token terminator (see messageRouter.ts) get
   // surfaced instead of rotting in the buffer.
   private leaderIdle: IdleDetector | null = null;
   private leaderWasIdle = false;
+  /**
+   * v0.5.0 — Turn counter for strategy B dedupe.
+   *
+   * Bumped each time the leader transitions from idle → busy (which in
+   * practice means "user just sent a prompt and leader started emitting
+   * its response"). commitRoute / commitLeaderInject stamp their
+   * recentPayloads entries with the current turnId and drop any repeat
+   * route whose stamp matches the same turnId. Different turnId → new
+   * delegation, allowed. This is immune to Ink repaint boundary wobble
+   * that slipped past the older A+C strategies.
+   *
+   * v0.5.1 — Cooldown guard. The leaderIdle silenceMs is 500ms, which
+   * is shorter than some pauses Claude's Ink TUI takes mid-response
+   * (for tool-call status ticks, re-render sweeps, etc). Without a
+   * cooldown the same logical turn flips idle→busy several times and
+   * blows the turnId up by 3–4 per user prompt. See `lastTurnAdvanceAt`
+   * below.
+   */
+  private leaderTurnId = 0;
+  /**
+   * v0.5.1 — Timestamp of the most recent `leaderTurnId` bump. An
+   * idle→busy edge within TURN_COOLDOWN_MS of the previous bump is
+   * ignored: it is almost certainly the same logical user turn
+   * experiencing a transient status-tick pause, not a new prompt.
+   */
+  private lastTurnAdvanceAt = 0;
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private stats = { routed: 0, injected: 0, queued: 0, dropped: 0, deduped: 0, flushed: 0, dissolved: 0 };
   private nowFn: () => number = Date.now;
@@ -257,6 +579,29 @@ export class PodiumOrchestrator implements vscode.Disposable {
   private readonly pendingRoute = new Map<
     string,
     { payload: string; timer: ReturnType<typeof setTimeout> }
+  >();
+  /**
+   * v0.3.4 · Per-source pending debounce for worker→leader routing. Mirrors
+   * `pendingRoute` but keyed by the SOURCE pane id (the worker that emitted
+   * the @leader: directive). Absorbs the same Ink re-render "short pulse →
+   * longer pulse" pattern on the leader-inject path that the worker-target
+   * route's pendingRoute already handles — without this, every wrap stage
+   * of a single @leader: reply counted as a separate round.
+   */
+  private readonly pendingLeaderInject = new Map<
+    string,
+    {
+      payload: string;
+      timer: ReturnType<typeof setTimeout>;
+      /**
+       * v0.7.3 — When the leader-idle gate first observes leader busy,
+       * stamp the time here. Subsequent re-arms compare against this to
+       * cap the total wait at LEADER_IDLE_WAIT_MAX_MS — after which the
+       * inject commits anyway so a never-idle leader does not strand
+       * worker replies indefinitely.
+       */
+      leaderGateStartedAt?: number;
+    }
   >();
   /** v2.7.19 · Captured cwd for team snapshot export. */
   private attachedCwd: string | null = null;
@@ -278,8 +623,48 @@ export class PodiumOrchestrator implements vscode.Disposable {
    */
   private readonly recentAdds = new Map<string, number>();
 
+  // ── v0.3.0 bidirectional / ping-pong state ──────────────────────────────
+
+  /** Whether worker output is also parsed for routing directives. */
+  private enableWorkerRouting = false;
+  /** Routing kill-switch. When true, all route() calls drop silently. */
+  private routingPaused = false;
+  /** Cap on routed directives per task. 0 = unlimited. */
+  private maxRoundsPerTask = 0;
+  /** Idle window after which the round counter auto-resets to 0. */
+  private autoResetRoundMs = 30_000;
+  /** Current round count. Incremented on each commit (post-dedupe). */
+  private currentRound = 0;
+  /** Wall-clock ms of the most recent successful commit. Drives auto-reset. */
+  private lastRouteAt = 0;
+  /** Prevents the cap-reached notice from firing every subsequent dropped route. */
+  private roundCapNotifyFired = false;
+  /**
+   * v0.5.0 — Track whether routing was paused *because* of the round cap
+   * (vs a manual pause()/resume() by the user). Only the round-cap pause
+   * is auto-cleared by `resetRound()`; user-requested pauses stay put.
+   */
+  private routingPausedByRoundCap = false;
+  /**
+   * Payload → last-seen ms for directives aimed at the LEADER. Mirrors
+   * `WorkerRuntime.recentPayloads` but for the leader target (which has no
+   * WorkerRuntime of its own). Keeps Claude's Ink redraw duplicates from
+   * re-injecting the same reply N times into the leader stdin.
+   */
+  private readonly leaderRecentPayloads = new Map<string, { turnId: number; ts: number }>();
+
+  /**
+   * v0.9.5 · Optional event ledger. Mirrors orchestration events as
+   * provider-neutral NDJSON. Null when no logger was supplied.
+   *
+   * The logger carries its own `podiumSessionId` — a provider-neutral id
+   * generated by the caller (or its defaults) distinct from any provider
+   * CLI session uuid on purpose, so it survives a future provider swap.
+   */
+  private eventLogger: EventLogger | null = null;
+
   constructor(
-    private readonly panel: LiveMultiPanel,
+    private readonly panel: OrchestratorPanel,
     private readonly output: vscode.OutputChannel,
     private readonly summarizer: Summarizer = claudeBareSummarizer,
   ) {}
@@ -295,8 +680,39 @@ export class PodiumOrchestrator implements vscode.Disposable {
     if (opts.dedupeWindowMs !== undefined) this.dedupeWindowMs = opts.dedupeWindowMs;
     if (opts.dispatchDebounceMs !== undefined) this.dispatchDebounceMs = opts.dispatchDebounceMs;
     this.attachedCwd = opts.cwd ?? process.cwd();
+    // v0.9.0 · Archive orphan drops from prior sessions.
+    // Move any top-level `*.md` files in `<cwd>/.omc/team/drops/` to
+    // `<cwd>/.omc/team/drops/archive/<ISO>/`. Evidence: 2026-04-24
+    // parseCSV retrospective (Section G) — `turn1-seq1.md` from a prior
+    // reverseString session remained on disk and made turn numbering
+    // forensic analysis costly. Each fresh attach now clears the drops
+    // root into a timestamped archive so the new session owns a clean
+    // workspace. History is preserved, not deleted.
+    try {
+      this.archivePriorDrops(this.attachedCwd);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch.drops] archive on attach FAILED — ${msg}`);
+    }
     this.onAutoSnapshot = opts.onAutoSnapshot ?? null;
     this.autoSnapshotFired = false;
+    // v0.3.0 bidirectional + round cap wiring
+    this.enableWorkerRouting = opts.enableWorkerRouting ?? false;
+    this.maxRoundsPerTask = opts.maxRoundsPerTask ?? 0;
+    if (opts.autoResetRoundMs !== undefined) this.autoResetRoundMs = opts.autoResetRoundMs;
+    this.currentRound = 0;
+    this.roundCapNotifyFired = false;
+    this.lastRouteAt = 0;
+    this.routingPaused = false;
+    this.routingPausedByRoundCap = false;
+    // v0.5.0 — Fresh attach starts at turnId=0. The first idle→busy edge
+    // in onPaneData will bump it to 1 when the leader starts its first
+    // response, which is when we actually want same-turn dedupe to apply.
+    this.leaderTurnId = 0;
+    // v0.5.1 — Clear cooldown timestamp so the very first turn boundary
+    // is never suppressed by a stale timestamp from a prior attach.
+    this.lastTurnAdvanceAt = 0;
+    this.leaderRecentPayloads.clear();
     // v2.7.28: arm the restore grace window if caller requested one.
     if (opts.restoreGraceMs && opts.restoreGraceMs > 0) {
       this.restoreGraceEndsAt = this.nowFn() + opts.restoreGraceMs;
@@ -321,6 +737,24 @@ export class PodiumOrchestrator implements vscode.Disposable {
         queue: [],
         recentPayloads: new Map(),
         transcript: '',
+        rawTranscript: '',
+        rawCurrentTurnStart: 0,
+        // v0.3.0: only wire worker-side parsers when bidirectional is on.
+        parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
+        wasIdle: false,
+        currentTurnStart: 0,
+        spillSeq: 0,
+        hasPendingReply: false,
+        pendingAckFp: null,
+        recentSpills: [],
+        retryChain: null,
+        turnStartArtifactSnapshot: this.snapshotArtifactsDir(),
+        // v0.7.4 — Projector instantiated for all Claude agents (not
+        // gated on routing) so transcript capture gets the same
+        // assistant-only filtering as parser routing. Spill files
+        // then contain only assistant text, no thinking spinners or
+        // status chrome.
+        projector: w.agent === 'claude' ? new ClaudeLeaderRoutingProjector() : null,
       });
     }
 
@@ -355,6 +789,65 @@ export class PodiumOrchestrator implements vscode.Disposable {
         .map((w) => `${w.cfg.id}→${w.cfg.paneId}(${w.cfg.agent})`)
         .join(', ')}`,
     );
+
+    // v0.9.5 · Event ledger wiring. Done last so that if logger construction
+    // or first write fails, the orchestrator is already fully attached and
+    // routing-capable. The logger's `podiumSessionId` is supplied by the
+    // caller (provider-neutral id, not a Claude CLI session uuid).
+    this.eventLogger = opts.eventLogger ?? null;
+    this.logEvent({
+      type: 'session.started',
+      source: { kind: 'orchestrator' },
+      payload: {
+        leader: {
+          paneId: opts.leader.paneId,
+          provider: opts.leader.agent,
+          sessionId: opts.leader.sessionId,
+          label: opts.leader.label,
+        },
+        workers: [...this.workers.values()].map((w) => ({
+          id: w.cfg.id,
+          paneId: w.cfg.paneId,
+          provider: w.cfg.agent,
+          role: w.cfg.role,
+          sessionId: w.cfg.sessionId,
+          label: w.cfg.label,
+        })),
+        cwd: this.attachedCwd,
+        enableWorkerRouting: this.enableWorkerRouting,
+        maxRoundsPerTask: this.maxRoundsPerTask,
+      },
+    });
+  }
+
+  /**
+   * v0.9.5 · Guarded ledger write. Never throws. No-op when no logger was
+   * supplied.
+   */
+  private logEvent(input: Parameters<EventLogger['log']>[0]): void {
+    if (!this.eventLogger) return;
+    try {
+      this.eventLogger.log(input);
+    } catch (err) {
+      // Defense in depth — EventLogger already guards internally, but a
+      // programming error here must still not break routing.
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch.eventLogger] log FAILED — ${msg}`);
+    }
+  }
+
+  /** v0.9.5 · Build a provider-neutral endpoint descriptor for a worker. */
+  private workerEndpoint(w: WorkerRuntime): EventEndpoint {
+    return { kind: 'worker', id: w.cfg.id, provider: w.cfg.agent };
+  }
+
+  /** v0.9.5 · Build a provider-neutral endpoint descriptor for the leader. */
+  private leaderEndpoint(): EventEndpoint {
+    return {
+      kind: 'leader',
+      id: this.leader?.paneId,
+      provider: this.leader?.agent,
+    };
   }
 
   dispose(): void {
@@ -364,7 +857,15 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
     for (const { timer } of this.pendingRoute.values()) clearTimeout(timer);
     this.pendingRoute.clear();
+    // v0.3.4 · also drain the symmetric leader-inject pending map.
+    for (const { timer } of this.pendingLeaderInject.values()) clearTimeout(timer);
+    this.pendingLeaderInject.clear();
     this.recentAdds.clear();
+    // v0.3.0: reset per-worker projector state + leader dedupe cache.
+    for (const w of this.workers.values()) {
+      w.projector?.reset();
+    }
+    this.leaderRecentPayloads.clear();
     for (const s of this.subscriptions) s.dispose();
     this.subscriptions.length = 0;
     this.output.appendLine(
@@ -439,6 +940,23 @@ export class PodiumOrchestrator implements vscode.Disposable {
       queue: [],
       recentPayloads: new Map(),
       transcript: '',
+      rawTranscript: '',
+      rawCurrentTurnStart: 0,
+      wasIdle: false,
+      currentTurnStart: 0,
+      spillSeq: 0,
+      hasPendingReply: false,
+      pendingAckFp: null,
+      recentSpills: [],
+      retryChain: null,
+      turnStartArtifactSnapshot: this.snapshotArtifactsDir(),
+      // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
+      parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
+      // v0.7.4 — see attach() site for rationale.
+      projector:
+        cfg.agent === 'claude'
+          ? new ClaudeLeaderRoutingProjector()
+          : null,
     };
     this.workers.set(cfg.id, runtime);
 
@@ -549,6 +1067,59 @@ export class PodiumOrchestrator implements vscode.Disposable {
   }
 
   /**
+   * v0.3.0 · Pause all routing. Directives parsed from leader or worker
+   * output are dropped silently until `resume()` is called. Does NOT kill
+   * panes or clear pending debounce timers — this is a soft kill-switch the
+   * user can toggle when a ping-pong is going off the rails.
+   */
+  pause(): void {
+    if (this.routingPaused) return;
+    this.routingPaused = true;
+    this.output.appendLine('[orch] routing paused');
+  }
+
+  resume(): void {
+    if (!this.routingPaused) return;
+    this.routingPaused = false;
+    // v0.5.0 — User-initiated resume clears the round-cap pause marker
+    // too (single source of truth: after resume, routing is live).
+    this.routingPausedByRoundCap = false;
+    this.output.appendLine('[orch] routing resumed');
+  }
+
+  get isPaused(): boolean {
+    return this.routingPaused;
+  }
+
+  /**
+   * v0.3.0 · Reset the round counter to 0 and re-arm the cap-reached
+   * notice. Called manually (command) or automatically when the team has
+   * been idle for `autoResetRoundMs`.
+   */
+  resetRound(): void {
+    if (this.currentRound === 0 && !this.roundCapNotifyFired) return;
+    const prior = this.currentRound;
+    this.currentRound = 0;
+    this.roundCapNotifyFired = false;
+    // v0.5.0 — If routing was paused solely because of the round cap,
+    // clear that pause on reset. User-invoked pauses stay in effect.
+    if (this.routingPausedByRoundCap) {
+      this.routingPaused = false;
+      this.routingPausedByRoundCap = false;
+      this.output.appendLine(`[orch] routing auto-resumed (round cap cleared)`);
+    }
+    this.output.appendLine(`[orch] round reset (was ${prior})`);
+  }
+
+  get roundState(): { current: number; max: number; paused: boolean } {
+    return {
+      current: this.currentRound,
+      max: this.maxRoundsPerTask,
+      paused: this.routingPaused,
+    };
+  }
+
+  /**
    * v2.7.19 · Capture the current team as a plain data structure suitable
    * for `teamSnapshot.saveSnapshot`. Safe to call at any point while the
    * orchestrator is attached. Workers' sessionIds come from the attach
@@ -618,6 +1189,36 @@ export class PodiumOrchestrator implements vscode.Disposable {
   private onPaneData(paneId: string, rawData: string): void {
     if (this.leader && paneId === this.leader.paneId) {
       this.leaderIdle?.feed(rawData);
+      // v0.5.0 — Turn boundary detection (strategy B)
+      // ----------------------------------------------
+      // If the leader was idle before this chunk arrived, we just crossed
+      // an idle → busy edge. That almost always means the user sent a
+      // new prompt and the leader is starting to respond. Bump the turn
+      // id so same-turn dedupe entries do NOT mask legitimate re-delegations
+      // that a later turn might issue.
+      //
+      // v0.5.1 — Cooldown gate. Claude's Ink TUI takes transient pauses
+      // mid-response (tool status ticks, internal re-renders) that the
+      // 500ms idle detector interprets as idle→busy flips. Without this
+      // gate a single user prompt was bumping turnId by 3–4, scattering
+      // same-turn dedupe entries across multiple turnIds and making B
+      // strategy miss the repaints it was meant to catch. We only bump
+      // when the previous bump is at least TURN_COOLDOWN_MS old.
+      if (this.leaderWasIdle) {
+        const now = this.nowFn();
+        const sinceLast = now - this.lastTurnAdvanceAt;
+        if (this.lastTurnAdvanceAt === 0 || sinceLast >= TURN_COOLDOWN_MS) {
+          this.leaderTurnId += 1;
+          this.lastTurnAdvanceAt = now;
+          this.output.appendLine(
+            `[orch.turn] leader turnId advanced to ${this.leaderTurnId} (idle→busy edge, +${sinceLast}ms since last)`,
+          );
+        } else {
+          this.output.appendLine(
+            `[orch.turn] idle→busy edge coalesced into turn=${this.leaderTurnId} (only ${sinceLast}ms since last, cooldown=${TURN_COOLDOWN_MS}ms)`,
+          );
+        }
+      }
       this.leaderWasIdle = false; // incoming data — leader is active
       this.consumeLeaderOutput(rawData);
       return;
@@ -625,15 +1226,77 @@ export class PodiumOrchestrator implements vscode.Disposable {
     for (const w of this.workers.values()) {
       if (w.cfg.paneId === paneId) {
         w.idle.feed(rawData);
-        // Accumulate stripped output for dissolve-time summarization. Keep
-        // only the tail to bound memory on long-running teams.
-        w.transcript += stripAnsi(rawData);
+        // v0.7.4 — Accumulate PROJECTED output (not raw) for the
+        // transcript. Raw stripAnsi output includes Claude CLI's
+        // thinking spinner frames (✻ ✽ ✶ ✢ ·), status bar repaints
+        // (`[OMC#4.12.0] | ...`), chrome (─), prompt box (> ), and
+        // every cursor-replace frame of the assistant-streaming UI.
+        // Spill files then filled up with that garbage instead of the
+        // assistant's actual reply text, so the leader could not use
+        // the drop files and asked for retries. The projector already
+        // knows how to strip UI and keep only the assistant block
+        // (● bullet + its continuation rows); running it here once
+        // serves BOTH routing (consumeWorkerOutput reuses the result)
+        // and transcript capture (spill slices this).
+        const cleaned = stripAnsi(rawData);
+        const projected = w.projector ? w.projector.feed(cleaned) : cleaned;
+        w.transcript += projected;
         if (w.transcript.length > MAX_TRANSCRIPT_CHARS) {
           w.transcript = w.transcript.slice(-MAX_TRANSCRIPT_CHARS);
         }
+        // v0.8.4 — mirror into rawTranscript for spill.
+        // v0.8.5 — apply the broader `isInkNoise` sanitizer in addition
+        //         to `isCosmeticLine`. Field drops from the 2026-04-24
+        //         session were 16–37 KB, dominated by Ink TUI rendering
+        //         artifacts: spinner glyphs (✻ ✶ ✢ · ✽), thinking
+        //         verbs fragmented by cursor positioning ("Po", "u",
+        //         "ci g…"), box-draw rules, Claude logo art, and tool-
+        //         use chrome (⎿ path, "● Reading 1 file…"). The narrow
+        //         cosmetic filter (OMC status, prompt `>`, bypass hint)
+        //         caught none of it, so the drop file the leader
+        //         Read'd was mostly noise. Combined filter drops the
+        //         noise to a few hundred bytes without affecting the
+        //         real reply content.
+        for (const line of cleaned.split(/\r?\n/)) {
+          if (line.length > 0 && !isCosmeticLine(line) && !isInkNoise(line)) {
+            w.rawTranscript += line + '\n';
+          }
+        }
+        if (w.rawTranscript.length > MAX_TRANSCRIPT_CHARS) {
+          w.rawTranscript = w.rawTranscript.slice(-MAX_TRANSCRIPT_CHARS);
+        }
+        // v0.3.0: if bidirectional routing is enabled, parse this worker's
+        // output for `@leader:` / `@worker-N:` directives and route them.
+        this.consumeWorkerOutput(w, projected);
         return;
       }
     }
+  }
+
+  /**
+   * v0.3.0 · Parse one worker's output chunk for routing directives and
+   * dispatch them. No-op when `enableWorkerRouting` is false (legacy mode).
+   * Mirrors `consumeLeaderOutput` but uses the worker's own parser +
+   * projector pair so multiple workers stream in parallel without
+   * cross-contaminating each other's directive buffers.
+   */
+  private consumeWorkerOutput(w: WorkerRuntime, projected: string): void {
+    // v0.7.4 — stripAnsi + projector moved upstream to onPaneData so
+    // the transcript and routing share a single projection pass. This
+    // callee now receives already-projected (assistant-block-only)
+    // text, not raw ANSI. Feeding the projector twice would double-
+    // advance its inAssistantBlock / partial state and corrupt the
+    // classification.
+    if (!this.enableWorkerRouting || !w.parser) return;
+    if (!projected) return;
+    const msgs = w.parser.feed(projected);
+    if (msgs.length === 0) return;
+    this.output.appendLine(
+      `[orch.trace] ${w.cfg.id} yielded ${msgs.length} directive(s): ${msgs
+        .map((m) => `${m.workerId}=${preview(m.payload, 30)}`)
+        .join(', ')}`,
+    );
+    for (const m of msgs) this.route(m, w.cfg.paneId);
   }
 
   /**
@@ -791,7 +1454,31 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
   }
 
-  private route(msg: RoutedMessage): void {
+  /**
+   * v0.3.0 · `sourcePaneId` identifies whoever emitted the directive.
+   * Defaults to the leader's paneId for backward compatibility with the
+   * original leader-only routing path. Worker-emitted directives pass the
+   * worker's paneId so self-route and hub-and-spoke checks apply.
+   */
+  private route(msg: RoutedMessage, sourcePaneId?: string): void {
+    const source = sourcePaneId ?? this.leader?.paneId ?? '';
+
+    // v0.3.7 · Field diagnostic entry log. Makes every routing attempt
+    // visible so stalls between "parser yielded" and actual injection can
+    // be traced. Budget: one short line per parsed directive.
+    this.output.appendLine(
+      `[orch.route] src=${source} → target=${msg.workerId} (round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}, debounce=${this.dispatchDebounceMs}ms): ${preview(msg.payload)}`,
+    );
+
+    // v0.3.0 · Pause kill-switch — drops without any side effect.
+    if (this.routingPaused) {
+      this.stats.dropped += 1;
+      this.output.appendLine(
+        `[orch.paused] dropped routing to "${msg.workerId}": ${preview(msg.payload)}`,
+      );
+      return;
+    }
+
     this.stats.routed += 1;
 
     // v2.7.29: restore grace is idle-gated but the state transition lives in
@@ -808,36 +1495,98 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.output.appendLine(
         `[orch.restoreGrace] dropped routing to "${msg.workerId}": ${preview(msg.payload)}`,
       );
-      // v2.7.33: seed the worker's dedupe cache with the dropped payload so
-      // post-grace Ink redraws don't re-route it.
-      //
-      // Field log 2026-04-22 after v2.7.32: grace correctly dropped 2
-      // directives from scrollback replay, but when the user typed a NEW
-      // leader request (`worker-1한테는 바나나, worker-2는 1부터 5까지`),
-      // Claude's Ink UI repainted the whole alt-screen on every keystroke.
-      // The repaint stream contained BOTH the new response AND the previous
-      // session's response (`@worker-1: "apple"`, `@worker-2: 1부터 10까지`)
-      // because Ink alt-screen keeps scrollback above the input box. The
-      // parser yielded 4 msgs; the 2 live ones routed immediately, the 2
-      // replayed-from-scrollback ones queued behind them and executed once
-      // workers went idle — re-running the prior turn.
-      //
-      // Fix: when grace drops a directive, record it in the target worker's
-      // `recentPayloads` with the current timestamp. commitRoute() already
-      // consults this map and returns early with `stats.deduped += 1` when
-      // a payload is present. `dedupeWindowMs` defaults to 30_000ms and
-      // grace is 15_000ms, so the seeded entry survives ≥15s past grace
-      // close — well beyond the typical window in which Ink redraws the
-      // prior assistant turn.
-      const w = this.workers.get(msg.workerId);
-      if (w) w.recentPayloads.set(msg.payload, this.nowFn());
+      // Seed the target's dedupe cache so post-grace Ink redraws don't re-route.
+      if (msg.workerId === 'leader') {
+        this.leaderRecentPayloads.set(msg.payload, {
+          turnId: this.leaderTurnId,
+          ts: this.nowFn(),
+        });
+      } else {
+        const w = this.workers.get(msg.workerId);
+        if (w) w.recentPayloads.set(msg.payload, { turnId: this.leaderTurnId, ts: this.nowFn() });
+      }
+      return;
+    }
+
+    // v0.3.0 · @leader target handling (hub-and-spoke reply path).
+    if (msg.workerId === 'leader') {
+      if (!this.leader) {
+        this.stats.dropped += 1;
+        return;
+      }
+      if (source === this.leader.paneId) {
+        this.output.appendLine(
+          `[orch] leader emitted @leader: — self-route dropped (payload: ${preview(msg.payload)})`,
+        );
+        this.stats.dropped += 1;
+        return;
+      }
+      // v0.8.1 · Route-time dedupe (leader target). Mirrors commitLeaderInject
+      // but runs BEFORE the debounce timer arms, so a storm of scrollback
+      // repaints can't push the commit past CROSS_TURN_DEDUPE_MS. Without
+      // this, a worker pane that keeps repainting a prior `@leader: ...`
+      // line burns CPU on re-arm logs and eventually re-injects the stale
+      // reply into the leader. See same-direction guard in the worker
+      // branch below for the symmetric case.
+      {
+        const nowL = this.nowFn();
+        this.pruneLeaderRecent(nowL);
+        const keyL = this.dedupeKey(msg.payload);
+        const prevL = this.leaderRecentPayloads.get(keyL);
+        if (prevL !== undefined) {
+          const sameTurn = prevL.turnId === this.leaderTurnId;
+          const crossTurnWithin = nowL - prevL.ts < CROSS_TURN_DEDUPE_MS;
+          if (sameTurn || crossTurnWithin) {
+            this.stats.deduped += 1;
+            const reason = sameTurn
+              ? `same turn=${this.leaderTurnId}`
+              : `cross-turn within ${CROSS_TURN_DEDUPE_MS}ms (prior turn=${prevL.turnId}, cur=${this.leaderTurnId})`;
+            this.output.appendLine(
+              `[orch.route] leader (from ${source}) dedup-drop (${reason}, key="${preview(keyL, 40)}"): ${preview(msg.payload)}`,
+            );
+            const pendingL = this.pendingLeaderInject.get(source);
+            if (pendingL && this.dedupeKey(pendingL.payload) === keyL) {
+              clearTimeout(pendingL.timer);
+              this.pendingLeaderInject.delete(source);
+            }
+            return;
+          }
+        }
+      }
+      // v0.3.4 · Ink re-render absorber, symmetric with the worker-target
+      // path in the branch below. Without this, each wrap stage of a
+      // single worker @leader: reply counted as a separate round.
+      if (this.dispatchDebounceMs <= 0) {
+        this.commitLeaderInject(msg.payload, source);
+        return;
+      }
+      const existingL = this.pendingLeaderInject.get(source);
+      if (existingL) {
+        clearTimeout(existingL.timer);
+        const newExtendsOld = msg.payload.startsWith(existingL.payload);
+        const oldExtendsNew = existingL.payload.startsWith(msg.payload);
+        if (!newExtendsOld && !oldExtendsNew) {
+          // Different logical messages — flush pending, debounce new.
+          this.commitLeaderInject(existingL.payload, source);
+        }
+        if (oldExtendsNew && !newExtendsOld) {
+          // New is a shrinking prefix — keep the longer pending.
+          const timer = setTimeout(() => {
+            this.pendingLeaderInject.delete(source);
+            this.commitLeaderInject(existingL.payload, source);
+          }, this.dispatchDebounceMs);
+          this.pendingLeaderInject.set(source, { payload: existingL.payload, timer });
+          return;
+        }
+      }
+      this.armLeaderDispatchTimer(source, msg.payload);
       return;
     }
 
     const w = this.workers.get(msg.workerId);
     if (!w) {
       this.output.appendLine(
-        `[orch] leader referenced unknown "${msg.workerId}" — dropped (payload: ${preview(msg.payload)})`,
+        `[orch] ${sourcePaneId ? `${sourcePaneId} referenced` : 'leader referenced'} unknown "${msg.workerId}" — dropped (payload: ${preview(msg.payload)})`,
       );
       // v2.7.25: if this id was `addWorker`'d very recently, the leader may
       // have referenced the new id before our `workers.set` landed. Surface
@@ -853,6 +1602,48 @@ export class PodiumOrchestrator implements vscode.Disposable {
       }
       this.stats.dropped += 1;
       return;
+    }
+
+    // v0.3.0 · Self-route guard (worker-1 cannot send to worker-1).
+    if (w.cfg.paneId === source) {
+      this.output.appendLine(
+        `[orch] ${msg.workerId} self-routed — dropped (payload: ${preview(msg.payload)})`,
+      );
+      this.stats.dropped += 1;
+      return;
+    }
+
+    // v0.8.1 · Route-time dedupe (worker target). Catches the bug where
+    // Ink alt-screen repaints re-emit a prior turn's `@worker-N: ...`
+    // directive in the middle of the NEXT turn. The repaint lands in
+    // `route()`, which arms a debounce timer; each subsequent repaint
+    // re-arms the timer ad infinitum while the leader is busy. By the
+    // time the leader falls idle and commit fires, CROSS_TURN_DEDUPE_MS
+    // measured from the ORIGINAL commit has lapsed → commit-time dedupe
+    // misses → the task is re-injected into the worker. Dropping at
+    // route time prevents both the spam and the re-injection.
+    const nowR = this.nowFn();
+    this.pruneRecent(w, nowR);
+    const keyR = this.dedupeKey(msg.payload);
+    const prevR = w.recentPayloads.get(keyR);
+    if (prevR !== undefined) {
+      const sameTurn = prevR.turnId === this.leaderTurnId;
+      const crossTurnWithin = nowR - prevR.ts < CROSS_TURN_DEDUPE_MS;
+      if (sameTurn || crossTurnWithin) {
+        this.stats.deduped += 1;
+        const reason = sameTurn
+          ? `same turn=${this.leaderTurnId}`
+          : `cross-turn within ${CROSS_TURN_DEDUPE_MS}ms (prior turn=${prevR.turnId}, cur=${this.leaderTurnId})`;
+        this.output.appendLine(
+          `[orch.route] ${w.cfg.id} dedup-drop (${reason}, key="${preview(keyR, 40)}"): ${preview(msg.payload)}`,
+        );
+        const pending = this.pendingRoute.get(w.cfg.id);
+        if (pending && this.dedupeKey(pending.payload) === keyR) {
+          clearTimeout(pending.timer);
+          this.pendingRoute.delete(w.cfg.id);
+        }
+        return;
+      }
     }
 
     if (this.dispatchDebounceMs <= 0) {
@@ -894,11 +1685,295 @@ export class PodiumOrchestrator implements vscode.Disposable {
     this.armDispatchTimer(w.cfg.id, msg.payload);
   }
 
+  /**
+   * v0.3.0 · Inject a `@leader:` payload into the leader pane. Shares the
+   * round-cap and dedupe enforcement model with `commitRoute` (the worker-
+   * side path), which keeps both directions of the bidirectional routing
+   * under the same convergence budget.
+   */
+  private commitLeaderInject(payload: string, sourcePaneId: string): void {
+    if (!this.leader) {
+      this.stats.dropped += 1;
+      return;
+    }
+    const nowMs = this.nowFn();
+    // v0.9.2 — ACK round-trip verification. If the source worker had a
+    // pending fingerprint (armed by the last leader→worker spill), consume
+    // it here: compare the echoed `ACK bytes=N tail=XXXX` against the
+    // expected values and log match/mismatch. Missing or malformed ACK
+    // is silent — the convention is best-effort, not required.
+    this.maybeConsumeAck(payload, sourcePaneId);
+    this.pruneLeaderRecent(nowMs);
+    // v0.5.0 · (A+B) Normalized key + turn-based dedupe also on the
+    // worker→leader direction. Ghost repaints from worker panes re-emitting
+    // a prior turn's `@leader: banana` directive must NOT make it back to
+    // the leader stdin a second time — field logs showed worker-2 yielding
+    // ["leader=banana", "leader=25"] multiple times per tick after it had
+    // already moved on to a new task.
+    const key = this.dedupeKey(payload);
+    const lastSeen = this.leaderRecentPayloads.get(key);
+    // v0.5.0 (B) + v0.7.3 cross-turn dedupe window — see commitRoute for
+    // rationale. Same-turn OR within-2-min across turns → drop. Worker
+    // panes also repaint scrollback and yield stale @leader: directives;
+    // this suppresses those ghosts without blocking legitimate re-uses
+    // after the window expires.
+    if (lastSeen !== undefined) {
+      if (lastSeen.turnId === this.leaderTurnId) {
+        this.stats.deduped += 1;
+        this.output.appendLine(
+          `[orch.commit] leader (from ${sourcePaneId}) deduped (same turn=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+        );
+        return;
+      }
+      if (nowMs - lastSeen.ts < CROSS_TURN_DEDUPE_MS) {
+        this.stats.deduped += 1;
+        this.output.appendLine(
+          `[orch.commit] leader (from ${sourcePaneId}) deduped (cross-turn within ${CROSS_TURN_DEDUPE_MS}ms: prior turn=${lastSeen.turnId}, cur=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+        );
+        return;
+      }
+    }
+    if (this.enforceRoundCap(`leader (from ${sourcePaneId})`, payload)) return;
+    this.leaderRecentPayloads.set(key, { turnId: this.leaderTurnId, ts: nowMs });
+    this.currentRound += 1;
+    this.lastRouteAt = nowMs;
+    const agent = this.leader.agent;
+    const opts = { agent };
+    try {
+      if (needsWin32KeyEvents(opts)) {
+        const { body, submit } = splitSubmitPayload(payload, opts);
+        this.panel.writeToPane(this.leader.paneId, body);
+        setTimeout(() => {
+          try {
+            this.panel.writeToPane(this.leader!.paneId, submit);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            this.output.appendLine(`[orch] inject submit → leader FAILED — ${msg}`);
+          }
+        }, INJECT_SUBMIT_DELAY_MS);
+      } else {
+        this.panel.writeToPane(this.leader.paneId, buildSubmitPayload(payload, opts));
+      }
+      this.stats.injected += 1;
+      this.output.appendLine(
+        `[orch] → leader (from ${sourcePaneId}, round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}): ${preview(payload)}`,
+      );
+      // v0.9.5 · Worker→leader commit. Use the source worker's endpoint if
+      // we can find it; fall back to a provider-less descriptor with just
+      // the paneId so the ledger still shows the source.
+      const sourceWorker = this.findWorkerByPaneId(sourcePaneId);
+      this.logEvent({
+        type: 'route.committed',
+        turnId: this.leaderTurnId,
+        source: sourceWorker
+          ? this.workerEndpoint(sourceWorker)
+          : { kind: 'worker', id: sourcePaneId },
+        target: this.leaderEndpoint(),
+        payload: {
+          direction: 'worker-to-leader',
+          round: this.currentRound,
+          payloadBytes: Buffer.byteLength(payload, 'utf8'),
+          payloadPreview: preview(payload, 80),
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch] inject → leader FAILED — ${msg}`);
+      this.stats.dropped += 1;
+    }
+  }
+
+  /**
+   * v0.9.2 — Inspect an inbound worker→leader payload for an echoed
+   * `ACK bytes=N tail=XXXX` signature and compare against the
+   * fingerprint the orch spilled to that worker last.
+   *
+   * Semantics:
+   *   - No worker matching sourcePaneId → no-op (routing bookkeeping mismatch).
+   *   - Worker has no pending fingerprint → no-op (unsolicited ACK,
+   *     e.g. from a prompt-driven retry or a previous session's scrollback).
+   *   - Pending fingerprint present but no ACK pattern → clear it
+   *     silently (worker chose not to echo; that's allowed).
+   *   - ACK parses AND matches → log `[orch.ack] match ...`.
+   *   - ACK parses AND mismatches → log `[orch.ack] MISMATCH ...`.
+   *
+   * The pending fingerprint is cleared in every branch so it does not
+   * leak across turns. The function NEVER drops the payload — the ACK
+   * check is purely observational, never blocking.
+   */
+  private maybeConsumeAck(payload: string, sourcePaneId: string): void {
+    const w = this.findWorkerByPaneId(sourcePaneId);
+    if (!w || !w.pendingAckFp) return;
+
+    const expected = w.pendingAckFp;
+    w.pendingAckFp = null; // one-shot, consume regardless of outcome
+
+    const m = payload.match(/^\s*ACK\s+bytes=(\d+)\s+tail=([0-9a-f]{8})\b/i);
+    if (!m) return; // no ACK echoed — silent by design
+
+    const gotBytes = Number.parseInt(m[1], 10);
+    const gotTail = m[2].toLowerCase();
+
+    if (gotBytes === expected.bytes && gotTail === expected.tail_sha8) {
+      this.output.appendLine(
+        `[orch.ack] match ${w.cfg.id} bytes=${gotBytes} tail=${gotTail} (drop=${expected.dropPath})`,
+      );
+      // v0.9.4 — successful delivery ends any active retry chain.
+      w.retryChain = null;
+      // v0.9.5 — ledger.
+      this.logEvent({
+        type: 'ack.match',
+        turnId: this.leaderTurnId,
+        source: this.workerEndpoint(w),
+        target: this.leaderEndpoint(),
+        payload: {
+          bytes: gotBytes,
+          tail_sha8: gotTail,
+          dropPath: expected.dropPath,
+        },
+      });
+      return;
+    }
+
+    this.output.appendLine(
+      `[orch.ack] MISMATCH ${w.cfg.id} expected bytes=${expected.bytes} tail=${expected.tail_sha8}, got bytes=${gotBytes} tail=${gotTail} (drop=${expected.dropPath}) — directive likely truncated in transit; consider re-sending the full body`,
+    );
+    // v0.9.4 — arm the retry chain. If a chain already exists, extend
+    // it (the prior retry failed too); otherwise start a fresh chain
+    // rooted at this failed drop.
+    const nowMs = this.nowFn();
+    if (w.retryChain) {
+      w.retryChain.priorDropPath = expected.dropPath;
+      w.retryChain.nextCount += 1;
+      w.retryChain.ts = nowMs;
+    } else {
+      w.retryChain = { priorDropPath: expected.dropPath, nextCount: 2, ts: nowMs };
+    }
+    // v0.9.5 — ledger.
+    this.logEvent({
+      type: 'ack.mismatch',
+      level: 'warn',
+      turnId: this.leaderTurnId,
+      source: this.workerEndpoint(w),
+      target: this.leaderEndpoint(),
+      payload: {
+        expected: { bytes: expected.bytes, tail_sha8: expected.tail_sha8 },
+        got: { bytes: gotBytes, tail_sha8: gotTail },
+        dropPath: expected.dropPath,
+        retryChainLength: w.retryChain?.nextCount ?? null,
+      },
+    });
+  }
+
+  private findWorkerByPaneId(paneId: string): WorkerRuntime | null {
+    for (const w of this.workers.values()) {
+      if (w.cfg.paneId === paneId) return w;
+    }
+    return null;
+  }
+
+  private pruneLeaderRecent(nowMs: number): void {
+    for (const [payload, entry] of this.leaderRecentPayloads) {
+      if (nowMs - entry.ts >= this.dedupeWindowMs) this.leaderRecentPayloads.delete(payload);
+    }
+  }
+
+  /**
+   * Returns true when the round cap has been hit (caller should drop).
+   * The cap-reached notice is injected into the leader exactly once per
+   * capped window; `resetRound()` or auto-reset re-arms the notice.
+   */
+  private enforceRoundCap(targetLabel: string, payload: string): boolean {
+    if (this.maxRoundsPerTask <= 0) return false;
+    if (this.currentRound < this.maxRoundsPerTask) return false;
+    this.stats.dropped += 1;
+    this.output.appendLine(
+      `[orch.roundCap] dropped → ${targetLabel} (round ${this.currentRound} ≥ cap ${this.maxRoundsPerTask}): ${preview(payload)}`,
+    );
+    if (!this.roundCapNotifyFired) {
+      this.roundCapNotifyFired = true;
+      // v0.5.0 — When the round cap is first hit, flip the routing pause
+      // switch. The existing notify already tells the leader to stop
+      // delegating, but the leader often keeps trying for a few more
+      // turns (the model doesn't parse "paused" as a hard stop). Flipping
+      // `routingPaused` converts those continued attempts into cheap
+      // `[orch.paused]` drops instead of letting them re-enter the dedupe
+      // / debounce path. `resetRound()` re-enables routing.
+      this.routingPaused = true;
+      this.routingPausedByRoundCap = true;
+      this.scheduleLeaderNotify(
+        `round cap reached (${this.maxRoundsPerTask}). Further worker routing is paused — summarize what you have and reply to the user, or ask to reset.`,
+      );
+    }
+    return true;
+  }
+
   private armDispatchTimer(workerId: string, payload: string): void {
     const existing = this.pendingRoute.get(workerId);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.tryDispatchPending(workerId, payload), this.dispatchDebounceMs);
     this.pendingRoute.set(workerId, { payload, timer });
+  }
+
+  /** v0.3.4 · Mirror of `armDispatchTimer` for worker→leader routing. */
+  private armLeaderDispatchTimer(sourcePaneId: string, payload: string): void {
+    const existing = this.pendingLeaderInject.get(sourcePaneId);
+    if (existing) clearTimeout(existing.timer);
+    const timer = setTimeout(
+      () => this.tryDispatchPendingLeader(sourcePaneId, payload),
+      this.dispatchDebounceMs,
+    );
+    // v0.7.3 — Preserve leaderGateStartedAt across re-arms so the
+    // cumulative wait toward LEADER_IDLE_WAIT_MAX_MS is honored. A
+    // re-arm is an extension of the same pending inject, not a fresh
+    // one; if we reset the stamp every debounce cycle the cap would
+    // never be reached.
+    this.pendingLeaderInject.set(sourcePaneId, {
+      payload,
+      timer,
+      leaderGateStartedAt: existing?.leaderGateStartedAt,
+    });
+  }
+
+  private tryDispatchPendingLeader(sourcePaneId: string, payload: string): void {
+    // Gate on the SOURCE worker's idle state — same rationale as
+    // `tryDispatchPending` gates on leaderIdle. If the source is still
+    // emitting assistant output, an Ink re-wrap of the @leader: line may
+    // land a longer version in the next few hundred ms; re-arm and wait.
+    const source = [...this.workers.values()].find((w) => w.cfg.paneId === sourcePaneId);
+    if (source && !source.idle.isIdle) {
+      const ms = source.idle.msSinceOutput;
+      this.output.appendLine(
+        `[orch.debounce] re-arm leader←${sourcePaneId} (source busy, msSinceOutput=${ms}ms): ${preview(payload)}`,
+      );
+      this.armLeaderDispatchTimer(sourcePaneId, payload);
+      return;
+    }
+    // v0.7.3 — Also gate on LEADER idle. Claude's Ink TUI sometimes
+    // does not honor the submit (`\r`) key while the leader is
+    // streaming its own response — the body bytes land in the bottom
+    // input box but the submit is eaten by the in-progress render, so
+    // the user has to press Enter manually. Waiting for leader idle
+    // sidesteps that. Bounded by LEADER_IDLE_WAIT_MAX_MS so we never
+    // lose an inject if the leader never settles.
+    const pending = this.pendingLeaderInject.get(sourcePaneId);
+    const waited = pending?.leaderGateStartedAt !== undefined
+      ? this.nowFn() - pending.leaderGateStartedAt
+      : 0;
+    if (this.leaderIdle && !this.leaderIdle.isIdle && waited < LEADER_IDLE_WAIT_MAX_MS) {
+      if (pending && pending.leaderGateStartedAt === undefined) {
+        pending.leaderGateStartedAt = this.nowFn();
+      }
+      const ms = this.leaderIdle.msSinceOutput;
+      this.output.appendLine(
+        `[orch.debounce] re-arm leader←${sourcePaneId} (leader busy, waited=${waited}ms/${LEADER_IDLE_WAIT_MAX_MS}ms, leader msSinceOutput=${ms}ms): ${preview(payload)}`,
+      );
+      this.armLeaderDispatchTimer(sourcePaneId, payload);
+      return;
+    }
+    this.output.appendLine(`[orch.debounce] commit leader←${sourcePaneId}: ${preview(payload)}`);
+    this.pendingLeaderInject.delete(sourcePaneId);
+    this.commitLeaderInject(payload, sourcePaneId);
   }
 
   /**
@@ -914,26 +1989,74 @@ export class PodiumOrchestrator implements vscode.Disposable {
    */
   private tryDispatchPending(workerId: string, payload: string): void {
     if (this.leaderIdle && !this.leaderIdle.isIdle) {
+      // v0.3.7 · Field diagnostic: log every re-arm so silent stalls are
+      // visible. Field log showed the pending debounce looping forever when
+      // leaderIdle misjudged busy; without this log the loop was invisible.
+      const ms = this.leaderIdle.msSinceOutput;
+      this.output.appendLine(
+        `[orch.debounce] re-arm ${workerId} (leaderIdle=busy, msSinceOutput=${ms}ms): ${preview(payload)}`,
+      );
       this.armDispatchTimer(workerId, payload);
       return;
     }
+    this.output.appendLine(`[orch.debounce] commit ${workerId}: ${preview(payload)}`);
     this.pendingRoute.delete(workerId);
     const w = this.workers.get(workerId);
     if (w) this.commitRoute(w, payload);
   }
 
   private commitRoute(w: WorkerRuntime, payload: string): void {
+    // v0.3.7 · Entry log — field diagnostic for stalls between commit and inject.
+    this.output.appendLine(
+      `[orch.commit] ${w.cfg.id} (idle=${w.idle.isIdle}, queueLen=${w.queue.length}): ${preview(payload)}`,
+    );
     // Redraw dedupe: Claude's Ink UI repaints the same line on every status
     // tick. Suppress any payload we've seen for this worker within the dedupe
     // window. First hit logs as dedup-suppressed; silent for subsequent hits.
+    //
+    // v0.4.2 · (A) Key normalization
+    // -------------------------------
+    // Pre-v0.4.2 the dedupe key was the full payload string. Ink alt-screen
+    // scrollback repaints sometimes shift payload boundaries — e.g. the first
+    // emission folds a trailing narration sentence into the payload
+    // (`"banana"...마세요. 두 워커의 응답을 기다리겠습니다.`) but the repaint
+    // yields the parser a bare `"banana"...마세요.`. Different strings, so
+    // the full-payload key missed and the worker got re-injected.
+    // Normalizing to the first line (up to 100 chars) makes the key stable
+    // across such boundary wobbles while still distinguishing legitimately
+    // different tasks (which virtually always diverge within the first line).
     const nowMs = this.nowFn();
     this.pruneRecent(w, nowMs);
-    const lastSeen = w.recentPayloads.get(payload);
+    const key = this.dedupeKey(payload);
+    const lastSeen = w.recentPayloads.get(key);
+    // v0.5.0 (B) same-turn dedupe + v0.7.3 cross-turn dedupe window.
+    // Same-turn repeat → drop. Different turn with SAME key within
+    // CROSS_TURN_DEDUPE_MS → also drop (catches Ink scrollback repaints
+    // that span turn boundaries). Different turn older than the window
+    // → allowed through for legitimate re-delegation.
     if (lastSeen !== undefined) {
-      this.stats.deduped += 1;
-      return;
+      if (lastSeen.turnId === this.leaderTurnId) {
+        this.stats.deduped += 1;
+        this.output.appendLine(
+          `[orch.commit] ${w.cfg.id} deduped (same turn=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+        );
+        return;
+      }
+      if (nowMs - lastSeen.ts < CROSS_TURN_DEDUPE_MS) {
+        this.stats.deduped += 1;
+        this.output.appendLine(
+          `[orch.commit] ${w.cfg.id} deduped (cross-turn within ${CROSS_TURN_DEDUPE_MS}ms: prior turn=${lastSeen.turnId}, cur=${this.leaderTurnId}, key="${preview(key, 40)}")`,
+        );
+        return;
+      }
     }
-    w.recentPayloads.set(payload, nowMs);
+    // v0.3.0: enforce round cap AFTER dedupe so Ink redraws of a single
+    // commit don't exhaust the budget. Once the cap is hit the route is
+    // dropped and a single notice fires (see enforceRoundCap).
+    if (this.enforceRoundCap(w.cfg.id, payload)) return;
+    w.recentPayloads.set(key, { turnId: this.leaderTurnId, ts: nowMs });
+    this.currentRound += 1;
+    this.lastRouteAt = nowMs;
 
     if (w.idle.isIdle) {
       this.inject(w, payload);
@@ -941,15 +2064,357 @@ export class PodiumOrchestrator implements vscode.Disposable {
       w.queue.push(payload);
       this.stats.queued += 1;
       this.output.appendLine(
-        `[orch] queue ${w.cfg.id} (busy, queue=${w.queue.length}): ${preview(payload)}`,
+        `[orch] queue ${w.cfg.id} (busy, queue=${w.queue.length}, round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}): ${preview(payload)}`,
       );
+    }
+    // v0.9.5 · Route commit crosses the dedupe/round-cap gate; mirror it
+    // into the ledger regardless of whether the payload injected
+    // immediately or went to the worker's queue (the queue is still a
+    // committed route — it will fire once the worker is idle).
+    this.logEvent({
+      type: 'route.committed',
+      turnId: this.leaderTurnId,
+      source: this.leaderEndpoint(),
+      target: this.workerEndpoint(w),
+      payload: {
+        direction: 'leader-to-worker',
+        round: this.currentRound,
+        queued: !w.idle.isIdle,
+        payloadBytes: Buffer.byteLength(payload, 'utf8'),
+        payloadPreview: preview(payload, 80),
+      },
+    });
+  }
+
+  /**
+   * v0.6.0 — Save the worker's completed turn body to a drop file and
+   * inject a short pty-safe "[drop from worker-N]" notice into the leader.
+   *
+   * The notice contains up to SPILL_PREVIEW_LINES lines of the body
+   * (each capped at SPILL_PREVIEW_LINE_CHARS) so the user watching the
+   * leader pane has immediate visibility into what the worker wrote,
+   * and the leader itself has enough context to decide whether to Read
+   * the full drop file before synthesizing.
+   *
+   * File path: `<attachedCwd>/.omc/team/drops/<worker>-turn<N>-seq<S>.md`
+   * (`.omc/` is already gitignored at the project root).
+   */
+  /**
+   * v0.9.0 — Archive top-level `*.md` drops from a prior session.
+   *
+   * Called once per `attach()`. Moves any `.md` files directly inside
+   * `<cwd>/.omc/team/drops/` into `<cwd>/.omc/team/drops/archive/<ISO>/`
+   * so the new session starts with a clean drops root. Subdirectories
+   * (including `archive/`) are left alone — re-archiving is a no-op.
+   *
+   * Non-fatal: caller wraps in try/catch and logs. Archive failure
+   * never blocks attach.
+   */
+  private archivePriorDrops(cwd: string): void {
+    const dropsDir = path.join(cwd, '.omc', 'team', 'drops');
+    if (!fs.existsSync(dropsDir)) return;
+
+    const entries = fs.readdirSync(dropsDir, { withFileTypes: true });
+    const orphans = entries.filter((e) => e.isFile() && e.name.endsWith('.md'));
+    if (orphans.length === 0) return;
+
+    // Filesystem-safe ISO-ish stamp (no ':' or '.'; Windows-hostile).
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archiveDir = path.join(dropsDir, 'archive', stamp);
+    fs.mkdirSync(archiveDir, { recursive: true });
+
+    for (const f of orphans) {
+      const src = path.join(dropsDir, f.name);
+      const dst = path.join(archiveDir, f.name);
+      fs.renameSync(src, dst);
+    }
+
+    const archiveRel = path.posix.join('.omc', 'team', 'drops', 'archive', stamp);
+    this.output.appendLine(
+      `[orch.drops] archived ${orphans.length} prior drop(s) → ${archiveRel}`,
+    );
+  }
+
+  /**
+   * v0.11.0 — Snapshot the current `.omc/team/artifacts/` filenames so a
+   * worker's spillAndNotify can compute "what was newly created during
+   * this turn". Returns an empty Set when the directory is missing or
+   * unreadable — failure modes are non-fatal because the worker's first
+   * spill in that case will simply observe `currentSet` as the
+   * baseline.
+   */
+  private snapshotArtifactsDir(): Set<string> {
+    const root = this.attachedCwd ?? process.cwd();
+    const artifactsDir = path.join(root, '.omc', 'team', 'artifacts');
+    try {
+      if (!fs.existsSync(artifactsDir)) return new Set<string>();
+      return new Set(
+        fs
+          .readdirSync(artifactsDir, { withFileTypes: true })
+          .filter((e) => e.isFile())
+          .map((e) => e.name),
+      );
+    } catch {
+      return new Set<string>();
     }
   }
 
-  private pruneRecent(w: WorkerRuntime, nowMs: number): void {
-    for (const [payload, t] of w.recentPayloads) {
-      if (nowMs - t >= this.dedupeWindowMs) w.recentPayloads.delete(payload);
+  /**
+   * v0.11.0 — Public setter for worker→leader reply mode. Wired by the
+   * VS Code extension host from the `podium.workerReplyMode` user
+   * setting. Pure setter (no event side-effect) so tests can toggle
+   * without the configuration system.
+   */
+  setWorkerReplyMode(mode: WorkerReplyMode): void {
+    if (this.workerReplyMode === mode) return;
+    const prev = this.workerReplyMode;
+    this.workerReplyMode = mode;
+    this.output.appendLine(
+      `[orch.spill] workerReplyMode: ${prev} → ${mode}`,
+    );
+  }
+
+  /** Test/debug introspection. */
+  getWorkerReplyMode(): WorkerReplyMode {
+    return this.workerReplyMode;
+  }
+
+  private spillAndNotify(w: WorkerRuntime, turnBody: string): void {
+    if (this.workerReplyMode === 'artifact') {
+      this.spillRawDebugAndNotifyArtifacts(w, turnBody);
+      return;
     }
+    // legacy-auto-spill mode (pre-v0.11). Original code path follows.
+    this.spillAndNotifyLegacy(w, turnBody);
+  }
+
+  /**
+   * v0.11.0 default — Save the raw pty turn body to a debug-only file
+   * under `.omc/team/drops/raw/` (NOT inject into the leader) and then
+   * scan `.omc/team/artifacts/` for files newly created during this
+   * worker's turn. Each new artifact triggers a path notice routed to
+   * the leader. Worker thinking, status redraws, and other pty noise
+   * are therefore invisible to the leader's context — only files the
+   * worker DELIBERATELY wrote reach the synthesis surface.
+   */
+  private spillRawDebugAndNotifyArtifacts(w: WorkerRuntime, turnBody: string): void {
+    w.spillSeq += 1;
+    const root = this.attachedCwd ?? process.cwd();
+    const rawDir = path.join(root, '.omc', 'team', 'drops', 'raw');
+    const rawFilename = `${w.cfg.id}-turn${this.leaderTurnId}-seq${w.spillSeq}.md`;
+    const rawAbs = path.join(rawDir, rawFilename);
+    const rawRel = path.posix.join('.omc', 'team', 'drops', 'raw', rawFilename);
+    try {
+      fs.mkdirSync(rawDir, { recursive: true });
+      const now = new Date().toISOString();
+      const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
+      const header =
+        `# Raw debug dump: ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
+        `mode: artifact\n` +
+        `session: ${session}\n` +
+        `timestamp: ${now}\n` +
+        `note: this file is for debugging only and is NOT inject into the leader.\n` +
+        `      The leader receives notices about new files in .omc/team/artifacts/ instead.\n` +
+        `---\n\n`;
+      fs.writeFileSync(rawAbs, header + turnBody, 'utf8');
+      this.output.appendLine(
+        `[orch.spill.artifact] ${w.cfg.id} raw → ${rawRel} (${turnBody.length} bytes, debug-only)`,
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch.spill.artifact] raw write FAILED for ${rawFilename} — ${msg}`);
+      // Non-fatal — continue to artifact notification.
+    }
+
+    // Diff `.omc/team/artifacts/` against the snapshot captured at this
+    // worker's turn start. Each new file is a deliberate worker product.
+    this.notifyLeaderOfNewArtifacts(w);
+  }
+
+  /**
+   * v0.11.0 — Compare `.omc/team/artifacts/` to `w.turnStartArtifactSnapshot`
+   * and inject one path notice per new file into the leader. After the
+   * diff, refresh the snapshot to the current set so the next turn's
+   * baseline is accurate. Missing-directory and read-failure are
+   * non-fatal — they yield zero notices and a single warning log line.
+   */
+  private notifyLeaderOfNewArtifacts(w: WorkerRuntime): void {
+    const root = this.attachedCwd ?? process.cwd();
+    const artifactsDir = path.join(root, '.omc', 'team', 'artifacts');
+    let entries: string[] = [];
+    try {
+      if (fs.existsSync(artifactsDir)) {
+        entries = fs
+          .readdirSync(artifactsDir, { withFileTypes: true })
+          .filter((e) => e.isFile())
+          .map((e) => e.name);
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(
+        `[orch.spill.artifact] readdir ${artifactsDir} FAILED — ${msg}; no artifact notice this turn`,
+      );
+      return;
+    }
+    const currentSet = new Set(entries);
+    const newFiles: string[] = [];
+    for (const name of entries) {
+      if (!w.turnStartArtifactSnapshot.has(name)) newFiles.push(name);
+    }
+    // Refresh baseline so subsequent turns only see newer-still files.
+    w.turnStartArtifactSnapshot = currentSet;
+
+    if (newFiles.length === 0) {
+      this.output.appendLine(
+        `[orch.spill.artifact] ${w.cfg.id} produced no new artifact this turn`,
+      );
+      return;
+    }
+
+    for (const name of newFiles) {
+      const absPath = path.join(artifactsDir, name);
+      const relPath = path.posix.join('.omc', 'team', 'artifacts', name);
+      let bytes = 0;
+      let tail_sha8 = '';
+      try {
+        const body = fs.readFileSync(absPath, 'utf8');
+        bytes = Buffer.byteLength(body, 'utf8');
+        tail_sha8 = computeTailSha8(body);
+      } catch {
+        // Race: file disappeared or is being rewritten — skip it.
+        continue;
+      }
+      const notice =
+        `[artifact from ${w.cfg.id} turn ${this.leaderTurnId}] ${relPath} (bytes=${bytes} tail=${tail_sha8})\n\n` +
+        `위 파일을 Read 해서 워커의 결과물을 확인해 주세요.`;
+      this.output.appendLine(
+        `[orch.spill.artifact] ${w.cfg.id} → leader: ${relPath} (${bytes}B)`,
+      );
+      this.logEvent({
+        type: 'artifact.notified',
+        turnId: this.leaderTurnId,
+        source: this.workerEndpoint(w),
+        target: this.leaderEndpoint(),
+        payload: {
+          direction: 'worker-to-leader',
+          artifactPath: relPath,
+          bytes,
+          tail_sha8,
+        },
+      });
+      this.route({ workerId: 'leader', payload: notice }, w.cfg.paneId);
+    }
+  }
+
+  private spillAndNotifyLegacy(w: WorkerRuntime, turnBody: string): void {
+    w.spillSeq += 1;
+    const root = this.attachedCwd ?? process.cwd();
+    const dir = path.join(root, '.omc', 'team', 'drops');
+    const filename = `${w.cfg.id}-turn${this.leaderTurnId}-seq${w.spillSeq}.md`;
+    const absPath = path.join(dir, filename);
+    const relPath = path.posix.join('.omc', 'team', 'drops', filename);
+    // v0.9.5 · Hoist out of the try block so the ledger write below can
+    // reuse without recomputing.
+    const tail_sha8 = computeTailSha8(turnBody);
+    const bytes = Buffer.byteLength(turnBody, 'utf8');
+
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const now = new Date().toISOString();
+      const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
+      const header =
+        `# Drop: ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
+        `session: ${session}\n` +
+        `timestamp: ${now}\n` +
+        `bytes: ${bytes}\n` +
+        `tail_sha8: ${tail_sha8}\n` +
+        `---\n\n`;
+      fs.writeFileSync(absPath, header + turnBody, 'utf8');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch.spill] write FAILED for ${filename} — ${msg}`);
+      this.stats.dropped += 1;
+      return;
+    }
+
+    const preview = this.buildSpillPreview(turnBody);
+    const notice =
+      `[drop from ${w.cfg.id} turn ${this.leaderTurnId}] 본문 저장됨: ${relPath}\n\n` +
+      `미리보기:\n${preview}\n\n` +
+      `전체 본문은 위 파일을 Read 해서 확인하고 종합해 주세요.`;
+
+    this.output.appendLine(
+      `[orch.spill] ${w.cfg.id} → ${relPath} (${turnBody.length} bytes); notifying leader`,
+    );
+
+    // v0.9.5 · Ledger — worker→leader drop file written.
+    this.logEvent({
+      type: 'drop.written',
+      turnId: this.leaderTurnId,
+      source: this.workerEndpoint(w),
+      target: this.leaderEndpoint(),
+      payload: {
+        direction: 'worker-to-leader',
+        dropPath: relPath,
+        bytes: Buffer.byteLength(turnBody, 'utf8'),
+        tail_sha8,
+        seq: w.spillSeq,
+      },
+    });
+
+    // Route via the same worker→leader path as a normal `@leader:` directive.
+    // This pays round-counter + dedupe + routing-pause the same as a
+    // parser-yielded message, keeping accounting consistent.
+    this.route({ workerId: 'leader', payload: notice }, w.cfg.paneId);
+  }
+
+  /**
+   * v0.6.0 — Build the preview block shown inside a drop notice.
+   * Up to SPILL_PREVIEW_LINES lines, each prefixed with "> " (markdown
+   * block-quote style so it reads cleanly in the leader's context),
+   * each capped at SPILL_PREVIEW_LINE_CHARS chars with an ellipsis when
+   * truncated. An extra "> …" line indicates the body continues beyond
+   * the preview.
+   */
+  private buildSpillPreview(body: string): string {
+    const lines = body.split(/\r?\n/);
+    const taken: string[] = [];
+    for (let i = 0; i < Math.min(lines.length, SPILL_PREVIEW_LINES); i++) {
+      const raw = lines[i];
+      const trimmed =
+        raw.length > SPILL_PREVIEW_LINE_CHARS
+          ? raw.slice(0, SPILL_PREVIEW_LINE_CHARS - 1) + '…'
+          : raw;
+      taken.push(`> ${trimmed}`);
+    }
+    if (lines.length > SPILL_PREVIEW_LINES) taken.push('> …');
+    return taken.join('\n');
+  }
+
+  private pruneRecent(w: WorkerRuntime, nowMs: number): void {
+    for (const [payload, entry] of w.recentPayloads) {
+      if (nowMs - entry.ts >= this.dedupeWindowMs) w.recentPayloads.delete(payload);
+    }
+  }
+
+  /**
+   * v0.4.2 — Dedupe key normalization (strategy "A" from the dedupe ladder).
+   *
+   * Two payloads that represent the same routing intent but differ at the
+   * edges (because the Ink-repaint sometimes folds a trailing narration
+   * sentence into the payload, sometimes doesn't) should collapse to the
+   * same dedupe key. Use the first logical line, trimmed, capped at 100
+   * characters. Legitimate different tasks practically always differ within
+   * the opening line, so false-positive collisions are very rare; the gain
+   * is that Ink boundary wobble stops leaking ghost injections.
+   *
+   * Memo: if this still leaks in the field log, the next rung on the ladder
+   * is strategy "B" (turn-based dedupe — one route per worker per leader
+   * turn, regardless of payload content).
+   */
+  private dedupeKey(payload: string): string {
+    const firstLine = payload.split(/\r?\n/, 1)[0] ?? '';
+    return firstLine.trim().slice(0, 100);
   }
 
   private inject(w: WorkerRuntime, payload: string): void {
@@ -959,11 +2424,26 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // back dispatches) even though worker-1 with a shorter payload fired
     // fine. A short macrotask gap lets ConPTY flush the body bytes through
     // win32-input-mode before the submit sequence arrives.
+    //
+    // v0.6.1 — Mark the worker as having a pending reply. The next
+    // busy→idle edge will treat its transcript slice as a real reply
+    // (flush + maybe-spill). Boot output and idle repaints happening
+    // BEFORE any inject arrives are skipped to avoid spurious drop
+    // notices and the meta-analysis cascade they triggered in v0.6.0.
+    w.hasPendingReply = true;
+    // v0.7.0 — Symmetric spill. A long leader→worker payload (the
+    // delegation body, especially when the leader pastes code or a
+    // full review request) fragments through the pty pipeline just like
+    // worker→leader replies did in v0.5.2. Check size here and, above
+    // SPILL_THRESHOLD_CHARS, divert to a drop file and inject only a
+    // short pty-safe notice. The worker is taught (via workerProtocol)
+    // to Read the file before starting the task.
+    const effective = this.maybeSpillLeaderToWorker(w, payload);
     const paneId = w.cfg.paneId;
     const opts = { agent: w.cfg.agent };
     try {
       if (needsWin32KeyEvents(opts)) {
-        const { body, submit } = splitSubmitPayload(payload, opts);
+        const { body, submit } = splitSubmitPayload(effective, opts);
         this.panel.writeToPane(paneId, body);
         setTimeout(() => {
           try {
@@ -974,17 +2454,191 @@ export class PodiumOrchestrator implements vscode.Disposable {
           }
         }, INJECT_SUBMIT_DELAY_MS);
       } else {
-        const bytes = buildSubmitPayload(payload, opts);
+        const bytes = buildSubmitPayload(effective, opts);
         this.panel.writeToPane(paneId, bytes);
       }
       w.idle.markBusy();
       this.stats.injected += 1;
-      this.output.appendLine(`[orch] → ${w.cfg.id}: ${preview(payload)}`);
+      this.output.appendLine(`[orch] → ${w.cfg.id}: ${preview(effective)}`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[orch] inject → ${w.cfg.id} FAILED — ${msg}`);
       this.stats.dropped += 1;
     }
+  }
+
+  /**
+   * v0.8.0 — Leader→Worker: unconditional file-mediated delivery.
+   *
+   * Every leader-originated payload (regardless of length) is written
+   * to `.omc/team/drops/to-<worker>-turn<N>-seq<S>.md` and only a
+   * SHORT PTY-SAFE NOTICE is injected into the worker's stdin. The
+   * notice's FIRST LINE is the file path — so even if Ink TUI
+   * fragments the rest of the notice mid-stream the worker still sees
+   * the path and can Read it to recover the full directive.
+   *
+   * Why unconditional (change from v0.7.0's 300-char threshold): field
+   * logs of v0.7.4 showed Claude's Ink TUI fragments delegations well
+   * under the 300-char threshold whenever an 'other' line intervenes
+   * and kicks the projector out of the assistant block. Short inline
+   * payloads therefore are NOT reliable either. The user explicitly
+   * requested that ALL leader-to-worker delegations go through files
+   * — that is what this function now guarantees.
+   *
+   * Path-first notice format (critical for fragmentation survival):
+   *
+   *   .omc/team/drops/to-worker-1-turn3-seq1.md
+   *
+   *   위 파일을 Read 해서 지시사항을 수행해 주세요.
+   *
+   * The path is the first token on the first line. Anything cut from
+   * the notice after that is recoverable because the worker already
+   * has the path. Worker's system prompt (workerProtocol DROP HANDLING)
+   * is updated to recognize this format.
+   *
+   * File-write failures fall back to injecting the original payload
+   * (best-effort: fragmentation is worse than nothing, but losing the
+   * task entirely is worse than fragmentation).
+   */
+  private maybeSpillLeaderToWorker(w: WorkerRuntime, payload: string): string {
+    w.spillSeq += 1;
+    const root = this.attachedCwd ?? process.cwd();
+    const dir = path.join(root, '.omc', 'team', 'drops');
+    const filename = `to-${w.cfg.id}-turn${this.leaderTurnId}-seq${w.spillSeq}.md`;
+    const absPath = path.join(dir, filename);
+    const relPath = path.posix.join('.omc', 'team', 'drops', filename);
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+      const now = new Date().toISOString();
+      const nowMs = this.nowFn();
+      const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
+      const tail_sha8 = computeTailSha8(payload);
+      const bytes = Buffer.byteLength(payload, 'utf8');
+
+      // v0.9.3 / v0.9.4 — Redelivery detection. Two triggers compose:
+      //
+      //   (A) v0.9.4 ACK-mismatch chain. If the worker's last reply
+      //       echoed an ACK that didn't match the spilled fingerprint,
+      //       maybeConsumeAck armed `w.retryChain`. The next spill
+      //       within the window is the leader's retry — tag it. This
+      //       is the realistic real-world trigger because retries
+      //       usually rewrite content (prefix/suffix) so their
+      //       `tail_sha8` differs from the original.
+      //
+      //   (B) v0.9.3 Content-hash chain. If the exact same tail is
+      //       spilled again within the window, tag as retry of the
+      //       prior matching drop. This catches orchestrator-initiated
+      //       re-sends or synthetic duplicates.
+      //
+      // (A) takes priority when both fire: the mismatch signal is
+      // more specific about intent. Both update per-worker state.
+      w.recentSpills = w.recentSpills.filter((e) => nowMs - e.ts < REDELIVERY_WINDOW_MS);
+      if (w.retryChain && nowMs - w.retryChain.ts >= REDELIVERY_WINDOW_MS) {
+        w.retryChain = null; // prune stale
+      }
+
+      let redeliveryOf: string | null = null;
+      let chainLength = 1;
+
+      if (w.retryChain) {
+        // (A) ACK-mismatch-keyed retry.
+        redeliveryOf = w.retryChain.priorDropPath;
+        chainLength = w.retryChain.nextCount;
+        // This new drop becomes the anchor for any subsequent mismatch
+        // that extends the chain. The mismatch handler will still
+        // increment nextCount on the next failure.
+        w.retryChain.priorDropPath = relPath;
+        w.retryChain.ts = nowMs;
+      } else {
+        // (B) Content-hash match fallback.
+        const prior = [...w.recentSpills]
+          .reverse()
+          .find((e) => e.tail_sha8 === tail_sha8);
+        if (prior) {
+          redeliveryOf = prior.dropPath;
+          chainLength = prior.chainLength + 1;
+        }
+      }
+
+      const redeliveryLines =
+        chainLength > 1 && redeliveryOf
+          ? `redelivery_of: ${redeliveryOf}\nredelivery_count: ${chainLength}\n`
+          : '';
+
+      const header =
+        `# Drop: leader → ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
+        `direction: leader → ${w.cfg.id}\n` +
+        `session: ${session}\n` +
+        `timestamp: ${now}\n` +
+        `bytes: ${bytes}\n` +
+        `tail_sha8: ${tail_sha8}\n` +
+        redeliveryLines +
+        `---\n\n`;
+      fs.writeFileSync(absPath, header + payload, 'utf8');
+
+      // Record THIS spill for future retry checks. Append after write so
+      // we don't leak state if the write failed.
+      w.recentSpills.push({ tail_sha8, dropPath: relPath, ts: nowMs, chainLength });
+      if (chainLength > 1 && redeliveryOf) {
+        this.output.appendLine(
+          `[orch.redelivery] ${w.cfg.id} drop tagged redelivery_count=${chainLength} (prior=${redeliveryOf})`,
+        );
+        // v0.9.5 · Ledger — redelivery tag.
+        this.logEvent({
+          type: 'redelivery.tagged',
+          turnId: this.leaderTurnId,
+          source: this.leaderEndpoint(),
+          target: this.workerEndpoint(w),
+          payload: {
+            dropPath: relPath,
+            priorDropPath: redeliveryOf,
+            chainLength,
+            tail_sha8,
+          },
+        });
+      }
+      // v0.9.5 · Ledger — leader→worker drop file written.
+      this.logEvent({
+        type: 'drop.written',
+        turnId: this.leaderTurnId,
+        source: this.leaderEndpoint(),
+        target: this.workerEndpoint(w),
+        payload: {
+          direction: 'leader-to-worker',
+          dropPath: relPath,
+          bytes,
+          tail_sha8,
+          seq: w.spillSeq,
+          ...(chainLength > 1 && redeliveryOf
+            ? { redeliveryOf, chainLength }
+            : {}),
+        },
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(
+        `[orch.spill] leader→${w.cfg.id} write FAILED — ${msg}; falling back to direct inject`,
+      );
+      return payload;
+    }
+    this.output.appendLine(
+      `[orch.spill] leader → ${w.cfg.id}: ${relPath} (${Buffer.byteLength(payload, 'utf8')} bytes, tail=${computeTailSha8(payload)}); injecting path-first notice`,
+    );
+    // PATH MUST BE FIRST. Fragmentation-survivable format.
+    // v0.9.1 · fingerprint `(bytes=N tail=XXXX)` embedded on the same
+    // line as the path so the leader (or any reader of the worker's
+    // pty scrollback) can verify the directive arrived whole without
+    // parsing the file header. `bytes` is the payload length in UTF-8
+    // bytes; `tail` is the first 8 hex chars of SHA-256 over the last
+    // 40 chars of the payload (or full payload if shorter). Same
+    // fingerprint lives in the drop file header under `tail_sha8:`.
+    const bytes = Buffer.byteLength(payload, 'utf8');
+    const tail = computeTailSha8(payload);
+    // v0.9.2 — Arm the ACK round-trip. When this worker's next
+    // `@leader:` reply lands, `commitLeaderInject` will compare the
+    // echoed `ACK bytes=N tail=XXXX` against this fingerprint.
+    w.pendingAckFp = { bytes, tail_sha8: tail, dropPath: relPath, ts: this.nowFn() };
+    return `${relPath} (bytes=${bytes} tail=${tail})\n\n위 파일을 Read 해서 지시사항을 수행해 주세요.`;
   }
 
   /**
@@ -1132,10 +2786,91 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.leaderWasIdle = false;
     }
     for (const w of this.workers.values()) {
+      // v0.5.2 / v0.6.0 — Worker busy→idle edge
+      // ----------------------------------------
+      // At the moment the worker goes idle, we pick one of two paths
+      // depending on how much it wrote during this turn:
+      //
+      //   (a) Short reply (< SPILL_THRESHOLD_CHARS): run the existing
+      //       parser.flush() path so pending `@leader:` / `@worker-N:`
+      //       directives drain even without an `@end` terminator.
+      //       This is the v0.5.2 behavior.
+      //
+      //   (b) Long reply (>= SPILL_THRESHOLD_CHARS): abandon the
+      //       parser. Long bodies fragment unpredictably through the
+      //       Ink repaint + pty chunk + ANSI strip pipeline; the
+      //       parser yielded only the first 20–80 bytes of real code
+      //       answers in v0.5.2 field tests. Instead, write the entire
+      //       turn body to a drop file and inject a short pty-safe
+      //       notice into the leader with a preview + file path.
+      //       The leader uses its Read tool to ingest the full body.
+      //       See SPILL_THRESHOLD_CHARS for rationale.
+      if (w.parser && w.idle.isIdle && !w.wasIdle) {
+        if (w.hasPendingReply) {
+          // v0.8.3: always spill the turn body via a drop file (no
+          //         SPILL_THRESHOLD_CHARS gate).
+          // v0.8.4: spill from `rawTranscript` (cosmetic-filtered raw
+          //         stripAnsi), NOT the projector-filtered `transcript`.
+          //         Field evidence: `worker-1-turn3-seq2.md` was 728 B
+          //         but contained only the `@leader:` header line — the
+          //         projector closed the assistant block on the first
+          //         `other`-classified line (in practice, the first code
+          //         line), dropping the body. The routing parser still
+          //         reads the projected stream (that logic is unchanged),
+          //         but the drop file now carries what the worker
+          //         actually wrote.
+          const turnBody = w.rawTranscript.slice(w.rawCurrentTurnStart);
+          if (turnBody.trim().length > 0) {
+            this.spillAndNotify(w, turnBody);
+          } else {
+            this.output.appendLine(
+              `[orch] ${w.cfg.id} idle — no body to spill (turnBody empty, pendingReply cleared)`,
+            );
+          }
+          // Drain any parser state regardless — the drop file supersedes
+          // anything the parser yielded mid-stream.
+          w.parser.flush();
+          w.hasPendingReply = false;
+        } else {
+          // v0.6.1 — No inject was routed to this worker since the last
+          // idle edge. The transcript growth is boot UI, status-tick
+          // repaint, or ambient noise — NOT a reply. Skip spill/flush so
+          // we do not emit spurious drop notices into the leader or
+          // re-route stale fragments from the parser buffer. Still drain
+          // the buffer so it does not accumulate.
+          if (w.parser) w.parser.flush();
+          this.output.appendLine(
+            `[orch] ${w.cfg.id} idle edge skipped (no pending reply — boot/repaint)`,
+          );
+        }
+        // Always advance the turn-start marker so the next real reply
+        // slices from the right offset, regardless of which branch ran.
+        w.currentTurnStart = w.transcript.length;
+        w.rawCurrentTurnStart = w.rawTranscript.length;
+        w.wasIdle = true;
+      } else if (!w.idle.isIdle) {
+        w.wasIdle = false;
+      }
       if (w.queue.length > 0 && w.idle.isIdle) {
         const next = w.queue.shift();
         if (next !== undefined) this.inject(w, next);
       }
+    }
+
+    // v0.3.0 · Auto-reset the round counter when the team has been quiet
+    // for `autoResetRoundMs`. Lets the user's next prompt start from round
+    // 0 without manual resetRound(). Gated on: (a) currentRound > 0 or cap
+    // notice fired, (b) leader idle, (c) all workers idle, (d) no routing
+    // activity within the window.
+    if (
+      this.autoResetRoundMs > 0 &&
+      (this.currentRound > 0 || this.roundCapNotifyFired) &&
+      this.lastRouteAt > 0 &&
+      this.nowFn() - this.lastRouteAt >= this.autoResetRoundMs &&
+      (!this.leaderIdle || this.leaderIdle.isIdle) &&
+      [...this.workers.values()].every((w) => w.idle.isIdle && w.queue.length === 0)
+    ) {
+      this.resetRound();
     }
   }
 
@@ -1158,6 +2893,33 @@ export class PodiumOrchestrator implements vscode.Disposable {
 function preview(text: string, max = 60): string {
   const single = text.replace(/\s+/g, ' ').trim();
   return single.length > max ? `${single.slice(0, max)}…` : single;
+}
+
+/**
+ * v0.9.1 — Content fingerprint for drop files.
+ *
+ * Returns the first 8 hex chars of SHA-256 over the last 40 characters
+ * of the payload (or the full payload if shorter). Used as a cheap,
+ * forensic-friendly signature embedded in:
+ *   - drop file header (`tail_sha8:` field)
+ *   - path-first notice injected into the worker (`tail=XXXX` marker)
+ *
+ * Why the tail window and not the full body: in the 2026-04-24 parseCSV
+ * retrospective, the diagnostic value came from verifying "did the
+ * directive arrive with its ending intact?" A 40-char tail covers the
+ * concluding sentence / punctuation / markers, which is exactly where
+ * Ink-wrap truncations land. Hashing the full body would also detect
+ * mid-body edits, but that's out of scope for a "did it arrive whole"
+ * check.
+ *
+ * Character-based (not byte-based) so the window size is consistent
+ * across CJK / emoji / ASCII payloads. Collision space (24 bits) is
+ * intentionally small — this is a forensic signal, not a security
+ * primitive.
+ */
+function computeTailSha8(payload: string): string {
+  const tail = payload.length <= 40 ? payload : payload.slice(-40);
+  return createHash('sha256').update(tail, 'utf8').digest('hex').slice(0, 8);
 }
 
 function trimForFallback(transcript: string): string {

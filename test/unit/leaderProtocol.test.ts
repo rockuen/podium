@@ -4,6 +4,7 @@ import {
   PODIUM_LEADER_SYSTEM_PROMPT,
   PODIUM_LEADER_DISALLOWED_TOOLS,
   buildLeaderExtraArgs,
+  buildLeaderSystemPrompt,
 } from '../../src/orchestration/core/leaderProtocol';
 
 test('leaderProtocol: system prompt teaches @worker-N routing syntax', () => {
@@ -52,4 +53,37 @@ test('leaderProtocol: system prompt stays under ~500 tokens (≈2000 chars)', ()
     PODIUM_LEADER_SYSTEM_PROMPT.length < 2000,
     `prompt is ${PODIUM_LEADER_SYSTEM_PROMPT.length} chars — trim it`,
   );
+});
+
+test('leaderProtocol v0.3.0: role-aware prompt embeds roster + bidirectional rules', () => {
+  const prompt = buildLeaderSystemPrompt({
+    workers: [
+      { id: 'worker-1', role: 'implementer' },
+      { id: 'worker-2', role: 'critic' },
+    ],
+    maxRoundsPerTask: 5,
+  });
+  assert.ok(prompt.includes('worker-1'));
+  assert.ok(prompt.includes('implementer'));
+  assert.ok(prompt.includes('worker-2'));
+  assert.ok(prompt.includes('critic'));
+  assert.ok(prompt.includes('@leader:'));
+  assert.ok(prompt.includes('BIDIRECTIONAL'));
+  assert.ok(prompt.includes('5 total'));
+});
+
+test('leaderProtocol v0.3.0: empty roster falls back to the legacy prompt', () => {
+  const prompt = buildLeaderSystemPrompt({ workers: [] });
+  assert.equal(prompt, PODIUM_LEADER_SYSTEM_PROMPT);
+});
+
+test('leaderProtocol v0.3.0: buildLeaderExtraArgs with workers uses dynamic prompt', () => {
+  const args = buildLeaderExtraArgs({
+    workers: [{ id: 'worker-1', role: 'implementer' }],
+    maxRoundsPerTask: 3,
+  });
+  const promptIdx = args.indexOf('--append-system-prompt');
+  const prompt = args[promptIdx + 1];
+  assert.notEqual(prompt, PODIUM_LEADER_SYSTEM_PROMPT);
+  assert.ok(prompt.includes('implementer'));
 });

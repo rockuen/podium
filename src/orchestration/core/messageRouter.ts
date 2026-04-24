@@ -1,11 +1,13 @@
-// Phase 2 · v2.7.9 — `@worker-N` routing token parser + Claude leader-output
-// projector.
+// Phase 2 · v2.7.9 / v0.3.0 — `@leader:` and `@worker-N:` routing token parser
+// + Claude pane-output projector. v0.3.0 extended the token set so workers
+// can also emit directives (ping-pong + worker-to-worker discussion).
 //
 // Syntax (Option A — our own, no OMC compat):
 //
 //   Single-line form:
 //       @worker-1: Summarize the plan in three bullets.
 //       @worker-2: Meanwhile draft a name for the product.
+//       @leader: Done. Summary: ...
 //
 //   Multi-line form (for longer prompts):
 //       @worker-1:
@@ -54,16 +56,72 @@
 // unambiguously.
 
 export interface RoutedMessage {
-  /** Worker identifier, e.g. `worker-1`. */
+  /**
+   * Target identifier. `'leader'` for @leader: directives, otherwise a
+   * worker id like `'worker-1'`. v0.3.0 widened this from worker-only so
+   * workers can route back to the leader or a peer.
+   */
   workerId: string;
   /** Payload text (multi-line bodies joined with `\n`). Never has trailing newline. */
   payload: string;
 }
 
-const TOKEN_RE = /@(worker-\d+):/g;
+const TOKEN_RE = /@(leader|worker-\d+):/g;
 const END_RE = /@end\b/;
-const CLAUDE_ASSISTANT_START_RE = /^\s*●(?:\s+|(?=@worker-))/;
-const CLAUDE_ASSISTANT_CONT_RE = /^(?:\s{2,}\S|@worker-\d+:|@end\b)/;
+
+// v0.4.0 — Protocol template / placeholder noise guard
+// -----------------------------------------------------
+// Two failure modes observed in field logs:
+//
+//   1. Leader, while acknowledging the protocol on its first turn, types a
+//      template block that quotes the delegation syntax back, e.g.:
+//         @worker-1: ... / @worker-2: ... (컬럼 0에서 시작)
+//         - 라운드 예산: 작업당 10회
+//         - Effort: max
+//      The tokenizer happily yields directives with payloads like `... /`
+//      and `... (컬럼 0에서 시작) - 라운드 예산: 작업당 10회`, which then
+//      route to workers as if they were real tasks.
+//
+//   2. System-prompt example rows like `@worker-1: <task for worker-1>`
+//      occasionally bleed through repaints; same class of problem.
+//
+// Filter payloads at yield-time so the orchestrator never sees them.
+// Conservative by design: only drop payloads that are OBVIOUSLY template or
+// placeholder content — never a legitimate user task.
+const PLACEHOLDER_PAYLOAD_RE = /^[\s…./\-*·●•]+$/;
+const PROTOCOL_META_RE = /컬럼\s*0\s*에서\s*시작|라운드\s*예산|작업당\s*\d+\s*회|Effort\s*[::]|<task for\b/;
+
+function isProtocolNoise(payload: string): boolean {
+  if (!payload) return true;
+  const trimmed = payload.trim();
+  if (trimmed.length === 0) return true;
+  if (PLACEHOLDER_PAYLOAD_RE.test(trimmed)) return true;
+  if (PROTOCOL_META_RE.test(trimmed)) return true;
+  return false;
+}
+const CLAUDE_ASSISTANT_START_RE = /^\s*●(?:\s+|(?=@(?:worker-|leader:)))/;
+const CLAUDE_ASSISTANT_CONT_RE = /^(?:\s{2,}\S|@(?:worker-\d+|leader):|@end\b)/;
+// v0.3.6 / v0.7.2 · Bare or indented routing directive. Classify as
+// assistant-start so the projector re-enters the assistant block whenever
+// a `@worker-N:` / `@leader:` directive appears, regardless of leading
+// whitespace.
+//
+// Why the relaxed (v0.7.2) match
+// ------------------------------
+// v0.3.6 required column 0 (no leading whitespace). Field logs of the
+// v0.7.1 reverseString task chain showed Claude leaders frequently emit
+// their delegation lines INDENTED (as part of an Ink-wrapped continuation
+// of a preceding bullet paragraph that the projector has meanwhile closed
+// because a 'other' line — diagnostic narration, status repaint — kicked
+// it out). The subsequent `    @worker-2: ...` line then matched only
+// CLAUDE_ASSISTANT_CONT_RE, which drops when the block is closed. Result:
+// the entire `@worker-2: ...` directive (and its body continuation rows)
+// got suppressed, worker-2 was never routed to, and the leader filled
+// the gap by hallucinating a reply.
+//
+// Safe against prompt echo: echoes always carry a `>` or `│ >` prefix
+// (see CLAUDE_PROMPT_RE), which matches before this check.
+const CLAUDE_BARE_DIRECTIVE_RE = /^[ \t]*@(?:worker-\d+|leader):/;
 const CLAUDE_PROMPT_RE = /^(?:>\s.*|>\s*$|│\s*>\s*.*)$/;
 const CLAUDE_STATUS_RE = /^(?:\[OMC#[\d.]+\].*|⏵⏵\s+bypass permissions.*)$/;
 const CLAUDE_CHROME_RE = /^[\s─━│┃╭╮╰╯┌┐└┘┏┓┗┛]+$/;
@@ -76,6 +134,27 @@ const CLAUDE_CHROME_RE = /^[\s─━│┃╭╮╰╯┌┐└┘┏┓┗┛]+
  */
 export class ClaudeLeaderRoutingProjector {
   private inAssistantBlock = false;
+  /**
+   * v0.7.2 — Last non-blank line classification. Used to disambiguate an
+   * indented `@worker-N:` / `@leader:` line: at column 1+ the pattern
+   * looks identical in two very different contexts:
+   *
+   *   (a) An assistant-emitted delegation whose directive got Ink-
+   *       indented under a preceding bullet — legitimate routing; we
+   *       want to re-open the assistant block.
+   *   (b) The 2nd+ line of a multi-worker PROMPT ECHO. The user's
+   *       original input rendered as:
+   *         > @worker-1: ...
+   *           @worker-2: ...   ← indented, no `>` prefix
+   *       The second line looks like (a) by regex alone, but is in fact
+   *       pure echo and must stay dropped.
+   *
+   * We distinguish them by the most-recent non-blank classification:
+   * after a `prompt` line, any subsequent indented directive is still
+   * prompt-echo territory until we see something clearly not-prompt
+   * (assistant-start, chrome, status, or other).
+   */
+  private lastKind: 'prompt' | 'chrome' | 'status' | 'assistant-start' | 'assistant-cont' | 'other' | null = null;
   /**
    * Partial line held between `feed()` calls. v2.7.14 fix for worker-2 drop:
    *
@@ -132,11 +211,31 @@ export class ClaudeLeaderRoutingProjector {
   }
 
   private processLine(line: string, newline: string): string {
-    const kind = classifyClaudeLine(line);
+    let kind = classifyClaudeLine(line);
+    // v0.7.2 — Prompt-echo continuation guard. A bare directive that was
+    // only matched because of the v0.7.2-relaxed indent allowance must be
+    // re-demoted to `prompt` when we're in a pure-echo context: previous
+    // non-blank line was a prompt AND no assistant block is currently
+    // open. Inside an already-open assistant block (e.g. v2.7.30 repaint
+    // scenario where `●` opened the block, narration continues, then Ink
+    // sneaks a `> @worker-1:` repaint of the input box between narration
+    // and a legitimate `  @worker-1:` directive), the indented directive
+    // IS the assistant's real output and must re-assert as assistant-start
+    // so the token reaches the parser.
+    if (
+      kind === 'assistant-start' &&
+      this.lastKind === 'prompt' &&
+      !this.inAssistantBlock &&
+      /^[ \t]+@(?:worker-\d+|leader):/.test(line)
+    ) {
+      kind = 'prompt';
+    }
     if (kind === 'assistant-start') {
       this.inAssistantBlock = true;
+      this.lastKind = kind;
       return line + newline;
     }
+    if (kind !== 'blank') this.lastKind = kind;
     if (!this.inAssistantBlock) return '';
     if (kind === 'assistant-cont' || kind === 'blank') {
       return line + newline;
@@ -164,6 +263,7 @@ export class ClaudeLeaderRoutingProjector {
 
   reset(): void {
     this.inAssistantBlock = false;
+    this.lastKind = null;
     this.partial = '';
   }
 }
@@ -195,7 +295,7 @@ export class WorkerPatternParser {
     const { workerId, payloadStart } = remaining;
     const payload = this.normalize(this.buffer.slice(payloadStart));
     this.buffer = '';
-    if (payload.length === 0) return drained;
+    if (payload.length === 0 || isProtocolNoise(payload)) return drained;
     return [...drained, { workerId, payload }];
   }
 
@@ -224,7 +324,7 @@ export class WorkerPatternParser {
       const payload = isMultiline
         ? this.normalizeMultiline(rawPayload)
         : this.normalize(rawPayload);
-      if (payload.length > 0) {
+      if (payload.length > 0 && !isProtocolNoise(payload)) {
         out.push({ workerId: token.workerId, payload });
       }
       this.buffer = this.buffer.slice(terminator.advanceTo);
@@ -304,12 +404,97 @@ export class WorkerPatternParser {
       // Peek the next line. If it looks like a continuation row, skip this
       // newline and keep scanning. Otherwise terminate here.
       const afterNl = chosen.advance;
+      // v0.8.7 · Hold at end-of-buffer newlines when the payload is
+      // wrap-suspect (long, not sentence-terminated).
+      //
+      // Field evidence (session 2026-04-24): the drop
+      // `to-worker-2-turn6-seq1.md` was cut at 69 bytes mid-sentence
+      // ("...reverseStringSimple,") because Ink visual-wrapped a long
+      // directive at a comma, the wrapped row
+      // ("  reverseStringUnicode) ...") arrived in a LATER pty chunk,
+      // and the parser had already yielded the truncated first row and
+      // advanced past the `@worker-2:` token — so the continuation hit
+      // the stream with no token and was treated as narrative.
+      //
+      // Heuristic: hold only on the FIRST iteration (before any
+      // continuation has been folded) when the newline is the buffer's
+      // last byte AND the payload is not sentence-terminated. Once we
+      // have folded at least one continuation row, the payload is
+      // already multi-line and an end-of-buffer newline there is a
+      // reasonable terminator — returning null would risk never
+      // yielding (iteration count could grow with every chunk).
+      //
+      // Matched test fixtures that informed this shape:
+      //  - v2.7.15 compat (folding across chunks): scanFrom == from on
+      //    iter 1, but the buffer ends AFTER content, so afterNl <
+      //    buffer.length. Check doesn't trigger.
+      //  - v0.4.2 non-terminated folding: iter 2 hits end-of-buffer
+      //    newline; guard allows yield because scanFrom != from.
+      //  - CRLF split directives: iter 1 on second token hits
+      //    end-of-buffer but payload is 4 chars ("next") + terminal
+      //    punctuation test still false — the LENGTH guard below
+      //    short-circuits.
+      //
+      // Worst case if the continuation never arrives: the idle-edge
+      // `flush()` path surfaces the partial as-is. Cost: ~ next chunk
+      // arrival delay (tens to hundreds of ms).
+      if (scanFrom === from && afterNl >= this.buffer.length) {
+        const payloadSoFar = this.buffer.slice(from, chosen.payloadEnd);
+        const WRAP_SUSPECT_THRESHOLD = 30;
+        const endsWithTerminalPunct =
+          /[.!?。！？…](?:["'"'')）\]]+)?\s*$/.test(payloadSoFar);
+        if (!endsWithTerminalPunct && payloadSoFar.length >= WRAP_SUSPECT_THRESHOLD) {
+          return null;
+        }
+      }
       const peek = this.buffer.slice(afterNl, afterNl + 40);
       const isIndented = /^[ \t]{2,}\S/.test(peek);
-      const startsWithWorker = /^[ \t]*@worker-\d+:/.test(peek);
+      const startsWithTarget = /^[ \t]*@(?:worker-\d+|leader):/.test(peek);
       const startsWithEnd = /^[ \t]*@end\b/.test(peek);
       const isBlank = peek.length === 0 || /^[ \t]*(?:\r?\n|\r|$)/.test(peek);
-      const isContinuation = isIndented && !startsWithWorker && !startsWithEnd && !isBlank;
+      // v0.4.2 · (C) Terminal-punctuation guard
+      // ---------------------------------------
+      // If the payload up to this newline already ends with sentence-terminal
+      // punctuation (period, question, exclamation, including CJK variants,
+      // optionally followed by a close quote/paren), the directive is clearly
+      // a complete thought. A 2-space-indented follow-up that Ink wraps onto
+      // the next visual row after a terminated sentence is almost always a
+      // separate assistant paragraph (e.g. "두 워커의 응답을 기다리겠습니다."
+      // tacked after "@worker-2: "banana"이라고만 답하세요."), not a logical
+      // continuation of the directive. Do NOT fold across terminal punctuation.
+      // Multi-line directives that legitimately span sentences can still use
+      // the explicit `@end` sentinel form documented at the top of this file.
+      const payloadSoFar = this.buffer.slice(from, chosen.payloadEnd);
+      const endsWithTerminalPunctuation =
+        /[.!?。！？](?:["'"'')）\]]+)?\s*$/.test(payloadSoFar);
+      // v0.8.9 · no-indent wrap continuation
+      // -------------------------------------
+      // Field evidence (2026-04-23 `to-worker-2-turn4-seq1.md`, 60B): Ink
+      // occasionally wraps long directives onto the next visual row with
+      // NO 2-space indent. v2.7.15 required indent to classify as
+      // continuation, so these landed as premature terminators and the
+      // worker received a directive cut mid-sentence at "(1)".
+      //
+      // When the payload is long enough that Ink would plausibly have
+      // wrapped it (WRAP_SUSPECT_THRESHOLD chars, same as the v0.8.7
+      // end-of-buffer hold) AND has no terminal punctuation, treat a
+      // non-indented next line as continuation too — provided it's not a
+      // new `@target:`, not `@end`, and not blank. Those three guards
+      // still correctly terminate the legitimate leader-multi-line cases.
+      //
+      // Asymmetry rationale: under-fold is silent truncation (worker
+      // gets unusable instructions, leader never notices). Over-fold is
+      // recoverable (worker reads a few extra tokens of context). Prefer
+      // over-fold when the signal is ambiguous.
+      const WRAP_SUSPECT_THRESHOLD = 30;
+      const isWrapSuspect =
+        !endsWithTerminalPunctuation && payloadSoFar.length >= WRAP_SUSPECT_THRESHOLD;
+      const isContinuation =
+        (isIndented || isWrapSuspect) &&
+        !startsWithTarget &&
+        !startsWithEnd &&
+        !isBlank &&
+        !endsWithTerminalPunctuation;
 
       if (!isContinuation) {
         return { payloadEndPos: chosen.payloadEnd, advanceTo: chosen.advance };
@@ -343,16 +528,22 @@ export class WorkerPatternParser {
 
   /**
    * Single-line normalize: strip leading bullet/indent, fold continuation
-   * rows (\n + 2+ space indent) back to a single space, trim trailing
-   * whitespace. v2.7.15: the continuation fold mirrors the terminator
-   * lookahead — without it the raw slice would contain the raw `\n  `
-   * sequences that Ink used for visual wrapping, and the worker would see
-   * an awkwardly-broken prompt.
+   * rows back to a single space, trim trailing whitespace. Mirrors the
+   * terminator lookahead in `findSingleLineTerminator`.
+   *
+   * v2.7.15 folded `\n` + 2+ space indent (Ink's default wrap form).
+   * v0.8.9 folds `\n` with any indent (including 0), because Ink
+   * occasionally emits wraps without the 2-space indent and the parser
+   * now accepts those as continuations when the payload is wrap-suspect.
+   * Any `\n` that survived to this point is confirmed to be mid-payload
+   * (the parser already ruled out target/end/blank/terminal-punct), so
+   * collapsing it to a single space is always correct for single-line
+   * bodies.
    */
   private normalize(raw: string): string {
     return raw
       .replace(/^[ \t●•\-*]+/, '')
-      .replace(/\r?\n[ \t]{2,}/g, ' ')
+      .replace(/\r?\n[ \t]*/g, ' ')
       .replace(/[ \t\r\n]+$/g, '');
   }
 
@@ -401,6 +592,12 @@ function classifyClaudeLine(
   line: string,
 ): 'assistant-start' | 'assistant-cont' | 'prompt' | 'status' | 'chrome' | 'blank' | 'other' {
   if (CLAUDE_ASSISTANT_START_RE.test(line)) return 'assistant-start';
+  // v0.3.6 · Bare directive line at column 0 — re-enter the assistant block
+  // so the projector emits it even if an earlier 'other' paragraph had
+  // closed the block. Checked before CLAUDE_PROMPT_RE et al, but after the
+  // bullet-prefixed CLAUDE_ASSISTANT_START_RE so the existing "start" path
+  // stays authoritative for normally-formatted leader responses.
+  if (CLAUDE_BARE_DIRECTIVE_RE.test(line)) return 'assistant-start';
   if (line.trim().length === 0) return 'blank';
   if (CLAUDE_PROMPT_RE.test(line)) return 'prompt';
   if (CLAUDE_STATUS_RE.test(line)) return 'status';
@@ -408,3 +605,8 @@ function classifyClaudeLine(
   if (CLAUDE_ASSISTANT_CONT_RE.test(line)) return 'assistant-cont';
   return 'other';
 }
+
+// v0.3.0 — workers emit the same Ink TUI output as the leader, so the
+// projector is agent-role-agnostic. This alias makes the reuse explicit
+// at worker-side call sites without breaking legacy imports.
+export { ClaudeLeaderRoutingProjector as ClaudeRoutingProjector };

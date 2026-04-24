@@ -432,7 +432,13 @@ test('renameWorker v2.7.25: label-only — cfg.id untouched, routing by id still
   const writesAfter = ctl.writes.slice(writesBefore);
   const w1Writes = writesAfter.filter((w) => w.paneId === 'W1');
   assert.ok(w1Writes.length >= 1, 'worker-1 still receives routed payload');
-  assert.ok(w1Writes[0].data.startsWith('hello'), 'payload content routed correctly');
+  // v0.8.0 — delivery is via path-first drop notice; body 'hello' is in
+  // the drop file, not in the worker's stdin write. Assert that the
+  // write starts with the drop path prefix.
+  assert.ok(
+    w1Writes[0].data.startsWith('.omc/team/drops/to-worker-1-turn'),
+    `payload must be routed via path-first notice, got: ${w1Writes[0].data.slice(0, 80)}`,
+  );
 
   // captureSnapshot serializes the label.
   const snap = orch.captureSnapshot();
@@ -506,7 +512,7 @@ test('addWorker v2.7.25: id recycle after remove yields a FRESH runtime (no resi
 
   // Seed queue + recentPayloads + pendingRoute on the first incarnation.
   firstIncarnation.queue.push('stale-queued');
-  firstIncarnation.recentPayloads.set('stale-recent', 1500);
+  firstIncarnation.recentPayloads.set('stale-recent', { turnId: 0, ts: 1500 });
   const staleTimer = setTimeout(() => {}, 10_000);
   (orch as any).pendingRoute.set('worker-3', { payload: 'stale-pending', timer: staleTimer });
 
@@ -711,9 +717,12 @@ test('dissolve v2.7.25: add+dissolve includes runtime-added worker in summary in
   await orch.addWorker({ id: 'worker-3', paneId: 'worker-3', agent: 'claude' });
 
   // Feed each pane a distinctive transcript.
-  ctl.firePaneData({ paneId: 'W1', data: 'w1-transcript-marker\n' });
-  ctl.firePaneData({ paneId: 'W2', data: 'w2-transcript-marker\n' });
-  ctl.firePaneData({ paneId: 'worker-3', data: 'w3-transcript-marker\n' });
+  // v0.7.4: transcript uses the assistant-only projector; prefix with
+  // the `● ` bullet so the lines classify as assistant-start and land
+  // in each worker's transcript.
+  ctl.firePaneData({ paneId: 'W1', data: '● w1-transcript-marker\n' });
+  ctl.firePaneData({ paneId: 'W2', data: '● w2-transcript-marker\n' });
+  ctl.firePaneData({ paneId: 'worker-3', data: '● w3-transcript-marker\n' });
 
   const removedBefore = ctl.removed.length;
   await orch.dissolve();

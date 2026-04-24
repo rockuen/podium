@@ -24,7 +24,7 @@ For solo runs, Podium still bundles everything you'd want from a rich CLI wrappe
 
 A leader and worker panes share one Webview multi-pane terminal, with the orchestrator watching each pane's output for directives.
 
-- **Leader + worker panes** in a multi-pane Webview terminal (`psmux` on Windows, `tmux` on macOS/Linux — auto-selected)
+- **Leader + worker panes** in a single multi-pane Webview terminal — each pane owns a native node-pty process directly; no external multiplexer required
 - **Structured routing** — leader emits `@worker-1: task` and Podium auto-dispatches to the matching pane
 - **Per-worker idle detection** — dispatches queue while the worker is busy, flush when it goes idle
 - **Dynamic team shape** — add, remove, or rename workers at runtime via the Teams tree view context menu
@@ -51,7 +51,8 @@ The original Claude Code experience, in a Webview tab.
 
 1. Install from **Open VSX** — search `rockuen.podium`, or drag-drop the `.vsix` from [Releases](https://github.com/rockuen/podium/releases) into VSCode / Antigravity
 2. Install [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview)
-3. For orchestration mode, a multiplexer: `psmux` auto-installs on Windows, `tmux` expected on macOS / Linux
+
+No external multiplexer (tmux / psmux) required — Podium spawns and manages each pane's pty natively inside the extension.
 
 ## Quick start
 
@@ -76,8 +77,6 @@ Gear icon in the toolbar or **right-click → Settings**. The `claudeCodeLaunche
 | `claudeCodeLauncher.particlesEnabled` | `true` | Background particle effects |
 | `claudeCodeLauncher.customButtons` | `[]` | Toolbar shortcut buttons |
 | `claudeCodeLauncher.customSlashCommands` | `[]` | Autocomplete entries |
-| `claudeCodeLauncher.orchestration.backend` | `auto` | `psmux` / `tmux` / `auto` |
-| `claudeCodeLauncher.orchestration.sessionFilter` | — | Filter saved sessions for the resume picker |
 
 ### Custom Buttons
 

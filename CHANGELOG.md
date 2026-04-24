@@ -1,5 +1,760 @@
 # Changelog
 
+## [0.9.4] - 2026-04-25
+
+### Feature · ACK-mismatch-keyed retry chain (closes N2)
+
+v0.9.3 shipped redelivery infrastructure but the content-hash trigger
+rarely fires in production — real-world retries always rewrite the
+payload slightly (leader prepends "retry:" or appends an EOI marker)
+so the `tail_sha8` differs. v0.9.4 adds a stronger, semantically
+correct trigger keyed on the v0.9.2 ACK-mismatch signal.
+
+Flow:
+  1. `maybeConsumeAck` MISMATCH branch now arms `w.retryChain =
+     {priorDropPath, nextCount: 2, ts}` if no chain exists, or extends
+     it (priorDropPath = this latest failed drop, nextCount++) if one
+     is active.
+  2. `maybeConsumeAck` MATCH branch clears `w.retryChain` —
+     successful delivery breaks the chain.
+  3. `maybeSpillLeaderToWorker` checks `w.retryChain` BEFORE the
+     content-hash check. If the chain is live and within the 5-min
+     window, the new drop is tagged `redelivery_of=priorDropPath,
+     redelivery_count=nextCount` regardless of content similarity.
+  4. This new drop becomes the anchor for the next potential retry
+     (priorDropPath updated to the new relPath); the mismatch handler
+     will extend the chain if another ACK fails.
+
+The two triggers compose: v0.9.4 (mismatch-keyed) fires first when
+available, v0.9.3 (content-hash) is the fallback for synthetic or
+orchestrator-initiated exact re-sends.
+
+### Tests
+
+Six new v0.9.4 cases in test/unit/ackRetryChain.test.ts:
+
+- "ACK match → next spill NOT tagged as retry" — negative baseline.
+- "ACK mismatch → next spill tagged redelivery_count=2" — primary
+  positive case with DIFFERENT content between spills (realistic).
+- "repeated mismatches extend the chain (count=3)" — chain extends
+  through multiple failed deliveries.
+- "MATCH after earlier mismatch breaks the chain" — recovery clears
+  state; subsequent unrelated spill is not tagged.
+- "mismatch past window → new chain starts fresh" — 5-min window
+  enforced on the retryChain ts field.
+- "mismatch on worker-1 does NOT tag spill to worker-2" — per-worker
+  scope preserved (consistent with v0.9.3 semantics).
+
+Test-scaffolding notes (documented in-file):
+  - payloads end with terminal punctuation to avoid v0.8.7 end-of-
+    buffer hold which blocks yield on unterminated multi-line text
+  - `● ` bullet prefix on spill data so the Claude leader projector
+    stays in assistant-block state across consecutive spills
+  - `dedupeWindowMs: 0` to bypass production's cross-turn dedupe for
+    back-to-back scenarios (same rationale as v0.9.3 tests)
+
+234/234 tests green. No regressions in v0.8.x / v0.9.0 / v0.9.1 /
+v0.9.2 / v0.9.3 suites.
+
+## [0.9.3] - 2026-04-25
+
+### Feature · Drop redelivery metadata (N2 from 2026-04-24 parseCSV retro)
+
+When the leader spills the SAME directive to the SAME worker within
+5 minutes, the new drop's header is annotated so forensic analysis
+can follow the retry chain:
+
+    redelivery_of: .omc/team/drops/to-worker-1-turn2-seq1.md
+    redelivery_count: 2
+
+Detection uses content-hash match on `tail_sha8` (the v0.9.1 fingerprint
+already on every drop). Cross-worker spills with identical content are
+NOT linked — the retrospective's forensic question was "did worker-N
+see retries?", not "did the leader resend similar content to different
+workers?". Chain length increments on each subsequent match so triple
+retries show `redelivery_count: 3`, etc. Entries older than the 5-min
+window are pruned lazily on each spill; a retry past the window starts
+a fresh chain.
+
+Output also logs a `[orch.redelivery]` line when a chain extends,
+so real-time observers see retry cycles without opening drop headers:
+
+    [orch.redelivery] worker-1 drop tagged redelivery_count=2 (prior=...)
+
+### Known limitation · dedupe interaction
+
+Production's same-payload cross-turn dedupe (2 min, hardcoded) drops
+exact-duplicate routes BEFORE they reach spill. So the content-hash
+trigger only fires when the retry's content is slightly different
+from the original (e.g., the leader adds a "retry:" prefix or an
+EOI marker) — in which case `tail_sha8` won't match either.
+
+In practice this means v0.9.3's trigger catches a narrow band: retries
+that share the exact tail but differ elsewhere (unlikely in real
+usage). The infrastructure (`recentSpills` ring, chain counting,
+header fields, log line) is in place; v0.9.4 will add a broader
+trigger keyed on the ACK-mismatch signal from v0.9.2 — which is
+the actual semantic signal for "leader is retrying because delivery
+failed".
+
+Tests document the current trigger contract with `dedupeWindowMs: 0`
+to bypass production's dedupe for exact-duplicate scenarios.
+
+### Tests
+
+Five new v0.9.3 cases in test/unit/dropRedelivery.test.ts:
+
+- "distinct payloads to same worker are NOT linked" — negative
+  baseline; unrelated drops carry no redelivery fields.
+- "same payload twice within window → redelivery_of set, count=2"
+  — primary positive case; second drop points back at first.
+- "triple retry chains — redelivery_count increments" — chains
+  extend correctly (1 → 2 → 3).
+- "same payload beyond window → NEW chain (no link)" — window
+  pruning works; 6-min-later retry is a fresh chain.
+- "same payload to a different worker does NOT link" — per-worker
+  scope is respected.
+
+227/227 tests green. No regressions in v0.9.0/0.9.1/0.9.2 suites.
+
+## [0.9.2] - 2026-04-24
+
+### Feature · Worker ACK round-trip (completes N3 from 2026-04-24 retro)
+
+v0.9.1 embedded "(bytes=N tail=XXXX)" in the path-first notice. v0.9.2
+closes the round-trip: workers echo the fingerprint back, and the
+orchestrator auto-compares against what it spilled. The parseCSV
+retrospective's prompt-driven "ACK the ending" discipline is now a
+runtime primitive.
+
+Flow:
+
+  1. maybeSpillLeaderToWorker writes the drop, injects
+     ".omc/team/drops/to-worker-1-turn2-seq1.md (bytes=234 tail=a3c9b7d2)"
+     and arms w.pendingAckFp with the expected fingerprint.
+
+  2. Worker's system prompt (v0.9.2 update) instructs:
+     the first token of @leader reply SHOULD be "ACK bytes=<N> tail=<XXXX>"
+     copied verbatim from the notice.
+
+  3. On the worker's next @leader route, commitLeaderInject calls
+     maybeConsumeAck. It parses the payload's leading
+     /^\s*ACK\s+bytes=(\d+)\s+tail=([0-9a-f]{8})\b/i, compares against
+     w.pendingAckFp, and:
+       - match → "[orch.ack] match worker-1 bytes=234 tail=a3c9b7d2 (drop=...)"
+       - mismatch → "[orch.ack] MISMATCH worker-1 expected bytes=234
+           tail=a3c9b7d2, got bytes=169 tail=deadbeef (drop=...) —
+           directive likely truncated in transit; consider re-sending"
+       - missing/malformed → silent (ACK is advisory; a worker that
+         skips it is not wrong)
+
+  4. Fingerprint is one-shot: cleared in every branch to prevent stale
+     comparisons on subsequent turns. Unsolicited ACK (no prior spill)
+     is a no-op.
+
+Payload is NOT stripped of the ACK line before forwarding to leader.
+The ACK token is short and context-adjacent; stripping risks losing
+text attached on the same line. Leader sees the ACK verbatim in its
+inbox, which is acceptable forensic noise.
+
+### Deferred to v0.9.3+
+
+- Auto re-spill on MISMATCH. v0.9.2 only observes; human / leader
+  decides whether to retry. Auto-retry needs throttling + a signal
+  to break the retry loop, which deserves its own design pass.
+- Stripping the ACK line from the forwarded payload. Deferred until
+  real usage shows whether ACK-in-payload is actually noisy.
+- Worker→worker ACK. Currently only leader→worker spills arm
+  pendingAckFp; worker-to-worker drops don't track fingerprints.
+
+### Tests
+
+Four new v0.9.2 cases in test/unit/ackRoundTrip.test.ts:
+
+- "matching ACK logs a match line and does not warn" — RED baseline.
+  Feeds a worker reply containing the exact expected fingerprint,
+  asserts a match log appears with worker id + fingerprint.
+- "mismatching ACK emits MISMATCH warn with both values" — RED
+  baseline. Feeds a reply with truncated-style bytes + wrong tail,
+  asserts the warn contains BOTH expected and got for forensic
+  clarity.
+- "reply without ACK line is silently accepted" — no warn on missing
+  ACK (convention is advisory).
+- "ACK without a prior spill is ignored (no false positives)" —
+  unsolicited ACK must not raise MISMATCH; pendingAckFp stays null.
+
+222/222 tests green. Worker prompt updated to document the ACK
+contract. Leader protocol unchanged — this feature is invisible to
+the leader except via log lines.
+
+## [0.9.1] - 2026-04-24
+
+### Feature · Drop content fingerprint (tail SHA-8 + UTF-8 byte count)
+
+Partial N3 from the 2026-04-24 parseCSV retrospective. The session
+demonstrated that ad-hoc "ACK the last sentence ending" prompt
+discipline was effective at catching truncation, but relied on the
+worker's cooperation to compare received-vs-expected. v0.9.1 moves
+the signal from prompt convention into runtime metadata so the
+leader (and any external reader of the worker pty scrollback) can
+verify "did the directive arrive whole?" without relying on worker
+behavior.
+
+Every leader→worker and worker→leader drop file now carries two
+forensic fields in its header:
+
+  bytes: <UTF-8 byte count>
+  tail_sha8: <8 hex chars of SHA-256 over last 40 chars>
+
+The path-first notice injected into the worker embeds the same
+fingerprint on the same line as the drop path:
+
+  .omc/team/drops/to-worker-1-turn2-seq1.md (bytes=234 tail=a3c9b7d2)
+
+  위 파일을 Read 해서 지시사항을 수행해 주세요.
+
+Placing the fingerprint on the path line (not a separate line) is
+deliberate: the path line is the most fragmentation-survivable
+token in the notice, so the fingerprint rides along with the
+smallest piece that must arrive intact.
+
+`bytes` is UTF-8 bytes (not JavaScript string `.length`, which is
+UTF-16 code units) — consistent with how payload size is measured
+in transit. `tail_sha8` hashes the last 40 characters of the
+payload (or the full payload if shorter): the diagnostic interest
+in the retrospective was always "did the ending arrive?", not
+mid-body integrity. Collision space is 24 bits, intentionally small
+— this is a forensic signal, not a security primitive.
+
+### Deferred to v0.9.2
+
+- Worker protocol update instructing the worker to echo bytes+tail
+  back for structured ACK.
+- Runtime parser for worker-side ACK messages + auto-warn on
+  mismatch.
+
+The fingerprint shipping first means leaders can manually verify
+today; the worker-side round-trip lands once prompt + parser work
+is designed.
+
+### Tests
+
+Four new v0.9.1 cases in `test/unit/dropFingerprint.test.ts`:
+
+- `drop header contains tail_sha8 and matches payload` — RED
+  baseline; hashes a Korean directive and verifies both the header
+  field and the UTF-8 byte count.
+- `path-first notice embeds (bytes=N tail=XXXX)` — verifies the
+  injected notice carries the fingerprint.
+- `short payloads hash the whole body (no padding artifacts)` —
+  regression guard: payloads under 40 chars hash the full payload,
+  not a zero-padded slice.
+- `same tail → identical hash; differing tail → different hash` —
+  pure-function property check, decoupled from the orchestrator.
+
+All 218 tests green. No regressions in parser, projector, orch,
+snapshot, or v0.9.0 dropsArchive suites.
+
+## [0.9.0] - 2026-04-24
+
+### Feature · Drops forensics — archive on attach + session marker
+
+Closes N7 from the 2026-04-24 parseCSV retrospective (Section G).
+Field evidence: `to-worker-1-turn1-seq1.md` from a prior session's
+reverseString task remained on disk when the next session spawned,
+and the new session started writing from `turn2-seq1` onwards. Turn
+numbers across drop files no longer corresponded to conversation
+turns, and cross-session forensics had to disambiguate which drop
+belonged to which session by content inspection.
+
+On every `attach()`, any top-level `*.md` files in
+`<cwd>/.omc/team/drops/` are now moved into
+`<cwd>/.omc/team/drops/archive/<ISO-timestamp>/`. Subdirectories
+(including `archive/` itself) are preserved in place, so
+re-archiving is idempotent and prior archives are never
+double-moved. Failure is non-fatal and never blocks attach — the
+error is logged and the orchestrator continues with a clean-in-
+intent drops root.
+
+Drop file headers now include a `session: <first-8-chars>` field
+taken from `leader.sessionId`. Combined with the archive layout,
+any file found in `drops/` or `drops/archive/<ts>/` is
+self-identifying without cross-referencing filesystem timestamps.
+Missing `sessionId` falls back to `unknown` (e.g., tests that don't
+inject one).
+
+### Tests
+
+Five new v0.9.0 cases in `test/unit/dropsArchive.test.ts`:
+
+- `no pre-existing drops → nothing happens` — idempotent entry.
+- `pre-existing drops are moved to archive/<ISO>/` — core behavior.
+- `existing archive/ subdir is NOT moved into itself` — re-attach
+  idempotency.
+- `non-.md files are ignored (left at root)` — `.gitkeep`, stray
+  text files remain; only drops move.
+- `archive folder name is filesystem-safe` — ISO timestamp with
+  `:` and `.` stripped, so Windows paths are valid.
+
+All 214 tests green. No regressions in parser, idle detection,
+projector, or orchestrator suites.
+
+### Deferred to later releases
+
+2026-04-24 parseCSV retrospective also flagged seven other items
+(N1–N6, N8). This release intentionally takes only N7 — the
+smallest well-specified forensic improvement that can ship
+without architectural change. Larger items (ACK protocol builtin
+— N3, recovery-round exclusion — N6, redelivery metadata — N2,
+auto-file flip — N4) need dedicated design passes and will land
+in subsequent releases.
+
+## [0.8.9] - 2026-04-24
+
+### Fix · Parser folds Ink wraps that arrive with no 2-space indent
+
+Companion to v0.8.8 — addresses the second P0 from the 2026-04-24
+retrospective. Field evidence (drop `to-worker-2-turn4-seq1.md`,
+60B, session 2026-04-23): leader emitted
+    `@worker-2: .omc/team/artifacts/reverseString.js의 구현을 리뷰해줘. 체크할 포인트: (1)\nIntl.Segmenter...`
+in a single pty chunk. The `\n` after `"(1)"` was an Ink visual
+wrap, but the wrapped row arrived WITHOUT the 2-space indent that
+v2.7.15's continuation rule required. v0.8.7's end-of-buffer hold
+didn't fire either (the `\n` was not the last byte — `Intl.Seg...`
+followed in the same chunk). Parser terminated at `\n`, yielded
+`"체크할 포인트: (1)"`, and worker-2 had to reconstruct the intent
+from surrounding context.
+
+Fix: `findSingleLineTerminator` treats a non-indented next line as
+continuation when the payload-so-far is wrap-suspect —
+    `!endsWithTerminalPunctuation && payloadSoFar.length >= 30`
+— provided the usual terminate-signals (new `@target:` directive,
+`@end`, blank line) are absent. The legitimate leader-multi-line-
+narrative case is still caught by the terminal-punctuation guard
+(v0.4.2) and the blank-line guard.
+
+Pairs with a `normalize()` update: single-line folded `\n` with any
+indent (including zero) collapses to a single space. Any `\n` that
+survives to normalize is confirmed by the terminator logic to be
+mid-payload, so the collapse is always correct for single-line bodies.
+
+Asymmetry rationale: under-fold is silent truncation — worker gets
+unusable instructions, leader never notices. Over-fold is recoverable
+— worker reads a few extra tokens of context, task proceeds. Prefer
+over-fold when the signal is ambiguous.
+
+### Tests
+
+Six new v0.8.9 cases in `messageRouter.test.ts`:
+
+- `indent-less wrap continuation in same chunk folds` — verbatim
+  field drop reproduction. Was the RED baseline.
+- `indent-less wrap across two pty chunks folds` — cooperates with
+  v0.8.7 end-of-buffer hold across chunk boundaries.
+- `short payload without terminal punct does NOT force-fold` —
+  threshold guard; `"apple"` is too short to plausibly be wrap.
+- `terminal punct ends directive even with long no-indent follow` —
+  v0.4.2 terminal-punctuation guard preserved.
+- `next @target directive terminates a long no-punct payload` —
+  explicit target boundary wins over wrap-suspect heuristic.
+- `blank line after long no-punct payload still terminates` —
+  paragraph-break guard preserved.
+
+All 209 tests green. No regressions in v2.7.15 / v0.4.2 / CRLF /
+ellipsis / multi-directive / chunk-boundary fixtures.
+
+## [0.8.8] - 2026-04-24
+
+### Fix · Drop sanitizer covers the remaining 2026-04 verb set
+
+The v0.8.7 verb sweep was correction-by-memory and missed what was
+actually in the drops folder. An exhaustive sweep with
+`grep -hoE '[A-Z][a-z]+…' drops/*.md | sort -u` over the 2026-04-23/24
+field captures returned ten unique verbs; four of them weren't in
+`THINKING_VERB_RE`:
+
+- `Cooking` (progressive form — `Cooked` was in the list but not
+  the active form; `✶ Cooking… (4s · ↓ 120 tokens · thought for 1s)`
+  leaked straight through)
+- `Forming`
+- `Frosting` (dominated `worker-2-turn5-seq2.md` — the drop that
+  originally motivated the 2026-04-24 retrospective)
+- `Swirling`
+
+Added all four. `Running…` also appeared in drops but is the Bash-tool
+status row (`⎿  Running…`); it's already caught by `TOOL_LEADER_RE`
+and does not belong in the verb regex — `Running the tests` would
+be a legitimate prose prefix and a verb-side match would over-filter.
+
+### Tests
+
+- `sanitize v0.8.8: Cooking/Forming/Frosting/Swirling verbs are noise`
+  — uses verbatim drop-file lines (with counter digits and spinner
+  glyphs) as fixtures. These tests also act as the canonical release
+  tracker: when Claude Code ships a new placeholder verb, add it
+  here first (it fails), then add to the regex.
+
+All 204 tests green.
+
+### Why parser fix not included
+
+The other P0 from the 2026-04-24 retrospective — leader directive
+truncated at `"(1)"` with `\nIntl.Seg` in the same pty chunk — is
+intentionally deferred to v0.8.8b. The naive extension of v0.8.7's
+end-of-buffer hold would over-hold legitimate multi-line prompts.
+Fix requires distinguishing "Ink wrap continuation with no indent"
+from "new narrative line" / "next @target directive" — that needs
+design (peek for `@<target>:` pattern vs non-`@` prose, and a
+column-width heuristic to guess Ink wrap vs author-intentional
+linebreak). Tracked separately.
+
+## [0.8.7] - 2026-04-24
+
+### Fix · Parser no longer truncates long directives at pty chunk boundaries
+
+Field evidence from session 2026-04-24 retrospective: the drop
+`to-worker-2-turn6-seq1.md` was 69 bytes, cut mid-sentence at a
+comma ("`...reverseStringSimple,`"). The leader's intended directive
+was "`...reverseStringSimple, reverseStringUnicode)을 검토해줘.`" —
+Ink visual-wrapped the row at ~80 columns, the wrap landed a `\n` +
+2-space-indent inside the payload, and that continuation arrived in
+a LATER pty chunk. `WorkerPatternParser.findSingleLineTerminator` saw
+the newline as the buffer's last byte, peeked ahead (empty), and
+classified the absent-content case as `isBlank` → terminate. It
+yielded the truncated first row, advanced past the `@worker-2:`
+token, and the continuation chunk then hit the stream with no token
+prefix and got absorbed as narrative. Worker-2 received unusable
+instructions; the leader blamed itself and re-sent.
+
+Fix: when (a) we are on the first iteration (no continuation folded
+yet), (b) the chosen newline IS the last byte in the buffer, and
+(c) the payload so far is ≥ 30 chars AND not sentence-terminated,
+return null from `findSingleLineTerminator`. `drainComplete`
+preserves the raw `@<target>: <partial>` slice in the buffer for
+the next feed. When the continuation chunk arrives, the peek
+succeeds with the indented content and the normal v2.7.15
+continuation-fold logic runs. If the leader genuinely stops emitting,
+the idle-edge `flush()` path still surfaces the held partial.
+
+Guard conditions tuned against the existing test corpus (v2.7.15
+continuation folding, v0.4.2 non-terminated folding, CRLF line
+endings, ellipsis-inside-payload, multi-directive chunks) — all 34
+router tests pass.
+
+### Fix · Drop sanitizer catches more thinking verbs
+
+Retro evidence showed `Warping…`, `Beaming…`, `Effecting…` slipping
+through — Claude Code v2.1+ placeholder rotation has broader verbs
+than the initial v0.8.5 list. Added: Warping, Beaming, Effecting,
+Conjuring, Transmuting, Invoking, Summoning, Crafting, Weaving,
+Forging, Sculpting, Tuning, Calibrating, Syncing, Aligning, Focusing,
+Channeling, Orchestrating, Synthesizing.
+
+### Tests
+
+- `router v0.8.7: long directive wrapped across two pty chunks is NOT truncated`
+- `router v0.8.7: short directive at end-of-buffer still yields (no hold regression)`
+- `router v0.8.7: held partial is released by flush on leader idle`
+
+## [0.8.6] - 2026-04-24
+
+### Fix · Sanitizer hotfix — asterisk spinner + bare counter
+
+Two `isInkNoise` test assertions failed the v0.8.5 release pipeline
+(the build still shipped, but the repo carried a red test):
+
+- `*      el in` — Claude's spinner rotation cycles through ASCII
+  `*` alongside the unicode glyphs. Line-start `*` followed by a
+  short letter/whitespace tail is the diagnostic fragment shape
+  drawn during `Channelling…` / `Pouncing…`.
+- `↑ 6` — bare arrow + digit that Ink paints mid-stream.
+
+Added `ASTERISK_FRAGMENT_RE` and `BARE_COUNTER_RE` so both match.
+Scope is narrow (short length, start-anchored) to avoid colliding
+with legitimate markdown list items or inline asterisks.
+
+## [0.8.5] - 2026-04-24
+
+### Fix · Drop sanitizer (P0-1 from 2026-04-24 retro)
+
+Post-session retro surfaced that v0.8.4's dual-transcript fix, while
+correct in direction, wasn't enough. Drops captured from the
+`reverseString` team run were still 16 KB and 37 KB in size, with
+the user's own estimate that roughly 95% of those bytes were
+terminal rendering noise.
+
+Inspection of `worker-1-turn4-seq2.md` and `worker-2-turn6-seq2.md`
+confirmed the diagnosis: the existing `isCosmeticLine` filter caught
+only OMC status rows, bypass hints, and bare prompts. It did not
+catch the dominant noise sources in Claude Code v2.1+'s Ink TUI:
+
+- Spinner glyphs on their own row or paired with a fragment of a
+  thinking verb (`✻`, `✶ C`, `✢    n  l`).
+- Thinking verbs like `Channelling…`, `Pouncing…`, `Sautéed`,
+  `Cooked`, `Simmering`, `Harmonizing`, and ~30 more that Claude
+  rotates through during generation.
+- Timing / token status markers (`(2s · thinking)`,
+  `↓ 13 tokens · thinking)`, `↑ 6`).
+- Horizontal rules (`───────────────────`) and the Claude logo art
+  block (`▐▛███▜▌`, `▝▜█████▛▘`).
+- Tool-use chrome (`⎿ path`, `● Reading 1 file… (ctrl+o to expand)`,
+  `Found 1 settings issue`, `ctrl+g to edit in Notepad`).
+- Cursor-positioned fragments: Ink draws `Channelling…`
+  character-by-character across rows, so after stripAnsi +
+  cosmetic-filter we saw short lines like `Po`, `u`, `n`, `ci g…`.
+
+Fix: added `isInkNoise` — a broader sanitizer specifically for the
+drop-file pipeline. The rawTranscript accumulator in `onPaneData`
+now filters by `isCosmeticLine || isInkNoise`, so drop contents are
+the worker's actual reply only.
+
+`isCosmeticLine` was intentionally NOT widened. The idle detector's
+silence-timer logic uses it to decide whether a chunk resets the
+timer; widening it would make the timer drift while Claude is mid-
+generation showing "Channelling…" status updates. A regression test
+asserts `isCosmeticLine` stays narrow.
+
+Test coverage: 9 new `sanitize: …` tests in `idleDetector.test.ts`
+with fixtures taken verbatim from the retro field drops.
+
+P0-2 (turn manifest) and P0-3 (reply-to causality) from the same
+retro are queued for v0.8.6 / v0.8.7.
+
+## [0.8.4] - 2026-04-24
+
+### Fix · Drop capture truncation (dual transcript)
+
+Post-session retrospective surfaced the root cause of a pattern we'd
+been fighting for multiple versions: drop files nominally captured
+worker output (e.g. `worker-1-turn3-seq2.md` at 728 bytes) but
+actually contained only the `@leader:` header line with none of the
+actual code body. Leader Read the drop file, got nothing useful,
+re-asked the worker to resend, burned more rounds, never converged.
+
+Cause: `w.transcript` (the source the spill slices) was fed from
+`ClaudeLeaderRoutingProjector.feed(stripAnsi(rawData))`. The
+projector closes the assistant block on any line it classifies as
+`other` (anything not recognized as assistant-start/cont, prompt,
+chrome, status, or blank). Code block bodies, Korean prose without
+known prefixes, and most real worker output are `other` — so the
+projector dropped them. Intentional for ROUTING (we don't want
+arbitrary text misread as directives), but wrong for SPILL (where
+we want every byte the worker actually wrote).
+
+Fix: dual transcript.
+
+- `WorkerRuntime` gains `rawTranscript` + `rawCurrentTurnStart`.
+- `onPaneData` worker branch now appends raw `stripAnsi` output
+  (minus cosmetic UI lines — OMC status / bypass hint / prompt
+  echo, via the already-existing `isCosmeticLine` filter, now
+  exported from `idleDetector.ts`) to `rawTranscript`. The
+  projector-fed `transcript` is unchanged — parser routing and
+  dedupe continue to use it.
+- Spill in the idle-edge handler now slices `rawTranscript`, not
+  `transcript`. Drop file contents are what the worker actually
+  wrote, including full code blocks.
+- `rawCurrentTurnStart` advances in lockstep with `currentTurnStart`
+  on every idle edge.
+
+### Protocol · Retrospective hardening
+
+Three prompt updates driven by the same field log:
+
+1. Worker protocol — `LONG-OUTPUT HANDLING`: for code blocks, long
+   reviews, or any multi-paragraph content, workers MUST use their
+   Write tool to save the artifact to `.omc/team/artifacts/<name>`
+   and reply with "@leader: <path> + one-line summary". Bypasses
+   drop-file capture entirely. Insurance on top of the dual-transcript
+   fix.
+2. Worker protocol — `NO ACK-ONLY REPLIES`: explicit prohibition
+   on "확인했습니다" / "대기 중입니다" confirmation messages.
+   Workers either do the work, ask a specific question, or report
+   a blocker. No handshake rounds.
+3. Leader protocol — `COMPLEXITY GATE`: team usage requires at
+   least one of { multi-file, genuinely independent perspectives,
+   parallelizable chunks, needs external verification }. Single
+   small functions: leader answers directly. Strict sequential
+   dependency: use one worker for "implement + self-verify"
+   rather than splitting.
+4. Leader protocol — `NO ENGAGEMENT WITH WORKER ACK-ONLY
+   REPLIES`: symmetric to worker side. Leader ignores
+   confirmation-only messages, responds only to concrete output,
+   specific questions, or real blockers.
+
+No existing tests lock in the projector→transcript path or the
+prompt text, so all 190 tests remain green.
+
+## [0.8.3] - 2026-04-24
+
+### Fix · Worker→leader always spills (threshold removed)
+
+Field log from a reverseString relay with an implementer + critic
+roster: workers produced long `@leader:` replies that never reached
+the leader. Worker-2 wrote a header line (`@leader: worker-1 구현
+검토 결과 — 3개 축 + 추가 이슈.`) followed by a multi-paragraph
+Korean review. The parser matched the header as a single-line
+`@leader:` directive and yielded just that one line. The review body
+below sat in `w.transcript` waiting for the busy→idle edge to spill
+it. That spill never fired — and when it did, the branch gate
+`turnBody.length >= SPILL_THRESHOLD_CHARS (300)` was the wrong lever.
+Worker-1's direct evidence: zero `worker-1-turn*.md` drop files in
+`.omc/team/drops/` across every session tried, only `to-worker-*`
+leader→worker files.
+
+Root cause: the short-reply branch ran `parser.flush()` to drain
+pending directives, but in the observed pattern the parser had
+**already** yielded the header mid-stream — the body wasn't in
+parser buffer, it was in transcript. Flush returned empty, no log
+line, the body was lost.
+
+Fix (symmetric with v0.8.0 leader→worker):
+
+- Drop the `SPILL_THRESHOLD_CHARS` gate on the worker→leader idle
+  edge. Any non-empty turnBody now spills to
+  `.omc/team/drops/worker-N-turn<M>-seq<S>.md` and injects the
+  path-first drop notice into the leader.
+- `parser.flush()` still runs to drain state, but the drop file
+  supersedes anything it might have emitted mid-stream. No more
+  double-delivery: parser mid-stream yields that were already routed
+  are fine (different dedupe key from the drop-notice text).
+- Add explicit log line for empty-body idle edges so the path is
+  never silent: `[orch] worker-N idle — no body to spill`.
+
+Test update: `orch v0.6.0: short worker reply stays on parser path`
+becomes `orch v0.8.3: short worker reply ALSO spills (threshold
+removed)`. Assertion flipped from "no worker→leader spill file" to
+"at least one worker→leader spill file". The 190 other tests remain
+green; only the semantic intent of the one test changed.
+
+## [0.8.2] - 2026-04-24
+
+### Fix · Leader now uses every worker in the roster by default
+
+Field feedback after v0.8.1: in a reverseString relay session with an
+implementer + critic roster, the leader delegated to the implementer,
+received the code, then stopped to ask the user "finalize, or another
+improvement round?" The critic was never invoked, defeating the point
+of running a multi-role team.
+
+Root cause was purely prompt-shaped, not a routing bug. The previous
+leader system prompt said "parallelize by default" but gave no rule
+against early-stopping a task when other relevant roles existed in
+the roster, and the implementer-first / critic-second sequential
+pattern was not required.
+
+`buildLeaderSystemPrompt` now embeds an explicit COLLABORATION DEFAULT
+section:
+
+- Every role in the roster must contribute. Implementer → critic →
+  revision → done is the minimum viable cycle for a multi-role team.
+- Pausing to ask the user between worker steps is disallowed except
+  when a requirement is genuinely ambiguous, the round budget is
+  exhausted, or a worker reports a real blocker.
+- Role-to-role routing guidance: when passing an implementer's reply
+  to a critic, embed the content directly in `@critic:` — the
+  orchestrator's auto-spill (v0.8.0) handles length safely.
+- Parallel vs serial distinction kept, but clarified: parallel when
+  roles are independent, serial when role B needs role A's output.
+
+No code paths changed; all 190 tests pass as-is (test fixtures don't
+lock the prompt text).
+
+## [0.8.1] - 2026-04-24
+
+### Fix · Route-time dedupe kills the re-inject storm
+
+Field logs from a reverseString relay showed the leader's @worker-1 directive being re-dispatched once per user-visible turn. Root cause: Claude's Ink TUI repaints scrollback across turn boundaries, so an already-committed `@worker-N: ...` line reappears in the parser stream on turn N+1. The orchestrator armed a debounce timer for it; each subsequent repaint re-armed (hence the hundreds of `re-arm worker-1 (leaderIdle=busy, msSinceOutput=…ms)` lines in the log). By the time the leader finally fell idle and the debounce fired, `CROSS_TURN_DEDUPE_MS` (120 s, measured from the ORIGINAL commit) had expired — so `commitRoute`'s dedupe missed and the worker got the same task injected again, acknowledging "이전 turn과 동일 요청 — 결과 재전달".
+
+Fix: `route()` now checks dedupe at parse time, before the debounce timer is armed. If the dedupeKey (first line, trim, cap 100) matches a recent `recentPayloads` entry in the same turn or within `CROSS_TURN_DEDUPE_MS`, the route is dropped and any in-flight pending debounce for the same key is cancelled. Symmetric guard added to the `@leader` branch. The commit-time dedupe is retained as a safety net but is now a no-op on the repaint path.
+
+Result: no more re-arm spam, no more stale re-injects after long worker tasks.
+
+## [0.2.1] - 2026-04-23
+
+### Teams Orchestration view — buttons
+
+The Teams Orchestration sidebar view now surfaces every Podium team action as a clickable button, eliminating the need to memorize Command Palette entries for common workflows.
+
+**Title-bar buttons** (visible when the view is focused):
+
+- `$(organization)` **Orchestrated Team** → `podium.orchestrate` — start a new leader + 2 workers team
+- `$(history)` **Resume Leader Session** → `podium.orchestrate.resume` — pick from saved leader sessions
+- `$(folder-opened)` **Open Saved Team** → `podium.snapshot.load` — restore a snapshot (workers `--resume`'d)
+- `$(edit)` **Rename Saved Team** → `podium.snapshot.rename` — rename a snapshot in place
+- `$(filter)` **Filter Sessions** → `session.filter` (existing, pushed to rightmost slot)
+
+**Inline node buttons** on a live team:
+
+- `$(add)` Add Worker (already present)
+- `$(save)` **Save Snapshot** → `podium.snapshot.save` — targets this specific team (was: "most recent team" only)
+- `$(close-all)` **Dissolve** → `podium.dissolve` — targets this specific team
+
+**Inline node buttons** on a worker row (unchanged):
+
+- `$(close)` Remove
+- `$(edit)` Rename
+
+### Handler updates (no breaking change)
+
+`podium.snapshot.save` and `podium.dissolve` now accept an optional `PodiumLiveTeamNode` argument. When invoked from the inline button the handler resolves the orchestrator by that node's `sessionKey`; when invoked from the Command Palette (no arg) the existing "most recent active team" fallback kicks in exactly as before.
+
+Consistent with the existing pattern used by `podium.worker.add`, `podium.worker.remove`, and `podium.worker.rename`.
+
+---
+
+## [0.2.0] - 2026-04-23
+
+### Remove psmux / tmux dependency
+
+Podium's orchestration layer no longer depends on an external multiplexer. Every pane — leader and workers — is now managed as a native `node-pty` process owned by the extension. The v2.6/2.7 era accumulated many psmux-specific fixes (mouse-mode scrollback, bracketed-paste LF escaping, send-keys paste-buffer quirks, kill-session zombie servers, win32-input-mode routing through send-keys); all of that surface is now gone.
+
+Primary Path A orchestration features are **unchanged**:
+
+- `Podium: Orchestrated Team (leader + 2 workers)`
+- `Podium: Orchestrated Team — Resume Leader Session`
+- `Podium: Save Team Snapshot` / `Open Saved Team...` / `Rename Saved Team...`
+- `Podium: Dissolve Team` (extract `●` bullet + Haiku fallback summarizer)
+- `Podium: Add / Remove / Rename Worker`
+
+### Removed (Path B features tied to the external multiplexer)
+
+- **`Open Claude Code` (Podium-ready variant)** — `createPodiumSession` command and its tmux/psmux wrapping (`src/pty/tmuxWrap.js`, `claudePodiumReadySessions` session-store key, ◆ badge + `organization` icon in the Sessions tree). Regular `Ctrl+Shift+;` open still works.
+- **External OMC team integration** — `team.create` (SpawnTeamPanel), `team.createIntegrated` (integrated terminal with OMC_OPENCLAW=1), `team.quickCreate`, `team.attach`, `team.kill`, `team.rename`, and the psmux-scan-based "external sessions" section of the Teams tree (SessionDetector + omcSession tree items).
+- **`Kill All Orchestration Sessions (Emergency Reset)`** — the 3-stage psmux kill-session → kill-pane → kill-server escalation. Internal orchestrator teardown is now handled entirely by `LiveMultiPanel.disposeAll()` + orchestrator registry cleanup (already landed in v2.7.27).
+- **Legacy `Show Multi-pane` (`podium.grid`)** — the psmux-polling `MultiPaneTerminalPanel` view. `LiveMultiPanel` (the v2.7.0 node-pty direct variant) is now the only multi-pane surface.
+- **Config keys**: `claudeCodeLauncher.orchestration.backend`, `claudeCodeLauncher.orchestration.sessionPrefix`, `claudeCodeLauncher.orchestration.sessionFilter`.
+- **Deleted modules** (11 files): `src/orchestration/backends/` (IMultiplexerBackend, PsmuxBackend, TmuxBackend), `src/orchestration/core/{SessionDetector,InlineTeamSpawner,OmcCoordinator,PsmuxSetup}.ts`, `src/orchestration/ui/{MultiPaneTerminalPanel,SpawnTeamPanel,TerminalPanel}.ts`, `src/orchestration/webview/multipane-main.ts`, `src/pty/tmuxWrap.js`.
+
+### Simplified
+
+- `src/panel/createPanel.js` — single direct node-pty spawn path; `podiumReady` / `tmuxSession` metadata removed from the `entry` object.
+- `src/panel/restartPty.js` — drops the `buildTmuxSpawnArgs` branch.
+- `src/pty/autoSend.js` — reduced from 97 lines (psmux send-keys + Win32 KEY_EVENT Shift+Enter chain + fallback) to 11 lines of direct `pty.write(body + '\r')`.
+- `src/store/sessionStore.js` — `listPodiumReadySessionsForCwd` removed.
+- `src/store/sessionManager.js` — `saveSessions` no longer persists `podiumReady` / `tmuxSession` / `claudePodiumReadySessions`.
+- `src/tree/SessionTreeDataProvider.js` — Podium-ready ◆ badge and `organization` icon removed.
+- `src/orchestration/index.ts` — `~350 lines` of helpers removed (`resolveBackend`, `binaryFor`, `stripDeprecationWarnings`, `runKillAll`, `LAUNCHER_PODIUM_PREFIX`, `readPodiumLabels`, `enrichFuzzyPodiumLabels`, `PodiumLabel`, `promptTeamSpec`). `TeamsTreeProvider` constructor reduced from `(detector, registry)` to `(registry)`.
+- `src/orchestration/ui/TeamsTreeProvider.ts` — rewritten from 239 lines to 90 lines; `SessionNode`, `PaneNode`, `EmptyNode` (psmux-variant), `ErrorNode` removed; now renders only live `PodiumLiveTeamNode` + `WorkerTreeItem`.
+
+### Preserved
+
+- `LiveMultiPanel` (Phase 1 · v2.7.0) — already used node-pty directly; its `addPane` / `writeToPane` / `removePane` interface is untouched.
+- `PodiumOrchestrator` routing, idle detection, dispatch debounce (1200 ms), snapshot/restore grace window, deterministic bullet-extraction summarizer — all unchanged.
+- File-based observers: `MissionWatcher`, `SessionHistoryWatcher`, `StateWatcher`, `CcgArtifactWatcher`, `TeamConversationPanel` (read-only over `.omc/state/` artifacts when OMC CLI is used externally).
+- Solo Launcher features (status icons, session save/restore, 7 themes, context usage bar, smart Ctrl+C, image paste, desktop notifications) are behavior-identical.
+- `claudeCodeLauncher.*` command IDs retained for back-compat with existing keybindings and user settings.
+
+### Known cosmetic debt (v0.2.x follow-up)
+
+- Several code comments and i18n entries still reference "tmux-wrapped sessions" or "psmux send-keys" historically. These have no functional effect (the code paths they refer to are gone) but will be scrubbed in a follow-up pass.
+- `TeamConversationPanel.sendToLeader` reads `tmux_session` from `.omc/state/.../config.json` for the "inject into leader pane" feature; when the OMC CLI is not used externally the field will be empty and the inject gracefully fails. Full removal deferred until the `.omc/state/` observer layer is re-scoped.
+
+### Tests
+
+- **142/142 tests pass.** No test file touched — all tests cover Path A functionality (orchestrator, routing, idle detection, summarizer, snapshot, worker management) which was not modified. `tsc -p . --noEmit` clean, `tsc -p . --noEmit --noUnusedLocals` reduced unused-locals surface by ~18 entries.
+
+---
+
 ## [0.1.0] - 2026-04-22
 
 ### Brand identity refresh

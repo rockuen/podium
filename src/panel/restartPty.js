@@ -7,7 +7,6 @@ const { t } = require('../i18n');
 const { resolveClaudeCli } = require('../pty/resolveCli');
 const { killPtyProcess } = require('../pty/kill');
 const { createContextParser } = require('../pty/contextParser');
-const { buildTmuxSpawnArgs } = require('../pty/tmuxWrap');
 const { saveSessions } = require('../store/sessionManager');
 const { setTabIcon, updateStatusBar } = require('./statusIndicator');
 
@@ -35,29 +34,8 @@ function restartPty(entry, panel, context, extensionPath) {
   const claudeShell = resolved.shell;
   const claudeArgs = [...resolved.args, ...(entry.sessionId ? ['--resume', entry.sessionId] : [])];
 
-  // v2.6.12: mirror createPanel's Podium-ready branching so restart reuses
-  // the existing tmux session (via `new-session -A`) instead of dropping the
-  // wrapping.
-  let spawnShell = claudeShell;
-  let spawnArgs = claudeArgs;
-  if (entry.podiumReady) {
-    const cols = entry._lastCols || 120;
-    const rows = entry._lastRows || 30;
-    const wrap = buildTmuxSpawnArgs({
-      sessionId: entry.sessionId,
-      cols, rows,
-      claudeShell,
-      claudeArgs
-    });
-    if (wrap) {
-      spawnShell = wrap.shell;
-      spawnArgs = wrap.args;
-      entry.tmuxSession = wrap.tmuxName;
-      console.log('[Podium] restart via Podium-ready tmux:', wrap.tmuxName);
-    } else {
-      console.warn('[Podium] restart: tmux/psmux not found, falling back to direct spawn');
-    }
-  }
+  const spawnShell = claudeShell;
+  const spawnArgs = claudeArgs;
 
   // Kill old PTY before spawning new one to prevent orphaned processes
   if (entry.pty) {

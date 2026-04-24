@@ -233,8 +233,6 @@ class SessionTreeDataProvider {
     }
 
     const titleMap = sessionStoreGet('claudeSessionTitles', {});
-    // v2.6.12: Podium-ready map for badge + tooltip annotation.
-    const podiumMap = sessionStoreGet('claudePodiumReadySessions', {});
 
     const items = [];
     for (const file of files) {
@@ -249,23 +247,12 @@ class SessionTreeDataProvider {
       const displayText = savedTitle || firstMsg;
       const label = displayText.length > 40 ? displayText.substring(0, 40) + '...' : displayText;
 
-      const podiumInfo = podiumMap[sessionId];
       const item = new vscode.TreeItem(label, vscode.TreeItemCollapsibleState.None);
-      // v2.6.12: prefix description with ◆ glyph for Podium-ready sessions so
-      // users can tell at a glance which ones can host an omc team leader.
-      item.description = podiumInfo ? `◆ ${dateStr}` : dateStr;
-      const podiumTip = podiumInfo
-        ? `\n\nPodium-ready · tmux: ${podiumInfo.tmuxSession}`
-        : '';
-      item.tooltip = `${savedTitle ? savedTitle + '\n\n' : ''}${firstMsg || ''}${podiumTip}\n\nSession: ${sessionId}\n${date.toLocaleString()}`;
-      // v2.6.0: conversation-style icons. Titled sessions get a "discussion"
-      // icon; untitled get "comment-draft". v2.6.12: Podium-ready sessions
-      // override with "organization" (mic/podium glyph) — clearly distinct
-      // from regular Claude chats.
-      const iconName = podiumInfo
-        ? 'organization'
-        : (savedTitle ? 'comment-discussion' : 'comment-draft');
-      item.iconPath = new vscode.ThemeIcon(iconName);
+      item.description = dateStr;
+      item.tooltip = `${savedTitle ? savedTitle + '\n\n' : ''}${firstMsg || ''}\n\nSession: ${sessionId}\n${date.toLocaleString()}`;
+      // Conversation-style icons: titled sessions get a "discussion" icon;
+      // untitled get "comment-draft".
+      item.iconPath = new vscode.ThemeIcon(savedTitle ? 'comment-discussion' : 'comment-draft');
       item.command = {
         command: 'claudeCodeLauncher.resumeSession',
         title: t('resumeSession'),

@@ -81,39 +81,9 @@ function migrateFromWorkspaceState(context) {
   }
 }
 
-// v2.6.12: List Podium-ready sessions for a given cwd. Orchestration
-// (SpawnTeamPanel) calls this to populate its "Leader source" dropdown.
-// Returns [{ sessionId, title, tmuxSession }] — empty when no match.
-function listPodiumReadySessionsForCwd(cwd) {
-  const podiumMap = sessionStoreGet('claudePodiumReadySessions', {});
-  const titleMap = sessionStoreGet('claudeSessionTitles', {});
-  // Active panel entries (in-memory only) are the authoritative cwd source.
-  // Saved-to-disk entries survive reload but don't carry per-session cwd yet,
-  // so we only match active ones here. Callers get a truthful "this cwd has
-  // a live Podium-ready pane you can target" list.
-  const state = require('../state');
-  const out = [];
-  for (const [, entry] of state.panels) {
-    if (!entry.podiumReady || !entry.tmuxSession || !entry.sessionId) continue;
-    if (cwd && entry.cwd && path.resolve(entry.cwd) !== path.resolve(cwd)) continue;
-    out.push({
-      sessionId: entry.sessionId,
-      title: entry.title || titleMap[entry.sessionId] || 'Claude Code',
-      tmuxSession: entry.tmuxSession,
-      cwd: entry.cwd,
-    });
-    // Also confirm the persisted map knows about this one (durability probe).
-    if (!podiumMap[entry.sessionId]) {
-      podiumMap[entry.sessionId] = { tmuxSession: entry.tmuxSession };
-    }
-  }
-  return out;
-}
-
 module.exports = {
   getSessionStorePath,
   sessionStoreGet,
   sessionStoreUpdate,
   migrateFromWorkspaceState,
-  listPodiumReadySessionsForCwd,
 };
