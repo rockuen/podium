@@ -2,7 +2,7 @@
   "name": "podium",
   "displayName": "Podium — Multi-Agent Stage for Claude Code",
   "description": "Orchestrate multi-agent Claude teams from one stage — leader + worker panes with structured routing, idle detection, team snapshots, and dissolve-with-summary. Or run a solo Claude Code session in a rich Webview tab. No external multiplexer required.",
-  "version": "0.9.4",
+  "version": "0.11.0",
   "keywords": [
     "claude",
     "claude-code",
@@ -253,6 +253,12 @@
         "title": "Show Team Dashboard",
         "icon": "$(dashboard)",
         "category": "Claude"
+      },
+      {
+        "command": "claudeCodeLauncher.podium.consultOthers",
+        "title": "Podium: Consult Other Models",
+        "icon": "$(comment-discussion)",
+        "category": "Podium"
       },
       {
         "command": "claudeCodeLauncher.hud.focus",
@@ -557,6 +563,19 @@
     "configuration": {
       "title": "Podium CLI Launcher for Claude",
       "properties": {
+        "podium.workerReplyMode": {
+          "type": "string",
+          "enum": [
+            "artifact",
+            "legacy-auto-spill"
+          ],
+          "enumDescriptions": [
+            "v0.11+ default — workers must Write explicit markdown files under .omc/team/artifacts/. Only those files are inject into the leader (path notice). Worker pty thinking/noise stays out of the leader's context. Raw turn body archived to .omc/team/drops/raw/ for debugging.",
+            "Pre-v0.11 behaviour — every worker turn's raw pty body is dumped to .omc/team/drops/<worker>-turn<N>-seq<S>.md and a preview notice is inject into the leader. Use only as a regression escape hatch."
+          ],
+          "default": "artifact",
+          "description": "Worker → leader reply mode. 'artifact' (default) makes workers author deliberate markdown files; 'legacy-auto-spill' restores the pre-v0.11 raw pty dump behaviour."
+        },
         "claudeCodeLauncher.defaultTheme": {
           "type": "string",
           "default": "default",

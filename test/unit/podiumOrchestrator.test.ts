@@ -544,6 +544,11 @@ test('orch v0.6.0: long worker turn body spills to drop file + leader notice', a
   const out = makeOutputChannel();
   const clock = mkClock();
   const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  // v0.11.0 — These pre-v0.11 spill assertions are about the legacy
+  // shape (drop file at .omc/team/drops/<worker>-turn<N>-seq<S>.md plus
+  // a leader preview notice). Force legacy mode; the new artifact mode
+  // is exercised by separate tests in podiumArtifactSpill.test.ts.
+  orch.setWorkerReplyMode('legacy-auto-spill');
   orch.attach({
     leader: { paneId: 'L', agent: 'claude' },
     workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],
@@ -848,6 +853,8 @@ test('orch v0.8.3: short worker reply ALSO spills (threshold removed)', async ()
   const out = makeOutputChannel();
   const clock = mkClock();
   const orch = new PodiumOrchestrator(ctl.panel, out.channel);
+  // v0.11.0 — Legacy spill assertions; same rationale as the v0.6.0 test.
+  orch.setWorkerReplyMode('legacy-auto-spill');
   orch.attach({
     leader: { paneId: 'L', agent: 'claude' },
     workers: [{ id: 'worker-1', paneId: 'W1', agent: 'claude', silenceMs: 50 }],

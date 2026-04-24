@@ -51,7 +51,32 @@ import {
   needsWin32KeyEvents,
 } from './core/cliInput';
 import { MAX_RUNTIME_WORKERS, PodiumOrchestrator } from './core/PodiumOrchestrator';
+import { EventLogger } from './core/EventLogger';
+import {
+  runConsultOthersFlow,
+  type ActiveFileRef,
+  type ConsultOthersDeps,
+} from './core/council/CouncilUI';
+import { exec as cpExec } from 'node:child_process';
 import { buildLeaderExtraArgs } from './core/leaderProtocol';
+
+/**
+ * v0.11.0 — Apply user-configured Podium settings (currently
+ * `podium.workerReplyMode`) to a freshly constructed orchestrator.
+ * PodiumOrchestrator imports vscode as a type only and cannot read
+ * workspace configuration itself, so this lives at the host edge.
+ */
+function applyPodiumSettings(orch: PodiumOrchestrator): void {
+  try {
+    const cfg = vscode.workspace.getConfiguration('podium');
+    const mode = cfg.get<string>('workerReplyMode', 'artifact');
+    if (mode === 'artifact' || mode === 'legacy-auto-spill') {
+      orch.setWorkerReplyMode(mode);
+    }
+  } catch {
+    // Settings unavailable in this host — keep the orchestrator default ('artifact').
+  }
+}
 import { buildWorkerExtraArgs, type WorkerRole } from './core/workerProtocol';
 
 // v0.3.0 · Default 3-agent team layout for the `orchestrate*` commands.
@@ -441,6 +466,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       });
 
       const orch = new PodiumOrchestrator(panel, output);
+      applyPodiumSettings(orch);
       orch.attach({
         leader: { paneId: 'leader', agent: 'claude', sessionId: leaderSid, label: 'leader (claude)' },
         workers: [
@@ -454,6 +480,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         enableWorkerRouting: true,
         maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
         autoResetRoundMs: DEFAULT_AUTO_RESET_ROUND_MS,
+        // v0.9.5: event ledger.
+        eventLogger: new EventLogger({ cwd, podiumSessionId: randomUUID(), warn: output }),
       });
 
       const sessionKey = `orch-${Date.now()}`;
@@ -556,6 +584,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       });
 
       const orch = new PodiumOrchestrator(panel, output);
+      applyPodiumSettings(orch);
       orch.attach({
         leader: { paneId: 'leader', agent: 'claude', sessionId, label: `leader (resumed ${sessionId.slice(0, 8)})` },
         workers: [
@@ -567,6 +596,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         onAutoSnapshot: makeAutoSnapshotHook(output, `resumed ${sessionId.slice(0, 8)}`),
         enableWorkerRouting: true,
         maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
+        // v0.9.5: event ledger.
+        eventLogger: new EventLogger({ cwd, podiumSessionId: randomUUID(), warn: output }),
         autoResetRoundMs: DEFAULT_AUTO_RESET_ROUND_MS,
       });
 
@@ -706,6 +737,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       output.appendLine('[orch.summonTeam] team ready — leader + 2 workers attached');
 
       const orch = new PodiumOrchestrator(bridge, output);
+      applyPodiumSettings(orch);
       orch.attach({
         leader: {
           paneId: 'leader',
@@ -723,6 +755,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         enableWorkerRouting: true,
         maxRoundsPerTask: DEFAULT_MAX_ROUNDS,
         autoResetRoundMs: DEFAULT_AUTO_RESET_ROUND_MS,
+        // v0.9.5: event ledger.
+        eventLogger: new EventLogger({ cwd, podiumSessionId: randomUUID(), warn: output }),
         // No restoreGrace: leader never restarted, so there's no scrollback
         // replay to absorb. Workers are fresh.
       });
@@ -962,6 +996,7 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
       );
 
       const orch = new PodiumOrchestrator(panel, output);
+      applyPodiumSettings(orch);
       orch.attach({
         leader: {
           paneId: snap.leader.paneId,
@@ -983,6 +1018,8 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         // PodiumOrchestrator.route(). 15s protects against a broken or very
         // slow leader; most restores close via the idle gate in 2–4s.
         restoreGraceMs: 15000,
+        // v0.9.5: event ledger.
+        eventLogger: new EventLogger({ cwd, podiumSessionId: randomUUID(), warn: output }),
       });
 
       const sessionKey = `orch-restore-${Date.now()}`;
@@ -1351,6 +1388,76 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
         history: historyWatcher.snapshot(),
         ccg: ccgWatcher.snapshot(),
       });
+    }),
+  );
+
+  // ─── Podium: Consult Other Models (v0.10.x Council Mode entrypoint) ───
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand('claudeCodeLauncher.podium.consultOthers', async () => {
+      output.appendLine('[orch] podium.consultOthers invoked');
+      const deps: ConsultOthersDeps = {
+        promptForQuestion: () =>
+          Promise.resolve(
+            vscode.window.showInputBox({
+              prompt: 'Podium Council — what do you want a second opinion on?',
+              placeHolder: 'e.g. Is this refactor scoped right? Risks I am missing?',
+              ignoreFocusOut: true,
+            }) as Thenable<string | undefined>,
+          ).then((p) => p),
+        getWorkspaceCwd: (): string | undefined => {
+          const folder = vscode.workspace.workspaceFolders?.[0];
+          return folder?.uri.fsPath;
+        },
+        getActiveFile: (): ActiveFileRef | undefined => {
+          const ed = vscode.window.activeTextEditor;
+          if (!ed) return undefined;
+          return {
+            absPath: ed.document.uri.fsPath,
+            content: ed.document.isDirty ? ed.document.getText() : undefined,
+          };
+        },
+        getGitDiff: async (cwd: string): Promise<string | undefined> => {
+          return new Promise<string | undefined>((resolve) => {
+            cpExec(
+              'git diff',
+              { cwd, maxBuffer: 10 * 1024 * 1024 },
+              (err, stdout) => {
+                if (err) {
+                  resolve(undefined);
+                  return;
+                }
+                resolve(stdout && stdout.length > 0 ? stdout : undefined);
+              },
+            );
+          });
+        },
+        notify: (message: string) => {
+          vscode.window.showInformationMessage(message);
+        },
+        showFile: async (absPath: string) => {
+          const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(absPath));
+          await vscode.window.showTextDocument(doc, { preview: false });
+        },
+      };
+      try {
+        // Default participant set is a single fake critic. Real Codex/Gemini
+        // wiring lives in the user's settings (later slice) — keeping the
+        // command useful with no external CLI installed today.
+        const cwd = deps.getWorkspaceCwd();
+        const eventLogger = cwd
+          ? new EventLogger({
+              cwd,
+              podiumSessionId: `council-ui-${Date.now()}`,
+              warn: output,
+            })
+          : undefined;
+        const outcome = await runConsultOthersFlow(deps, { eventLogger });
+        output.appendLine(`[orch] podium.consultOthers outcome=${outcome.status}`);
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        output.appendLine(`[orch] podium.consultOthers ERROR: ${msg}`);
+        vscode.window.showErrorMessage(`Podium Council failed: ${msg}`);
+      }
     }),
   );
 

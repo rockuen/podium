@@ -123,32 +123,60 @@ If you see a message whose first line is NOT a path (e.g. plain text
 from the user directly), handle it normally — those are rare; the
 standard case is leader→worker via the path-first notice above.
 
-LONG-OUTPUT HANDLING (v0.8.4 — use artifact files)
+MANDATORY ARTIFACT WORKFLOW (v0.11.0 — required, not optional)
 
-If your reply contains code blocks, long review checklists, or any
-multi-paragraph content that the leader needs intact, DO NOT put it
-inline in the "@leader:" body. Instead:
+EVERY substantive reply MUST be authored as a markdown artifact file
+that you create with your Write tool. The orchestrator no longer
+inject the raw pty output of your turn into the leader — only what you
+DELIBERATELY write to ".omc/team/artifacts/" reaches the leader.
 
-  1. Use your Write tool to save the full output to a file under
-     ".omc/team/artifacts/", choosing a descriptive name:
-       .omc/team/artifacts/reverseString.js
-       .omc/team/artifacts/review-worker-1.md
-       .omc/team/artifacts/test-cases.md
-  2. In your "@leader:" reply, write ONLY:
-       - The artifact file path(s).
-       - A one-line summary of what you produced (e.g. "Intl.Segmenter
-         기반 구현 + 4개 테스트 통과").
-  3. The leader will Read the artifact directly. This bypasses the
-     drop-file capture entirely and guarantees the leader sees the
-     full body, which is otherwise at the mercy of terminal buffer
-     flushing and ANSI projector heuristics.
+Step-by-step every turn:
 
-Example good reply:
+  1. Decide your answer. If it is a one-line direct fact (under ~50
+     chars total, e.g. "1+1은 2야"), you MAY skip the artifact and
+     just send "@leader: <answer>".
+  2. Otherwise — and this is the standard case — Write your full
+     answer to a file named exactly:
+       .omc/team/artifacts/${opts.workerId}-turn<N>.md
+     where <N> is the leader turn number you were responding to.
+     If unsure of <N>, use a UTC timestamp suffix instead:
+       .omc/team/artifacts/${opts.workerId}-2026-04-24T12-30-00Z.md
+  3. ATOMIC WRITE PATTERN (race-safety): always Write the COMPLETE
+     final body in a single Write call. Do not Write in pieces; do not
+     Write a partial body and then update it. The orchestrator's
+     watcher fires on file create/close and the leader will read
+     whatever is on disk at that moment.
+  4. Reply to the leader with the path and a single-line summary:
 
-  @leader: 구현 완료.
-  - 코드: .omc/team/artifacts/reverseString.js
-  - 설명: .omc/team/artifacts/reverseString-notes.md
-  - 요지: Intl.Segmenter 기반 grapheme 분할 · 4/4 케이스 통과.
+       @leader: ${opts.workerId}-turn<N>.md — <one line summary>
+
+     The orchestrator detects the new artifact and inject a path
+     notice into the leader independently of your @leader: reply, so
+     even if the @leader: line is fragmented by the Ink TUI the
+     leader still gets the artifact path.
+
+Example good turn (worker writes a real file then reports it):
+
+  [Worker calls Write tool]
+    path: .omc/team/artifacts/${opts.workerId}-turn3.md
+    content: # ${opts.workerId} — turn 3 결과
+             ## 결론
+             …
+             ## 근거
+             …
+
+  [Worker then sends to leader]
+    @leader: ${opts.workerId}-turn3.md — 결론은 X, 근거 3건 첨부.
+
+What NOT to do (these waste the leader's context):
+
+  - Pasting a long answer inline in @leader:.
+  - Sending @leader: WITHOUT having written an artifact when the
+    answer is multi-paragraph or contains code.
+  - Writing thinking-style text outside the artifact (the orchestrator
+    saves your raw pty output to .omc/team/drops/raw/ for debugging
+    only — it does NOT reach the leader, so any "thinking out loud"
+    in the pty is invisible to the rest of the team).
 
 NO ACK-ONLY REPLIES (v0.8.4)
 
