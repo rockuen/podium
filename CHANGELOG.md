@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.9.1] - 2026-04-24
+
+### Feature · Drop content fingerprint (tail SHA-8 + UTF-8 byte count)
+
+Partial N3 from the 2026-04-24 parseCSV retrospective. The session
+demonstrated that ad-hoc "ACK the last sentence ending" prompt
+discipline was effective at catching truncation, but relied on the
+worker's cooperation to compare received-vs-expected. v0.9.1 moves
+the signal from prompt convention into runtime metadata so the
+leader (and any external reader of the worker pty scrollback) can
+verify "did the directive arrive whole?" without relying on worker
+behavior.
+
+Every leader→worker and worker→leader drop file now carries two
+forensic fields in its header:
+
+  bytes: <UTF-8 byte count>
+  tail_sha8: <8 hex chars of SHA-256 over last 40 chars>
+
+The path-first notice injected into the worker embeds the same
+fingerprint on the same line as the drop path:
+
+  .omc/team/drops/to-worker-1-turn2-seq1.md (bytes=234 tail=a3c9b7d2)
+
+  위 파일을 Read 해서 지시사항을 수행해 주세요.
+
+Placing the fingerprint on the path line (not a separate line) is
+deliberate: the path line is the most fragmentation-survivable
+token in the notice, so the fingerprint rides along with the
+smallest piece that must arrive intact.
+
+`bytes` is UTF-8 bytes (not JavaScript string `.length`, which is
+UTF-16 code units) — consistent with how payload size is measured
+in transit. `tail_sha8` hashes the last 40 characters of the
+payload (or the full payload if shorter): the diagnostic interest
+in the retrospective was always "did the ending arrive?", not
+mid-body integrity. Collision space is 24 bits, intentionally small
+— this is a forensic signal, not a security primitive.
+
+### Deferred to v0.9.2
+
+- Worker protocol update instructing the worker to echo bytes+tail
+  back for structured ACK.
+- Runtime parser for worker-side ACK messages + auto-warn on
+  mismatch.
+
+The fingerprint shipping first means leaders can manually verify
+today; the worker-side round-trip lands once prompt + parser work
+is designed.
+
+### Tests
+
+Four new v0.9.1 cases in `test/unit/dropFingerprint.test.ts`:
+
+- `drop header contains tail_sha8 and matches payload` — RED
+  baseline; hashes a Korean directive and verifies both the header
+  field and the UTF-8 byte count.
+- `path-first notice embeds (bytes=N tail=XXXX)` — verifies the
+  injected notice carries the fingerprint.
+- `short payloads hash the whole body (no padding artifacts)` —
+  regression guard: payloads under 40 chars hash the full payload,
+  not a zero-padded slice.
+- `same tail → identical hash; differing tail → different hash` —
+  pure-function property check, decoupled from the orchestrator.
+
+All 218 tests green. No regressions in parser, projector, orch,
+snapshot, or v0.9.0 dropsArchive suites.
+
 ## [0.9.0] - 2026-04-24
 
 ### Feature · Drops forensics — archive on attach + session marker

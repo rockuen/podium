@@ -43,6 +43,7 @@ import type * as vscode from 'vscode';
 import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { createHash } from 'node:crypto';
 import { stripAnsi } from './ansi';
 import { IdleDetector, isCosmeticLine, isInkNoise } from './idleDetector';
 import {
@@ -1838,11 +1839,14 @@ export class PodiumOrchestrator implements vscode.Disposable {
       fs.mkdirSync(dir, { recursive: true });
       const now = new Date().toISOString();
       const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
+      const tail_sha8 = computeTailSha8(turnBody);
+      const bytes = Buffer.byteLength(turnBody, 'utf8');
       const header =
         `# Drop: ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
         `session: ${session}\n` +
         `timestamp: ${now}\n` +
-        `bytes: ${turnBody.length}\n` +
+        `bytes: ${bytes}\n` +
+        `tail_sha8: ${tail_sha8}\n` +
         `---\n\n`;
       fs.writeFileSync(absPath, header + turnBody, 'utf8');
     } catch (err) {
@@ -2011,12 +2015,15 @@ export class PodiumOrchestrator implements vscode.Disposable {
       fs.mkdirSync(dir, { recursive: true });
       const now = new Date().toISOString();
       const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
+      const tail_sha8 = computeTailSha8(payload);
+      const bytes = Buffer.byteLength(payload, 'utf8');
       const header =
         `# Drop: leader → ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
         `direction: leader → ${w.cfg.id}\n` +
         `session: ${session}\n` +
         `timestamp: ${now}\n` +
-        `bytes: ${payload.length}\n` +
+        `bytes: ${bytes}\n` +
+        `tail_sha8: ${tail_sha8}\n` +
         `---\n\n`;
       fs.writeFileSync(absPath, header + payload, 'utf8');
     } catch (err) {
@@ -2027,10 +2034,19 @@ export class PodiumOrchestrator implements vscode.Disposable {
       return payload;
     }
     this.output.appendLine(
-      `[orch.spill] leader → ${w.cfg.id}: ${relPath} (${payload.length} bytes); injecting path-first notice`,
+      `[orch.spill] leader → ${w.cfg.id}: ${relPath} (${Buffer.byteLength(payload, 'utf8')} bytes, tail=${computeTailSha8(payload)}); injecting path-first notice`,
     );
     // PATH MUST BE FIRST. Fragmentation-survivable format.
-    return `${relPath}\n\n위 파일을 Read 해서 지시사항을 수행해 주세요.`;
+    // v0.9.1 · fingerprint `(bytes=N tail=XXXX)` embedded on the same
+    // line as the path so the leader (or any reader of the worker's
+    // pty scrollback) can verify the directive arrived whole without
+    // parsing the file header. `bytes` is the payload length in UTF-8
+    // bytes; `tail` is the first 8 hex chars of SHA-256 over the last
+    // 40 chars of the payload (or full payload if shorter). Same
+    // fingerprint lives in the drop file header under `tail_sha8:`.
+    const bytes = Buffer.byteLength(payload, 'utf8');
+    const tail = computeTailSha8(payload);
+    return `${relPath} (bytes=${bytes} tail=${tail})\n\n위 파일을 Read 해서 지시사항을 수행해 주세요.`;
   }
 
   /**
@@ -2285,6 +2301,33 @@ export class PodiumOrchestrator implements vscode.Disposable {
 function preview(text: string, max = 60): string {
   const single = text.replace(/\s+/g, ' ').trim();
   return single.length > max ? `${single.slice(0, max)}…` : single;
+}
+
+/**
+ * v0.9.1 — Content fingerprint for drop files.
+ *
+ * Returns the first 8 hex chars of SHA-256 over the last 40 characters
+ * of the payload (or the full payload if shorter). Used as a cheap,
+ * forensic-friendly signature embedded in:
+ *   - drop file header (`tail_sha8:` field)
+ *   - path-first notice injected into the worker (`tail=XXXX` marker)
+ *
+ * Why the tail window and not the full body: in the 2026-04-24 parseCSV
+ * retrospective, the diagnostic value came from verifying "did the
+ * directive arrive with its ending intact?" A 40-char tail covers the
+ * concluding sentence / punctuation / markers, which is exactly where
+ * Ink-wrap truncations land. Hashing the full body would also detect
+ * mid-body edits, but that's out of scope for a "did it arrive whole"
+ * check.
+ *
+ * Character-based (not byte-based) so the window size is consistent
+ * across CJK / emoji / ASCII payloads. Collision space (24 bits) is
+ * intentionally small — this is a forensic signal, not a security
+ * primitive.
+ */
+function computeTailSha8(payload: string): string {
+  const tail = payload.length <= 40 ? payload : payload.slice(-40);
+  return createHash('sha256').update(tail, 'utf8').digest('hex').slice(0, 8);
 }
 
 function trimForFallback(transcript: string): string {
