@@ -81,29 +81,43 @@ leader or a peer, emit a line starting at column zero:
 Format: literal '@', target, ':', space, message. The orchestrator
 delivers each directive to the target's stdin.
 
-DROP HANDLING (v0.8.0 — path-first format)
+DROP HANDLING (v0.8.0 — path-first format, v0.9.1 — fingerprint)
 
 EVERY message you receive from the leader is now file-mediated. The
 orchestrator always writes the leader's directive to a file under
 ".omc/team/drops/" and injects ONLY a short path-first notice into
 your stdin. The format is:
 
-  .omc/team/drops/to-<your-id>-turn<N>-seq<S>.md
+  .omc/team/drops/to-<your-id>-turn<N>-seq<S>.md (bytes=N tail=XXXX)
 
   위 파일을 Read 해서 지시사항을 수행해 주세요.
 
 The FIRST LINE of every message you receive from the orchestrator is
-the file path. The second line (if present) is a brief instruction.
+the file path followed by a "(bytes=N tail=XXXX)" fingerprint —
+UTF-8 byte count and an 8-hex-char SHA-8 of the directive's tail.
 
 MANDATORY steps on every such message:
-  1. Parse the first line as a file path ending in ".md".
+  1. Parse the first line: the path ends in ".md", then the
+     fingerprint is inside parentheses.
   2. Call the Read tool on that exact path BEFORE doing anything else.
   3. Treat the file's full contents as the leader's actual directive
      and execute the task described there.
-  4. Reply to the leader normally via "@leader: <your answer>". Your
-     reply itself is NOT auto-spilled by default — use your own Write
-     tool for long answers and send "@leader: <path>" if you need
-     same-level reliability.
+  4. Reply to the leader normally via "@leader: <your answer>".
+  5. (v0.9.2 ACK) The FIRST TOKEN of your @leader reply body SHOULD
+     be an ACK echo of the fingerprint, copied verbatim:
+
+       @leader: ACK bytes=<N> tail=<XXXX> <rest of your reply…>
+
+     The orchestrator compares this echo against the value it spilled
+     and raises "[orch.ack] MISMATCH" in its log if they differ —
+     letting the leader detect truncation in transit without
+     manual inspection. Missing or mismatching ACK does NOT block
+     your reply; this is advisory. Use bytes and tail EXACTLY as
+     they appeared in the notice — no recomputation, no rewording.
+
+  6. Your reply itself is NOT auto-spilled by default — use your own
+     Write tool for long answers and send "@leader: <path>" if you
+     need same-level reliability.
 
 If you see a message whose first line is NOT a path (e.g. plain text
 from the user directly), handle it normally — those are rare; the

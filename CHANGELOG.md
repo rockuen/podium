@@ -1,5 +1,75 @@
 # Changelog
 
+## [0.9.2] - 2026-04-24
+
+### Feature · Worker ACK round-trip (completes N3 from 2026-04-24 retro)
+
+v0.9.1 embedded "(bytes=N tail=XXXX)" in the path-first notice. v0.9.2
+closes the round-trip: workers echo the fingerprint back, and the
+orchestrator auto-compares against what it spilled. The parseCSV
+retrospective's prompt-driven "ACK the ending" discipline is now a
+runtime primitive.
+
+Flow:
+
+  1. maybeSpillLeaderToWorker writes the drop, injects
+     ".omc/team/drops/to-worker-1-turn2-seq1.md (bytes=234 tail=a3c9b7d2)"
+     and arms w.pendingAckFp with the expected fingerprint.
+
+  2. Worker's system prompt (v0.9.2 update) instructs:
+     the first token of @leader reply SHOULD be "ACK bytes=<N> tail=<XXXX>"
+     copied verbatim from the notice.
+
+  3. On the worker's next @leader route, commitLeaderInject calls
+     maybeConsumeAck. It parses the payload's leading
+     /^\s*ACK\s+bytes=(\d+)\s+tail=([0-9a-f]{8})\b/i, compares against
+     w.pendingAckFp, and:
+       - match → "[orch.ack] match worker-1 bytes=234 tail=a3c9b7d2 (drop=...)"
+       - mismatch → "[orch.ack] MISMATCH worker-1 expected bytes=234
+           tail=a3c9b7d2, got bytes=169 tail=deadbeef (drop=...) —
+           directive likely truncated in transit; consider re-sending"
+       - missing/malformed → silent (ACK is advisory; a worker that
+         skips it is not wrong)
+
+  4. Fingerprint is one-shot: cleared in every branch to prevent stale
+     comparisons on subsequent turns. Unsolicited ACK (no prior spill)
+     is a no-op.
+
+Payload is NOT stripped of the ACK line before forwarding to leader.
+The ACK token is short and context-adjacent; stripping risks losing
+text attached on the same line. Leader sees the ACK verbatim in its
+inbox, which is acceptable forensic noise.
+
+### Deferred to v0.9.3+
+
+- Auto re-spill on MISMATCH. v0.9.2 only observes; human / leader
+  decides whether to retry. Auto-retry needs throttling + a signal
+  to break the retry loop, which deserves its own design pass.
+- Stripping the ACK line from the forwarded payload. Deferred until
+  real usage shows whether ACK-in-payload is actually noisy.
+- Worker→worker ACK. Currently only leader→worker spills arm
+  pendingAckFp; worker-to-worker drops don't track fingerprints.
+
+### Tests
+
+Four new v0.9.2 cases in test/unit/ackRoundTrip.test.ts:
+
+- "matching ACK logs a match line and does not warn" — RED baseline.
+  Feeds a worker reply containing the exact expected fingerprint,
+  asserts a match log appears with worker id + fingerprint.
+- "mismatching ACK emits MISMATCH warn with both values" — RED
+  baseline. Feeds a reply with truncated-style bytes + wrong tail,
+  asserts the warn contains BOTH expected and got for forensic
+  clarity.
+- "reply without ACK line is silently accepted" — no warn on missing
+  ACK (convention is advisory).
+- "ACK without a prior spill is ignored (no false positives)" —
+  unsolicited ACK must not raise MISMATCH; pendingAckFp stays null.
+
+222/222 tests green. Worker prompt updated to document the ACK
+contract. Leader protocol unchanged — this feature is invisible to
+the leader except via log lines.
+
 ## [0.9.1] - 2026-04-24
 
 ### Feature · Drop content fingerprint (tail SHA-8 + UTF-8 byte count)

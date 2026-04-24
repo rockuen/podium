@@ -281,6 +281,16 @@ export interface WorkerRuntime {
    * resets it to false after handling.
    */
   hasPendingReply: boolean;
+  /**
+   * v0.9.2 — Last-sent leader→worker fingerprint, awaiting echo from
+   * this worker's next `@leader:` reply. Set by `maybeSpillLeaderToWorker`.
+   * Consumed (cleared) once by `commitLeaderInject`'s ACK check on the
+   * very next reply — whether the ACK was present, matching, or absent.
+   * One-shot: we don't accumulate a queue, because the leader is
+   * expected to wait for each reply before issuing another directive
+   * (round-cap semantics enforce this too).
+   */
+  pendingAckFp: { bytes: number; tail_sha8: string; dropPath: string; ts: number } | null;
 }
 
 /** Cap per-worker transcript to avoid unbounded memory growth in long runs. */
@@ -634,6 +644,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
         currentTurnStart: 0,
         spillSeq: 0,
         hasPendingReply: false,
+        pendingAckFp: null,
         // v0.7.4 — Projector instantiated for all Claude agents (not
         // gated on routing) so transcript capture gets the same
         // assistant-only filtering as parser routing. Spill files
@@ -772,6 +783,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
       currentTurnStart: 0,
       spillSeq: 0,
       hasPendingReply: false,
+      pendingAckFp: null,
       // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
       parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
       // v0.7.4 — see attach() site for rationale.
@@ -1519,6 +1531,12 @@ export class PodiumOrchestrator implements vscode.Disposable {
       return;
     }
     const nowMs = this.nowFn();
+    // v0.9.2 — ACK round-trip verification. If the source worker had a
+    // pending fingerprint (armed by the last leader→worker spill), consume
+    // it here: compare the echoed `ACK bytes=N tail=XXXX` against the
+    // expected values and log match/mismatch. Missing or malformed ACK
+    // is silent — the convention is best-effort, not required.
+    this.maybeConsumeAck(payload, sourcePaneId);
     this.pruneLeaderRecent(nowMs);
     // v0.5.0 · (A+B) Normalized key + turn-based dedupe also on the
     // worker→leader direction. Ghost repaints from worker panes re-emitting
@@ -1579,6 +1597,56 @@ export class PodiumOrchestrator implements vscode.Disposable {
       this.output.appendLine(`[orch] inject → leader FAILED — ${msg}`);
       this.stats.dropped += 1;
     }
+  }
+
+  /**
+   * v0.9.2 — Inspect an inbound worker→leader payload for an echoed
+   * `ACK bytes=N tail=XXXX` signature and compare against the
+   * fingerprint the orch spilled to that worker last.
+   *
+   * Semantics:
+   *   - No worker matching sourcePaneId → no-op (routing bookkeeping mismatch).
+   *   - Worker has no pending fingerprint → no-op (unsolicited ACK,
+   *     e.g. from a prompt-driven retry or a previous session's scrollback).
+   *   - Pending fingerprint present but no ACK pattern → clear it
+   *     silently (worker chose not to echo; that's allowed).
+   *   - ACK parses AND matches → log `[orch.ack] match ...`.
+   *   - ACK parses AND mismatches → log `[orch.ack] MISMATCH ...`.
+   *
+   * The pending fingerprint is cleared in every branch so it does not
+   * leak across turns. The function NEVER drops the payload — the ACK
+   * check is purely observational, never blocking.
+   */
+  private maybeConsumeAck(payload: string, sourcePaneId: string): void {
+    const w = this.findWorkerByPaneId(sourcePaneId);
+    if (!w || !w.pendingAckFp) return;
+
+    const expected = w.pendingAckFp;
+    w.pendingAckFp = null; // one-shot, consume regardless of outcome
+
+    const m = payload.match(/^\s*ACK\s+bytes=(\d+)\s+tail=([0-9a-f]{8})\b/i);
+    if (!m) return; // no ACK echoed — silent by design
+
+    const gotBytes = Number.parseInt(m[1], 10);
+    const gotTail = m[2].toLowerCase();
+
+    if (gotBytes === expected.bytes && gotTail === expected.tail_sha8) {
+      this.output.appendLine(
+        `[orch.ack] match ${w.cfg.id} bytes=${gotBytes} tail=${gotTail} (drop=${expected.dropPath})`,
+      );
+      return;
+    }
+
+    this.output.appendLine(
+      `[orch.ack] MISMATCH ${w.cfg.id} expected bytes=${expected.bytes} tail=${expected.tail_sha8}, got bytes=${gotBytes} tail=${gotTail} (drop=${expected.dropPath}) — directive likely truncated in transit; consider re-sending the full body`,
+    );
+  }
+
+  private findWorkerByPaneId(paneId: string): WorkerRuntime | null {
+    for (const w of this.workers.values()) {
+      if (w.cfg.paneId === paneId) return w;
+    }
+    return null;
   }
 
   private pruneLeaderRecent(nowMs: number): void {
@@ -2046,6 +2114,10 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // fingerprint lives in the drop file header under `tail_sha8:`.
     const bytes = Buffer.byteLength(payload, 'utf8');
     const tail = computeTailSha8(payload);
+    // v0.9.2 — Arm the ACK round-trip. When this worker's next
+    // `@leader:` reply lands, `commitLeaderInject` will compare the
+    // echoed `ACK bytes=N tail=XXXX` against this fingerprint.
+    w.pendingAckFp = { bytes, tail_sha8: tail, dropPath: relPath, ts: this.nowFn() };
     return `${relPath} (bytes=${bytes} tail=${tail})\n\n위 파일을 Read 해서 지시사항을 수행해 주세요.`;
   }
 
