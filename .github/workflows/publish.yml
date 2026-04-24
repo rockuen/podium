@@ -47,5 +47,5 @@ jobs:
         run: |
           for f in *.vsix; do
             echo "Publishing $f..."
-            ovsx publish "$f" -p ${{ secrets.OVSX_TOKEN }}
+            ovsx publish "$f" -p ${{ secrets.OVSX_PAT }}
           done
