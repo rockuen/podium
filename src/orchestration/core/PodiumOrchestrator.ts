@@ -291,10 +291,39 @@ export interface WorkerRuntime {
    * (round-cap semantics enforce this too).
    */
   pendingAckFp: { bytes: number; tail_sha8: string; dropPath: string; ts: number } | null;
+  /**
+   * v0.9.3 — Recent leader→worker spill fingerprints, used for
+   * redelivery (retry) detection. When the orchestrator is about to
+   * spill a new directive, it searches this array for an entry whose
+   * `tail_sha8` matches — within REDELIVERY_WINDOW_MS — and, if found,
+   * annotates the new drop's header with `redelivery_of:` and a
+   * chain-length `redelivery_count:`. Entries older than the window
+   * are pruned lazily at each spill.
+   *
+   * Per-worker scope is deliberate: cross-worker spills with identical
+   * content are NOT a redelivery. The forensic question the 2026-04-24
+   * parseCSV retrospective asked was "did worker-N see retries?" —
+   * not "did the leader resend similar content to different workers?".
+   */
+  recentSpills: Array<{
+    tail_sha8: string;
+    dropPath: string;
+    ts: number;
+    chainLength: number;
+  }>;
 }
 
 /** Cap per-worker transcript to avoid unbounded memory growth in long runs. */
 const MAX_TRANSCRIPT_CHARS = 50_000;
+
+/**
+ * v0.9.3 — Window for redelivery detection. If the leader spills the
+ * exact same directive to the exact same worker within this window,
+ * the new drop is tagged as a retry of the older one. 5 minutes is
+ * wider than the parseCSV retrospective's recovery window (~30 s) but
+ * narrow enough that unrelated next-day dogfood sessions don't link.
+ */
+const REDELIVERY_WINDOW_MS = 5 * 60 * 1000;
 
 const DEFAULT_POLL_MS = 250;
 // Claude Code v2.1+ uses an Ink TUI that repaints the alt-screen periodically,
@@ -645,6 +674,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
         spillSeq: 0,
         hasPendingReply: false,
         pendingAckFp: null,
+        recentSpills: [],
         // v0.7.4 — Projector instantiated for all Claude agents (not
         // gated on routing) so transcript capture gets the same
         // assistant-only filtering as parser routing. Spill files
@@ -784,6 +814,7 @@ export class PodiumOrchestrator implements vscode.Disposable {
       spillSeq: 0,
       hasPendingReply: false,
       pendingAckFp: null,
+      recentSpills: [],
       // v0.3.0: runtime-added workers inherit the team's bidirectional flag.
       parser: this.enableWorkerRouting ? new WorkerPatternParser() : null,
       // v0.7.4 — see attach() site for rationale.
@@ -2082,9 +2113,26 @@ export class PodiumOrchestrator implements vscode.Disposable {
     try {
       fs.mkdirSync(dir, { recursive: true });
       const now = new Date().toISOString();
+      const nowMs = this.nowFn();
       const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
       const tail_sha8 = computeTailSha8(payload);
       const bytes = Buffer.byteLength(payload, 'utf8');
+
+      // v0.9.3 — Redelivery detection. Prune stale entries first so
+      // comparisons only look at the active window, then search for a
+      // content-hash match. If we find one, the new drop is tagged with
+      // the path of the match (the most-recent prior in the chain) and
+      // a chain-length counter incremented by one.
+      w.recentSpills = w.recentSpills.filter((e) => nowMs - e.ts < REDELIVERY_WINDOW_MS);
+      const prior = [...w.recentSpills]
+        .reverse()
+        .find((e) => e.tail_sha8 === tail_sha8);
+      const chainLength = prior ? prior.chainLength + 1 : 1;
+      const redeliveryLines =
+        chainLength > 1 && prior
+          ? `redelivery_of: ${prior.dropPath}\nredelivery_count: ${chainLength}\n`
+          : '';
+
       const header =
         `# Drop: leader → ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
         `direction: leader → ${w.cfg.id}\n` +
@@ -2092,8 +2140,18 @@ export class PodiumOrchestrator implements vscode.Disposable {
         `timestamp: ${now}\n` +
         `bytes: ${bytes}\n` +
         `tail_sha8: ${tail_sha8}\n` +
+        redeliveryLines +
         `---\n\n`;
       fs.writeFileSync(absPath, header + payload, 'utf8');
+
+      // Record THIS spill for future retry checks. Append after write so
+      // we don't leak state if the write failed.
+      w.recentSpills.push({ tail_sha8, dropPath: relPath, ts: nowMs, chainLength });
+      if (chainLength > 1) {
+        this.output.appendLine(
+          `[orch.redelivery] ${w.cfg.id} drop tagged redelivery_count=${chainLength} (prior=${prior!.dropPath})`,
+        );
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.output.appendLine(

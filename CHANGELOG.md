@@ -1,5 +1,66 @@
 # Changelog
 
+## [0.9.3] - 2026-04-25
+
+### Feature · Drop redelivery metadata (N2 from 2026-04-24 parseCSV retro)
+
+When the leader spills the SAME directive to the SAME worker within
+5 minutes, the new drop's header is annotated so forensic analysis
+can follow the retry chain:
+
+    redelivery_of: .omc/team/drops/to-worker-1-turn2-seq1.md
+    redelivery_count: 2
+
+Detection uses content-hash match on `tail_sha8` (the v0.9.1 fingerprint
+already on every drop). Cross-worker spills with identical content are
+NOT linked — the retrospective's forensic question was "did worker-N
+see retries?", not "did the leader resend similar content to different
+workers?". Chain length increments on each subsequent match so triple
+retries show `redelivery_count: 3`, etc. Entries older than the 5-min
+window are pruned lazily on each spill; a retry past the window starts
+a fresh chain.
+
+Output also logs a `[orch.redelivery]` line when a chain extends,
+so real-time observers see retry cycles without opening drop headers:
+
+    [orch.redelivery] worker-1 drop tagged redelivery_count=2 (prior=...)
+
+### Known limitation · dedupe interaction
+
+Production's same-payload cross-turn dedupe (2 min, hardcoded) drops
+exact-duplicate routes BEFORE they reach spill. So the content-hash
+trigger only fires when the retry's content is slightly different
+from the original (e.g., the leader adds a "retry:" prefix or an
+EOI marker) — in which case `tail_sha8` won't match either.
+
+In practice this means v0.9.3's trigger catches a narrow band: retries
+that share the exact tail but differ elsewhere (unlikely in real
+usage). The infrastructure (`recentSpills` ring, chain counting,
+header fields, log line) is in place; v0.9.4 will add a broader
+trigger keyed on the ACK-mismatch signal from v0.9.2 — which is
+the actual semantic signal for "leader is retrying because delivery
+failed".
+
+Tests document the current trigger contract with `dedupeWindowMs: 0`
+to bypass production's dedupe for exact-duplicate scenarios.
+
+### Tests
+
+Five new v0.9.3 cases in test/unit/dropRedelivery.test.ts:
+
+- "distinct payloads to same worker are NOT linked" — negative
+  baseline; unrelated drops carry no redelivery fields.
+- "same payload twice within window → redelivery_of set, count=2"
+  — primary positive case; second drop points back at first.
+- "triple retry chains — redelivery_count increments" — chains
+  extend correctly (1 → 2 → 3).
+- "same payload beyond window → NEW chain (no link)" — window
+  pruning works; 6-min-later retry is a fresh chain.
+- "same payload to a different worker does NOT link" — per-worker
+  scope is respected.
+
+227/227 tests green. No regressions in v0.9.0/0.9.1/0.9.2 suites.
+
 ## [0.9.2] - 2026-04-24
 
 ### Feature · Worker ACK round-trip (completes N3 from 2026-04-24 retro)
