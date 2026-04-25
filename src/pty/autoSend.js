@@ -24,16 +24,45 @@
 // - v2.6.23  single send-keys -l with the whole body. Raw LF bytes were
 //            treated by Claude readline as submit (same as CR), so only the
 //            first line was sent. ABANDONED.
-// - v2.6.24 (current): Win32-input-mode Shift+Enter KEY_EVENT ANSI sequence
-//            injected between lines. Format per MS ConPTY spec:
+// - v2.6.24: Win32-input-mode Shift+Enter KEY_EVENT ANSI sequence injected
+//            between lines. Format per MS ConPTY spec:
 //              \x1b[<vk>;<sc>;<uc>;<kd>;<cs>;<rc>_
 //            Enter: vk=13, sc=28; Shift modifier: cs=16.
 //            Sending the down+up pair makes Claude readline see a real
 //            Shift+Enter key event — newline-in-buffer, not submit. Bare
 //            Enter at the end submits.
-//
-// Non-Podium multi-line sends are still a known gap — pty.write + CR is
-// kept to avoid the v2.6.20-style lockup.
+// - v0.11.2: Mac added to the KEY_EVENT path. Claude Code v2.1+ activates
+//            win32-input-mode on macOS too — bare \r becomes Shift+Enter and
+//            leaves the directive un-submitted (leader hangs in Sautéed).
+//            This helper now uses KEY_EVENT on darwin + win32, and the
+//            v2.6.24-era "non-Podium multi-line" gap is closed by joining
+//            embedded newlines with SHIFT_ENTER on those platforms.
+
+const ESC = '\x1b';
+// Win32-input-mode KEY_EVENT pairs, mirrored byte-for-byte from
+// src/orchestration/core/cliInput.ts. This file is plain CommonJS, runs
+// alongside the extension host without going through the TS build, but the
+// sequences MUST stay byte-identical to cliInput. cliInput.test.ts covers the
+// canonical encoding sanity case.
+const WIN32_ENTER_SUBMIT =
+  ESC + '[13;28;13;1;0;1_' + // keydown: vk=13, sc=28, uc=13 (CR), kd=1, cs=0
+  ESC + '[13;28;13;0;0;1_';  // keyup
+const WIN32_SHIFT_ENTER =
+  ESC + '[13;28;10;1;16;1_' + // keydown: uc=10 (LF), cs=16 (SHIFT)
+  ESC + '[13;28;10;0;16;1_';  // keyup
+
+/**
+ * Whether this process needs win32-input-mode KEY_EVENT encoding when writing
+ * to a Claude PTY. Mirrors `needsWin32KeyEvents` in cliInput.ts.
+ *
+ * The legacy chat panel always spawns the Claude CLI, so we don't need an
+ * agent kind on `entry`. If we ever wire codex / gemini into the legacy
+ * panel, gate on `entry.agent === 'claude'` here.
+ */
+function needsWin32KeyEvents() {
+  const plat = process.platform;
+  return plat === 'win32' || plat === 'darwin';
+}
 
 function autoSendToEntry(entry, text) {
   if (!entry || !entry.pty) return;
@@ -41,10 +70,21 @@ function autoSendToEntry(entry, text) {
   // Strip any trailing CR/LF — this helper is responsible for appending Enter.
   const body = String(text).replace(/[\r\n]+$/, '');
   try {
-    entry.pty.write(body + '\r');
+    let payload;
+    if (needsWin32KeyEvents()) {
+      const lines = body.split(/\r?\n/);
+      payload = lines.join(WIN32_SHIFT_ENTER) + WIN32_ENTER_SUBMIT;
+    } else {
+      payload = body + '\r';
+    }
+    entry.pty.write(payload);
   } catch (e) {
     console.warn('[auto-send] pty.write failed:', e && e.message);
   }
 }
 
-module.exports = { autoSendToEntry };
+module.exports = {
+  autoSendToEntry,
+  // Exported for unit tests / inspection only.
+  __testing: { WIN32_ENTER_SUBMIT, WIN32_SHIFT_ENTER, needsWin32KeyEvents },
+};

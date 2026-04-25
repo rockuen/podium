@@ -1,5 +1,128 @@
 # Changelog
 
+## [0.11.2] - 2026-04-25
+
+### Bug fix · macOS Enter submit (Win32 KEY_EVENT cross-platform)
+
+Field finding (Antigravity webview + Claude Code v2.1.119, Mac arm64,
+session 64a1084f): leader pane Enter never submits. Paste / typing
+lands in the input buffer fine, but pressing Enter leaves the directive
+sitting un-submitted while Claude hangs in `Sautéed for Ns`. The
+projector / parser then partially echo-parses the visible repaint and
+spills tiny truncated drops to the workers (76B / 100B in the captured
+session).
+
+Root cause: Claude Code v2.1+ activates win32-input-mode (CSI ?9001h)
+on macOS as well, not just Windows. The v2.7.1 `cliInput` and
+v2.6.18 `autoSend` modules both assumed win32-mode was Windows-only
+and emitted bare `\r` on darwin. Under win32-mode the Claude Ink
+readline reinterprets bare `\r` as Shift+Enter (newline-in-buffer),
+so the directive is never submitted.
+
+Fix:
+- `src/orchestration/core/cliInput.ts` — `needsWin32KeyEvents` now
+  returns true on `darwin` + `win32` (Claude only). Codex / Gemini
+  remain on bare CR everywhere because they do not enable
+  win32-input-mode. Linux retains bare CR until field evidence
+  proves otherwise.
+- `src/pty/autoSend.js` — webview programmatic-send path
+  (`vscode.postMessage({ type: 'auto-send', text })`) now mirrors
+  cliInput: KEY_EVENT submit on darwin + win32 (Claude), bare CR on
+  Linux. Multi-line bodies join with WIN32_SHIFT_ENTER on Mac/Win32,
+  closing the v2.6.24-era "non-Podium multi-line" gap.
+- `src/panel/webviewClient.js` — `term.attachCustomKeyEventHandler`
+  intercepts plain Enter (no Ctrl/Cmd/Shift/Alt, not IME composing),
+  mirrors `lineBuffer` history bookkeeping that the legacy
+  `term.onData('\r')` branch performed, then routes through
+  `auto-send` so the extension emits the proper KEY_EVENT submit.
+
+### Tests
+
+Five new v0.11.2 cases in `test/unit/cliInput.test.ts`:
+
+- `needsWin32KeyEvents — claude on win32 + darwin` — primary positive
+  (replaces prior "win32 only" expectation, plus codex/gemini on
+  darwin still false).
+- `macOS claude single-line — KEY_EVENT submit` — `pty.write` payload
+  matches `body + WIN32_ENTER_SUBMIT`, no Shift+Enter.
+- `macOS claude multi-line — SHIFT_ENTER between, ENTER submit at end`
+  — embedded newlines join with WIN32_SHIFT_ENTER.
+- `macOS codex/gemini — bare CR (Mac fix is Claude-specific)` —
+  ensures other CLIs are unaffected by the promotion.
+- `macOS claude CRLF bodies normalize to KEY_EVENT path` — CRLF
+  splitter still works on darwin.
+
+Plus `submitToPty macOS claude writes KEY_EVENT payload` covering the
+write helper. Linux POSIX cases relabeled (the prior "POSIX" coverage
+implicitly assumed darwin == bare CR which was the broken assumption).
+
+313/313 tests pass (308 → 313, +5 new).
+
+### v7 plan reconciliation
+
+`260425 Podium 통합 플랜 v7 §3.2` listed
+"parser.findSingleLineTerminator indent-less continuation" as the
+top md-truncation candidate. Code evidence shows that path was
+already fixed in v0.8.9 (`messageRouter.ts:470-501`, six regression
+tests in `messageRouter.test.ts:131-228`). The real first-priority
+defect was Mac Enter submit. v7 §10.4 is being updated separately to
+record the close on the parser candidate and the v0.11.2 fix on the
+true defect.
+
+## [0.11.1] - 2026-04-24
+
+### Release · Platform-specific native binaries + OpenVSX
+
+- `publish.yml` GitHub Action secret rename `OVSX_TOKEN` → `OVSX_PAT`
+  so the OpenVSX publish step authenticates correctly.
+- Three-platform VSIX matrix builds the right node-pty native binary
+  per target: `darwin-arm64`, `win32-x64`, `linux-x64`. Mac users no
+  longer need `npm rebuild node-pty` after install.
+- GitHub Release v0.11.1 with universal VSIX attached, OpenVSX
+  publishes for all four channels (universal + 3 platform-pinned).
+
+## [0.11.0] - 2026-04-23
+
+### Feature · Council UI + worker artifact-only spill mode
+
+- New `podium.workerReplyMode` setting (`artifact` | `legacy-auto-spill`,
+  default `artifact`). In `artifact` mode workers must author
+  deliberate markdown files under `.omc/team/artifacts/`; only those
+  files are injected into the leader (path-first notice). Worker pty
+  thinking / scrollback noise stays out of the leader's context. Raw
+  turn body is archived to `.omc/team/drops/raw/` for debugging.
+  `legacy-auto-spill` keeps the pre-v0.11 raw pty dump behavior as a
+  regression escape hatch.
+- Council UI integrates with the live session as a hybrid panel —
+  user-facing entry point for `Podium: Consult Other Models`. Layout
+  groundwork for the v0.10.3 explicit close-flow lands here, but the
+  `Inject brief / Save only / Discard` user-selection UI is still
+  scheduled for v0.12.2 per v7 §8.2.
+
+## [0.10.2] - 2026-04-23
+
+### Feature · Council synthesizer + return brief
+
+- `CouncilSynthesizerSpec` interface with the default Claude
+  synthesizer wired through `runCouncil()`.
+- Each council run now writes `synthesis/summary.md` and
+  `return_brief.md` artifacts so the focused session has a compact
+  injection target on close.
+
+## [0.10.0] - 2026-04-23
+
+### Feature · Headless participant transport
+
+- `ParticipantTransport` interface and `HeadlessProcessTransport`
+  implementation: spawns a participant CLI in headless mode, captures
+  stdout / stderr / exit, and writes per-participant artifacts under
+  `.omc/team/council/<runId>/participants/<id>/`.
+- Async `runCouncil()` entry point assembles a `CouncilRun` from a
+  `ContextPack` + participant list and resolves with a
+  `CouncilRunResult`. Codex / Gemini participants ride the same
+  framework — actual CLI binding for those providers is deferred to
+  v0.12.0 / v0.12.1.
+
 ## [0.9.4] - 2026-04-25
 
 ### Feature · ACK-mismatch-keyed retry chain (closes N2)

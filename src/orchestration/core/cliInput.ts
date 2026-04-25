@@ -54,10 +54,23 @@ export interface BuildPayloadOptions {
 /**
  * Return true when the given agent + platform pair requires Win32 KEY_EVENT
  * encoding rather than bare CR/LF.
+ *
+ * v0.11.2 — macOS added to the KEY_EVENT path
+ * --------------------------------------------
+ * The original v2.7.1 design assumed win32-input-mode was Windows-only because
+ * Claude CLI activated it on ConPTY detection. Field evidence on 2026-04-25
+ * (Antigravity webview + Claude Code v2.1.119 + Mac arm64) shows v2.1+ also
+ * activates win32-input-mode on macOS — every `pty.write('\r')` is reinterpreted
+ * as Shift+Enter, the directive sits in the input buffer un-submitted, and the
+ * leader hangs in `Sautéed for Ns` forever. macOS now takes the same KEY_EVENT
+ * path as Windows. Linux retains the bare-CR path until field evidence proves
+ * otherwise. Codex / Gemini CLIs are unaffected (they don't enable
+ * win32-input-mode on any platform), so the Mac promotion stays Claude-scoped.
  */
 export function needsWin32KeyEvents(opts: BuildPayloadOptions): boolean {
+  if (opts.agent !== 'claude') return false;
   const plat = opts.platform ?? process.platform;
-  return plat === 'win32' && opts.agent === 'claude';
+  return plat === 'win32' || plat === 'darwin';
 }
 
 /**

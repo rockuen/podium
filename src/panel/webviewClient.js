@@ -1338,6 +1338,45 @@ function getClientScript(ctx) {
         return false;
       }
 
+      // v0.11.2 — Plain Enter intercept (Mac+Claude Code v2.1+ submit fix)
+      // ------------------------------------------------------------------
+      // xterm.js's default Enter behavior writes a bare \\r to the PTY. On
+      // macOS that breaks Claude Code v2.1+ because Claude activates
+      // win32-input-mode (CSI ?9001h) even on darwin and reinterprets bare \\r
+      // as Shift+Enter — the directive sits in the input buffer un-submitted
+      // and the leader hangs in "Sautéed for Ns" forever. Field-confirmed
+      // 2026-04-25 with Antigravity webview + Claude Code v2.1.119.
+      //
+      // Intercept here, mirror lineBuffer history bookkeeping that the
+      // term.onData('\\r') branch would have done, then route through
+      // 'auto-send' so the extension's autoSendToEntry can emit the proper
+      // KEY_EVENT submit (or bare \\r on Linux). Modifier-laden Enters
+      // (Ctrl/Cmd, Alt, Shift, IME composing) bypass this and fall through
+      // to xterm so existing shortcuts and IME behavior stay intact.
+      if (
+        event.key === 'Enter' &&
+        !mod &&
+        !event.shiftKey &&
+        !event.altKey &&
+        !event.isComposing
+      ) {
+        event.preventDefault();
+        if (lineBuffer.trim().length > 0) {
+          if (
+            inputHistory.length === 0 ||
+            inputHistory[inputHistory.length - 1] !== lineBuffer.trim()
+          ) {
+            inputHistory.push(lineBuffer.trim());
+            if (inputHistory.length > 100) inputHistory.shift();
+          }
+        }
+        lineBuffer = '';
+        historyIndex = -1;
+        currentLine = '';
+        vscode.postMessage({ type: 'auto-send', text: '' });
+        return false;
+      }
+
       // Ctrl+C: document-level capture does the copy, but keep a belt-and-
       // suspenders guard here: if a selection exists, tell xterm NOT to
       // process the event (return false). This blocks xterm from sending
