@@ -1,3 +1,34 @@
+> ## ⚠️ This project is no longer maintained
+>
+> **Podium has been frozen at v0.16.0** and will not receive further updates.
+>
+> Active development has returned to its predecessor:
+> **[rockuen/cli-launcher-for-claude](https://github.com/rockuen/cli-launcher-for-claude)**.
+>
+> After working on Podium for a few weeks, we decided that **adding OMC
+> (Oh-My-Claudecode) integration on top of `CLI launcher for claude` is a
+> cleaner path than maintaining Podium as a separate product**. The launcher
+> already provides everything Podium tried to be — session management, themes,
+> rich terminal — and OMC features will land there instead.
+>
+> 👉 **Latest stable build:** [CLI launcher for claude releases](https://github.com/rockuen/cli-launcher-for-claude/releases)
+>
+> ---
+>
+> ### 🇰🇷 한국어
+>
+> Podium 프로젝트는 **v0.16.0 시점에서 동결**되었으며 더 이상 업데이트되지 않습니다.
+>
+> 개발은 원래의 모태인 **[CLI launcher for claude](https://github.com/rockuen/cli-launcher-for-claude)**
+> 로 돌아갑니다. Podium에서 시도했던 멀티 에이전트 / OMC 기능들을
+> **별도 제품이 아니라 CLI launcher for claude의 확장 기능으로 추가**하는 것이
+> 더 좋은 방향이라고 판단했습니다. 런처 자체가 이미 충분한 베이스(세션 관리,
+> 테마, 리치 터미널)를 갖추고 있어 OMC 기능을 그 위에 얹는 것이 자연스럽습니다.
+>
+> 👉 **최신 빌드:** [CLI launcher for claude releases](https://github.com/rockuen/cli-launcher-for-claude/releases)
+
+---
+
 <p align="center">
   <img src="icons/icon-128.png" alt="Podium" width="96" height="96"/>
 </p>
