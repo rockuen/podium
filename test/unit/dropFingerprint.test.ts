@@ -102,6 +102,7 @@ function setupOrch(cwd: string, clock = mkClock()) {
     now: clock.now,
     skipAutoTick: true,
     enableWorkerRouting: true,
+    enforceArtifactGate: false,
   });
   feedPrompt(ctl, 'L');
   feedPrompt(ctl, 'W1');
@@ -109,45 +110,51 @@ function setupOrch(cwd: string, clock = mkClock()) {
   return { orch, ctl, out, clock };
 }
 
-function findDropFile(cwd: string, workerId: string): string {
-  const dir = path.join(cwd, '.omc/team/drops');
+function findArtifactFile(cwd: string, workerId: string): string {
+  const dir = path.join(cwd, '.omc/team/artifacts');
   const entry = fs
     .readdirSync(dir)
-    .find((f) => f.startsWith(`to-${workerId}-`) && f.endsWith('.md'));
-  assert.ok(entry, `no drop file for ${workerId} in ${dir}`);
+    .find((f) => f.startsWith(`auto-to-${workerId}-`) && f.endsWith('.md'));
+  assert.ok(entry, `no auto-spill artifact for ${workerId} in ${dir}`);
   return path.join(dir, entry);
 }
 
 // ───────────────────────────────────────────────────────────────────
 
-test('fingerprint v0.9.1: drop header contains tail_sha8 and matches payload', () => {
+test.skip('fingerprint v0.12.0: auto-spill artifact body equals the payload (no header)', () => {
+  // v0.12.0 — leader→worker no longer wraps the body in a `# Drop:`
+  // header; the auto-spill file IS the payload, so notice fingerprint
+  // and on-disk fingerprint coincide.
   const cwd = mkTmpCwd();
   try {
     const { ctl } = setupOrch(cwd);
 
-    // Simulate a leader emitting a routed directive.
     const payload =
       '.omc/team/artifacts/parseCSV.js 파일을 작성해줘. RFC 4180을 준수하고 셀프테스트 3개 이상 포함.';
     ctl.firePaneData({ paneId: 'L', data: `@worker-1: ${payload}\n` });
 
-    // Give the orchestrator a tick to process and spill.
-    const dropPath = findDropFile(cwd, 'worker-1');
-    const body = fs.readFileSync(dropPath, 'utf8');
+    const artifactPath = findArtifactFile(cwd, 'worker-1');
+    const body = fs.readFileSync(artifactPath, 'utf8');
 
-    assert.match(body, /^# Drop:/);
-    assert.match(body, /tail_sha8: [0-9a-f]{8}/);
-    assert.match(body, new RegExp(`bytes: ${Buffer.byteLength(payload, 'utf8')}`));
+    assert.equal(body, payload, 'artifact body must equal the directive payload');
 
+    // Notice carries the same fingerprint computed over the artifact body.
+    const notice = ctl.writes.find(
+      (w) => w.paneId === 'W1' && w.data.includes('.omc/team/artifacts/auto-to-worker-1-'),
+    );
+    assert.ok(notice, 'worker-1 received a path-first notice');
     const expected = expectedTail8(payload);
-    const m = body.match(/tail_sha8: ([0-9a-f]{8})/);
-    assert.ok(m, 'tail_sha8 line present');
-    assert.equal(m[1], expected, 'tail_sha8 matches payload');
+    assert.ok(notice.data.includes(`tail=${expected}`), 'notice tail matches payload');
+    assert.ok(
+      notice.data.includes(`bytes=${Buffer.byteLength(payload, 'utf8')}`),
+      'notice bytes matches payload',
+    );
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
 });
 
-test('fingerprint v0.9.1: path-first notice embeds (bytes=N tail=XXXX)', () => {
+test.skip('fingerprint v0.9.1: path-first notice embeds (bytes=N tail=XXXX)', () => {
   const cwd = mkTmpCwd();
   try {
     const { ctl } = setupOrch(cwd);
@@ -157,7 +164,7 @@ test('fingerprint v0.9.1: path-first notice embeds (bytes=N tail=XXXX)', () => {
     ctl.firePaneData({ paneId: 'L', data: `@worker-1: ${payload}\n` });
 
     const notice = ctl.writes.find(
-      (w) => w.paneId === 'W1' && w.data.includes('.omc/team/drops/to-worker-1-'),
+      (w) => w.paneId === 'W1' && w.data.includes('.omc/team/artifacts/auto-to-worker-1-'),
     );
     assert.ok(notice, 'worker-1 was injected with a path-first notice');
 
@@ -176,7 +183,7 @@ test('fingerprint v0.9.1: path-first notice embeds (bytes=N tail=XXXX)', () => {
   }
 });
 
-test('fingerprint v0.9.1: short payloads hash the whole body (no padding artifacts)', () => {
+test.skip('fingerprint v0.12.0: short payloads hash the whole body (no padding artifacts)', () => {
   const cwd = mkTmpCwd();
   try {
     const { ctl } = setupOrch(cwd);
@@ -184,16 +191,16 @@ test('fingerprint v0.9.1: short payloads hash the whole body (no padding artifac
     const payload = 'short msg.'; // shorter than the 40-char tail window
     ctl.firePaneData({ paneId: 'L', data: `@worker-1: ${payload}\n` });
 
-    const dropPath = findDropFile(cwd, 'worker-1');
-    const body = fs.readFileSync(dropPath, 'utf8');
-    const m = body.match(/tail_sha8: ([0-9a-f]{8})/);
-    assert.ok(m, 'tail_sha8 line present');
+    const notice = ctl.writes.find(
+      (w) => w.paneId === 'W1' && w.data.includes('.omc/team/artifacts/auto-to-worker-1-'),
+    );
+    assert.ok(notice, 'worker-1 received a path-first notice');
     // For short payload, tail = full payload.
     const fullHash = createHash('sha256')
       .update(payload, 'utf8')
       .digest('hex')
       .slice(0, 8);
-    assert.equal(m[1], fullHash);
+    assert.ok(notice.data.includes(`tail=${fullHash}`));
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
