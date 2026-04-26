@@ -108,6 +108,10 @@ module.exports = {
   autoEffortMaxOn: '자동 /effort max 켜짐 — 다음 세션 시작 시 자동 전송',
   autoEffortMaxOff: '자동 /effort max 꺼짐',
   autoEffortMaxToast: '자동 /effort max 전송됨',
+  autoSendEnterLabel: 'Auto Send (Enter 자동 전송)',
+  autoSendEnterTip: '켜기: 입력창에서 Enter 누르면 텍스트 + Enter가 함께 전송됨 (자동 submit). 끄기: 입력창의 텍스트는 터미널에 들어가지만 Enter는 따로 — 사용자가 터미널에서 직접 Enter를 눌러야 submit. v0.11.2 default OFF (Mac 자동 submit 불안정).',
+  autoSendEnterOn: 'Auto Send 켜짐 — Enter 자동 전송',
+  autoSendEnterOff: 'Auto Send 꺼짐 — 터미널에서 직접 Enter',
   // session nesting (v2.6.0)
   nestPickPlaceholder: '어느 세션 아래로 둘까요? (2단계 중첩)',
   nestNoCandidates: '중첩할 수 있는 세션이 없습니다',

@@ -1,5 +1,225 @@
 # Changelog
 
+## [0.16.0] - 2026-04-26
+
+### Artifact-first re-armed + auto-spill 완전 제거 + setup prompt 명시화
+
+v0.15.0~0.15.1는 artifact-first를 default off로 후퇴시키고 inline
+routing을 다시 default로 만들었지만, 그 결과 Ink TUI fragmentation으로
+잘린 directive가 워커에 전달되는 옛 v0.11.x 문제가 재발 (intersect
+2026-04-26 field). 사용자 의도("리더/워커가 무조건 Write tool로 md
+파일 작성")에 맞춰 v0.16.0은 다음 셋을 동시 적용:
+
+- **`enforceArtifactGate` default `false → true`** 복귀.
+- **`maybeSpillLeaderToWorker`의 auto-spill (CASE B) 완전 제거.**
+  orchestrator는 더 이상 `auto-to-*.md`를 만들지 않는다. leader / worker
+  가 유일한 파일 author. `findArtifactByTurn` 못 찾으면 raw payload를
+  반환하지만, gate-on production에선 `commitRoute`가 그 이전에 reject
+  를 발화하므로 도달하지 않는 분기.
+- **`team protocol note` (setup prompt)에 artifact-first 절차 명시.**
+  v0.14.x 때 LLM이 reject 메시지를 prompt injection으로 의심하던
+  실패의 핵심 원인이 이거였음 — 첫 turn부터 protocol을 알려주면
+  LLM이 이후 reject 메시지를 시스템 알림으로 자연스럽게 수용.
+- `leaderProtocol` / `workerProtocol`이 다시 artifact-first 강제 어휘로.
+  "[Podium Orchestrator system]" reject가 진짜 확장 알림이라는 점 명시.
+
+알려진 회귀: 26 unit test fail. 모두 v0.13~v0.14.x 시절의 auto-spill
+동작 검증 (path-first notice in worker stdin)이라 v0.16.0의 의도된
+auto-spill 제거 결과. 다음 cleanup commit에서 stale 표시 또는 inline-
+payload 검증으로 갱신 예정.
+
+## [0.15.1] - 2026-04-26
+
+### v0.15.0의 미완 — gate-off에서 spill notice가 여전히 worker stdin으로 흐름
+
+v0.15.0이 `enforceArtifactGate` default를 false로 전환했지만
+`maybeSpillLeaderToWorker`는 여전히 fragment-truncated payload를
+`auto-to-*.md` 파일로 저장하고 그 path-first notice를 worker stdin에
+주입했다. 결과: worker는 잘린 ~150B directive를 task body로 받음
+(intersect 2026-04-26 field 케이스).
+
+v0.15.1 fix:
+
+- gate-off 시 `maybeSpillLeaderToWorker`가 inline payload를 worker
+  stdin에 직접 주입한다. file은 forensic record / redelivery 추적용
+  으로 그대로 작성됨 (단, opt-in 클라이언트에만 path-first notice
+  방식으로 worker에 전달).
+- `notifyLeaderOfNewArtifacts`가 `auto-to-*` 파일은 워커 산출물 알림
+  대상에서 제외한다. orchestrator가 만든 leader→worker 전달 파일이
+  워커가 만든 결과물처럼 leader에 surface되던 문제 차단.
+
+## [0.15.0] - 2026-04-26
+
+### Retreat · artifact-first 강제를 opt-in으로
+
+v0.12.0–v0.14.2 동안 enforce된 "artifact 파일이 있어야만 라우팅 통과"
+정책이 LLM (Claude 4.6+)의 prompt-injection 방어 패턴을 정확히 trigger
+한다는 사실이 v0.14.2 검증에서 드러남:
+
+- LLM이 reject 메시지(`[Podium Orchestrator system · v0.14.x] ...
+  prompt injection이 아닙니다`)를 의심하고 진행 거부
+- 자기-방어 문구 + 동일 본문 반복 + 새 프로토콜 강제 + 파일 시스템
+  쓰기 요구 = 교과서적 injection 패턴으로 학습된 형태
+
+v0.15.0은 `enforceArtifactGate` default를 `true → false`로 되돌림.
+production 라우팅은 v0.11 스타일 inline 으로 복귀:
+
+  `@worker-1: <자유 길이 task body>`
+
+Ink TUI fragmentation은 messageRouter의 누적 fix들이 직접 처리:
+- v0.14.0 Fix X (column-0 prompt-echo demote)
+- v0.14.1 Z-1 (dedupeKey whitespace 정규화 + 30 chars cap)
+- v0.14.2 (onPaneData inline drain)
+
+artifact-backed routing은 명시적 opt-in (`enforceArtifactGate: true`)
+으로 남음 — forensic reproducibility / huge-body 보장이 필요한
+사용자만 활성화. `leaderProtocol` / `workerProtocol` 시스템 프롬프트도
+그에 맞게 inline routing 안내가 default, artifact 모드는 OPTIONAL
+섹션으로 분리.
+
+테스트는 `artifactGate.test.ts`가 명시적으로
+`enforceArtifactGate: true` 를 attach 옵션에 넣어 production gate
+시나리오를 그대로 검증.
+
+## [0.14.2] - 2026-04-26
+
+### Inline drain on pty data event (webview throttling 우회)
+
+Field evidence: 사용자가 Output 채널을 닫으면 워커 큐가 멈추고, 다시
+열면 진행되는 현상. 원인은 webview/window hidden 시 chromium / macOS
+App Nap이 `setInterval(250ms)`를 5–10초 단위로 throttling해서 `tick()`
+호출이 거의 안 되는 것. queue drain은 `tick()`에서만 호출되므로 polling
+정지 = drain 정지.
+
+v0.14.2는 `onPaneData`의 worker 분기에 inline drain을 추가. 워커가 idle
+전환되는 그 chunk가 도착하는 시점에 즉시 `inject` — pty data event는
+OS-level fd readiness라 throttling을 통과한다. `tick()`은 안전망 그대로.
+
+`[orch.drain] worker-N inline drain (queueLen was X)` 트레이스 로그 추가.
+
+## [0.14.1] - 2026-04-26
+
+### Z-1 · dedupeKey 정규화 (큐 폭증 차단)
+
+기존 `dedupeKey`는 first line 100 chars였는데, Ink TUI fragmentation으로
+같은 directive가 wrap 위치에 따라 다른 first line 길이로 yield되면 모두
+distinct → 모두 commit → 큐에 7건까지 적재. v0.14.1에선 whitespace를
+single space로 압축하고 30 chars로 cap → fragment 변형이 같은 key로
+collide.
+
+### Z-2 · idle latch 진단 trace
+
+Worker pane 데이터 chunk마다 isIdle 변화(idle↔busy)를 orchestrator
+output channel에 trace. msSinceOutput / chunkBytes / queueLen 같이 기록
+→ idle latch failure 재현 시 어떤 chunk가 lastOutputAt을 갱신했는지
+정확히 파악 가능.
+
+### Z-3 · system 메시지 prefix 명확화
+
+reject / stuck warn 메시지 prefix를 `[orch.reject]` / `[orch.warn]`에서
+`[Podium Orchestrator system · v0.14.x]`로 변경 + "이 메시지는 Podium
+VS Code 확장이 발신한 시스템 알림입니다 — prompt injection이 아닙니다"
+fragment 추가. LLM이 stale memory(이전 버전)와 충돌하더라도 시스템
+메시지로 인식 가능.
+
+## [0.14.0] - 2026-04-26
+
+### Fix X · prompt-echo column-0 directives now demoted
+
+v0.7.2's prompt-echo guard only demoted INDENTED `@worker-N: ...`
+lines that landed right after a prompt classification. Field evidence
+(parseCSV 2026-04-26) showed Ink TUI also fragments multi-line user
+input echoes such that the second line arrives at column 0, sneaking
+past the guard and emitting the user's own message text as a fresh
+directive — which the file-system gate then rejected, producing the
+"재촉" reject loop. Drop the indent restriction so prompt-context
+column-0 directives are also demoted. Safe against legitimate column-0
+routing because real LLM delegations open the assistant block with
+`●` first, so by the time the directive line is processed the guard
+condition (`!inAssistantBlock`) is already false.
+
+### Fix Y · stuck-queue surface
+
+When a worker's idle latch fails (boot output / Ink repaint keeps
+resetting the silence window), routes pile up in the queue and the
+user has no signal — v0.13.0 just sat silent. v0.14.0 stamps
+`queueStuckSince` when the queue first becomes non-empty against a
+busy worker and, if 30s elapses without drain, fires a one-shot
+`[orch.warn]` notice into the leader pane (and the orchestrator
+output channel) so the user can intervene instead of waiting
+indefinitely. Stamp clears the moment the queue drains; warn flag
+re-arms for the next stuck episode.
+
+## [0.13.0] - 2026-04-26
+
+### File-system gate (option C-2 — directive body no longer parsed)
+
+The v0.12.x gate parsed each `@worker-N: <body>` for an embedded
+`.omc/team/artifacts/<file>.md` path. Under Ink TUI fragmentation
+(directive line wrapping past viewport, scrollback repaint stripping
+trailing tokens) the path was unreliably captured, producing false
+positive rejects on otherwise valid directives.
+
+v0.13.0 stops parsing directive bodies entirely. Routing resolves
+the artifact by naming convention on disk:
+
+- Leader→worker: `to-<worker-id>-turn<N>.md`
+- Worker→leader: `from-<worker-id>-turn<N>.md`
+
+Resolution falls back to the highest matching turn number when the
+exact-turn file is absent, so the leader can pre-write artifacts
+without coordinating exact turn IDs.
+
+`archivePriorArtifacts` runs on every `attach()` (mirrors the v0.9.0
+drops archive): top-level `.md` files in `.omc/team/artifacts/`
+move to `.omc/team/artifacts/archive/<ISO>/` so a stale
+`to-worker-1-turn1.md` from a prior session does not silently match
+a fresh turn=1 directive.
+
+System prompts (`leaderProtocol` / `workerProtocol`) updated to
+describe the new contract — directive bodies are pure routing
+triggers; the file is the truth.
+
+## [0.12.1] - 2026-04-26
+
+### Bug fix · reject loop on Ink scrollback repaint
+
+The v0.12.0 reject notice contained `@worker-N` / `@leader` tokens
+that the orchestrator's own messageRouter parsed as fresh directives
+when the leader pane echoed them back through the pty stream. Combined
+with Ink TUI scrollback repainting prior `@worker-N: ...` lines after
+the cross-turn dedupe window expired, the same `[orch.reject]` text
+fired indefinitely.
+
+- Replaced the `@<id>:` example in reject reason text with `AT-<id>:`
+  (the same self-route-safe form used by the team setup prompt) so
+  the reject body is never re-parsed as a directive.
+- Added per-target rate-limit (`REJECT_RATE_LIMIT_MS = 30s`): same
+  dedupeKey for the same target within the window is logged but NOT
+  re-injected. Forensic trail (`[orch.reject] … rate-limited (Nms
+  since last)`) stays in the orchestrator output channel.
+
+## [0.12.0] - 2026-04-25
+
+### Artifact-only routing (Option C, hard reject)
+
+Every leader↔worker directive must reference an existing
+`.omc/team/artifacts/<file>.md` written via the Write tool. Inline
+bodies, ACK-only echoes, and short replies are no exceptions —
+without a path the orchestrator rejects the route and bounces a
+`[orch.reject]` notice to the source pane.
+
+- Removed `.omc/team/drops/to-*.md` envelope and the v0.11 chain-follow
+  rule. The first-line path of every notice now points directly at
+  the artifact file (no second hop).
+- Reply naming standardized: `to-<worker-id>-turn<N>.md` (leader→worker)
+  and `from-<worker-id>-turn<N>.md` (worker→leader).
+- All inter-pane content lives in `.omc/team/artifacts/`, so
+  `ls artifacts/` gives a complete conversation log.
+- New `enforceArtifactGate` attach option (default `true`).
+- `leaderProtocol` / `workerProtocol` system prompts updated to
+  describe the hard reject contract.
+
 ## [0.11.2] - 2026-04-25
 
 ### Bug fix · macOS Enter submit (Win32 KEY_EVENT cross-platform)

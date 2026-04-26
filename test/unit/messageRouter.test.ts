@@ -114,17 +114,49 @@ test('router v0.8.7: short directive at end-of-buffer still yields (no hold regr
   assert.equal(msgs[0].payload, 'say ok.');
 });
 
-test('router v0.8.7: held partial is released by flush on leader idle', () => {
-  // If the continuation never arrives (e.g. leader stops emitting),
-  // the held partial must still surface via flush() on the idle edge.
+test('router v0.11.2: wrap-suspect partial is HELD by flush (not released)', () => {
+  // v0.8.7 originally released held partials on flush so the leader-idle
+  // edge surfaced any dangling token. Field finding 2026-04-25 (parseCSV
+  // 52B truncation) showed that path POISONS the dedupe map: idleDetector
+  // briefly mis-reads inter-chunk silence as "leader idle", flush() yields
+  // the truncated first chunk, dispatch commits it, and any longer
+  // continuation is dedup-dropped under the same first-line key. v0.11.2
+  // flips the policy: a wrap-suspect partial (newline buffer-last + no
+  // terminal punctuation + ≥30 chars) STAYS HELD across flush. The next
+  // feed() either completes the payload or the dispatch wall-clock cap
+  // surfaces it via the dispatch path with the latest accumulated bytes.
   const p = new WorkerPatternParser();
   const msgs = p.feed(
     '@worker-1: implement reverseString with Intl.Segmenter and full test coverage,\n',
   );
   assert.equal(msgs.length, 0, 'hold until further data');
   const flushed = p.flush();
+  assert.equal(flushed.length, 0, 'wrap-suspect partial must stay held on flush');
+});
+
+test('router v0.11.2: sentence-complete partial without newline is released by flush', () => {
+  // The held-partial fallback is preserved for the safe shape: payload ends
+  // with terminal punctuation (no Ink wrap risk) AND no trailing newline
+  // (so the wrap-suspect "newline buffer-last" guard never fires). flush()
+  // surfaces it as before.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: implement reverseString and run all tests.');
+  assert.equal(msgs.length, 0, 'no terminator yet');
+  const flushed = p.flush();
   assert.equal(flushed.length, 1);
-  assert.match(flushed[0].payload, /Intl\.Segmenter/);
+  assert.match(flushed[0].payload, /run all tests\.$/);
+});
+
+test('router v0.11.2: short partial without newline released by flush', () => {
+  // Short dangling tokens (no trailing newline) bypass the new wrap-suspect
+  // hold because endsWithNewline is false. The legacy "dangling-single-line
+  // token surfaces on flush" path is preserved for this safe shape.
+  const p = new WorkerPatternParser();
+  const msgs = p.feed('@worker-1: short task');
+  assert.equal(msgs.length, 0, 'no terminator');
+  const flushed = p.flush();
+  assert.equal(flushed.length, 1);
+  assert.match(flushed[0].payload, /short task/);
 });
 
 // ─────────────────────────────────────────────────────────────────────

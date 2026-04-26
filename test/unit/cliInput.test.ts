@@ -9,35 +9,37 @@ import {
 
 const { WIN32_ENTER_SUBMIT, WIN32_SHIFT_ENTER } = __testing;
 
-test('cliInput: needsWin32KeyEvents — claude on win32 + darwin (v0.11.2)', () => {
-  // v0.11.2 — Field evidence (2026-04-25, Antigravity + Claude Code v2.1.119):
-  // Claude Code v2.1+ activates win32-input-mode on macOS as well. The
-  // "win32-only" assumption from v2.7.x silently broke Mac Enter submit
-  // (pty.write('\r') was reinterpreted as Shift+Enter, leader stuck Sautéed
-  // forever). darwin must take the KEY_EVENT path, same as win32.
+test('cliInput: needsWin32KeyEvents — claude on win32 only', () => {
+  // v0.11.2 final — darwin REVERTED to the bare-CR POSIX path. A mid-cycle
+  // hypothesis promoted darwin to the KEY_EVENT path on the assumption that
+  // Claude Code v2.1+ activated win32-input-mode on macOS, but field testing
+  // 2026-04-25 falsified that: Mac+Claude accepts bare \r as submit and
+  // silently drops KEY_EVENT bytes (treats them as a no-op ANSI escape),
+  // which is why textarea-Send under the broken hypothesis showed "text
+  // arrived but Enter never fired" while xterm direct \r worked. The
+  // race fix that does live in autoSend.js (writePtyChunked + setTimeout
+  // submit) handles the separate body/submit flush race seen even on POSIX.
   assert.equal(needsWin32KeyEvents({ agent: 'claude', platform: 'win32' }), true);
-  assert.equal(needsWin32KeyEvents({ agent: 'claude', platform: 'darwin' }), true);
-  // Linux retains the POSIX bare-CR path until field evidence proves otherwise.
+  assert.equal(needsWin32KeyEvents({ agent: 'claude', platform: 'darwin' }), false);
   assert.equal(needsWin32KeyEvents({ agent: 'claude', platform: 'linux' }), false);
-  // Non-Claude CLIs do not enable win32-input-mode on any platform.
   assert.equal(needsWin32KeyEvents({ agent: 'codex', platform: 'win32' }), false);
   assert.equal(needsWin32KeyEvents({ agent: 'codex', platform: 'darwin' }), false);
   assert.equal(needsWin32KeyEvents({ agent: 'gemini', platform: 'win32' }), false);
   assert.equal(needsWin32KeyEvents({ agent: 'gemini', platform: 'darwin' }), false);
 });
 
-test('cliInput: Linux claude single-line — plain CR suffix (POSIX path retained)', () => {
-  const p = buildSubmitPayload('hello', { agent: 'claude', platform: 'linux' });
+test('cliInput: POSIX claude single-line — plain CR suffix', () => {
+  const p = buildSubmitPayload('hello', { agent: 'claude', platform: 'darwin' });
   assert.equal(p, 'hello\r');
 });
 
-test('cliInput: Linux claude multi-line — LF separators + CR submit', () => {
+test('cliInput: POSIX claude multi-line — LF separators + CR submit', () => {
   const p = buildSubmitPayload('line one\nline two', { agent: 'claude', platform: 'linux' });
   assert.equal(p, 'line one\nline two\r');
 });
 
-test('cliInput: Linux strips trailing CR/LF from body (no double submit)', () => {
-  const p = buildSubmitPayload('hello\n\n\r', { agent: 'claude', platform: 'linux' });
+test('cliInput: POSIX strips trailing CR/LF from body (no double submit)', () => {
+  const p = buildSubmitPayload('hello\n\n\r', { agent: 'claude', platform: 'darwin' });
   assert.equal(p, 'hello\r');
 });
 
@@ -59,52 +61,36 @@ test('cliInput: Windows codex/gemini — raw LF/CR, no KEY_EVENT', () => {
   assert.equal(p2, 'hi\r');
 });
 
-test('cliInput v0.11.2: macOS claude single-line — KEY_EVENT submit (Mac fix)', () => {
-  // Mac+Claude must take the same KEY_EVENT path as Windows+Claude. Bare \r
-  // gets reinterpreted as Shift+Enter under Claude Code v2.1+ win32-input-mode
-  // even on macOS, leaving the directive in the input buffer un-submitted.
+test('cliInput: CRLF bodies normalized to LF joins', () => {
+  const p = buildSubmitPayload('a\r\nb\r\nc', { agent: 'claude', platform: 'darwin' });
+  assert.equal(p, 'a\nb\nc\r');
+});
+
+test('cliInput v0.11.2: macOS claude single-line uses bare CR (no KEY_EVENT)', () => {
+  // Regression marker for the reverted hypothesis — explicitly assert that
+  // Mac+Claude does NOT take the KEY_EVENT path. If a future patch promotes
+  // darwin again, this test must change in lockstep with cliInput.ts and a
+  // companion autoSend.js change.
   const p = buildSubmitPayload('hello', { agent: 'claude', platform: 'darwin' });
-  assert.equal(p, 'hello' + WIN32_ENTER_SUBMIT);
+  assert.equal(p, 'hello\r');
+  assert.ok(!p.includes(WIN32_ENTER_SUBMIT));
   assert.ok(!p.includes(WIN32_SHIFT_ENTER));
 });
 
-test('cliInput v0.11.2: macOS claude multi-line — SHIFT_ENTER between, ENTER submit at end', () => {
+test('cliInput v0.11.2: macOS claude multi-line uses LF + CR (no KEY_EVENT)', () => {
   const p = buildSubmitPayload('a\nb\nc', { agent: 'claude', platform: 'darwin' });
-  assert.equal(p, 'a' + WIN32_SHIFT_ENTER + 'b' + WIN32_SHIFT_ENTER + 'c' + WIN32_ENTER_SUBMIT);
+  assert.equal(p, 'a\nb\nc\r');
+  assert.ok(!p.includes(WIN32_SHIFT_ENTER));
 });
 
-test('cliInput v0.11.2: macOS codex/gemini — bare CR (Mac fix is Claude-specific)', () => {
-  // Codex / Gemini CLIs do not enable win32-input-mode anywhere. The Mac
-  // KEY_EVENT promotion must remain Claude-scoped to avoid breaking other CLIs.
+test('cliInput v0.11.2: macOS codex/gemini bare CR (Mac path is uniform)', () => {
   const p1 = buildSubmitPayload('hi', { agent: 'codex', platform: 'darwin' });
   assert.equal(p1, 'hi\r');
   const p2 = buildSubmitPayload('hi\nthere', { agent: 'gemini', platform: 'darwin' });
   assert.equal(p2, 'hi\nthere\r');
 });
 
-test('cliInput v0.11.2: macOS claude CRLF bodies normalize to KEY_EVENT path', () => {
-  const p = buildSubmitPayload('a\r\nb\r\nc', { agent: 'claude', platform: 'darwin' });
-  assert.equal(p, 'a' + WIN32_SHIFT_ENTER + 'b' + WIN32_SHIFT_ENTER + 'c' + WIN32_ENTER_SUBMIT);
-});
-
-test('cliInput: Linux claude CRLF bodies normalize to LF joins', () => {
-  const p = buildSubmitPayload('a\r\nb\r\nc', { agent: 'claude', platform: 'linux' });
-  assert.equal(p, 'a\nb\nc\r');
-});
-
-test('cliInput: submitToPty Linux claude writes bare-CR payload', () => {
-  const log: string[] = [];
-  const fakePty = {
-    write(d: string) {
-      log.push(d);
-    },
-  };
-  const r = submitToPty(fakePty, 'hello', { agent: 'claude', platform: 'linux' });
-  assert.deepEqual(r, { ok: true });
-  assert.deepEqual(log, ['hello\r']);
-});
-
-test('cliInput v0.11.2: submitToPty macOS claude writes KEY_EVENT payload', () => {
+test('cliInput: submitToPty writes payload and returns ok', () => {
   const log: string[] = [];
   const fakePty = {
     write(d: string) {
@@ -113,7 +99,7 @@ test('cliInput v0.11.2: submitToPty macOS claude writes KEY_EVENT payload', () =
   };
   const r = submitToPty(fakePty, 'hello', { agent: 'claude', platform: 'darwin' });
   assert.deepEqual(r, { ok: true });
-  assert.deepEqual(log, ['hello' + WIN32_ENTER_SUBMIT]);
+  assert.deepEqual(log, ['hello\r']);
 });
 
 test('cliInput: submitToPty captures thrown errors', () => {
@@ -126,7 +112,7 @@ test('cliInput: submitToPty captures thrown errors', () => {
   assert.deepEqual(r, { ok: false, error: 'broken pipe' });
 });
 
-test('cliInput: KEY_EVENT sequences match MS ConPTY spec (sanity)', () => {
+test('cliInput: KEY_EVENT sequences match MS ConPTY spec (sanity, retained from v2.7.x)', () => {
   // vk=13, sc=28, repeat=1; uc=13 & cs=0 for submit; uc=10 & cs=16 for Shift+Enter
   assert.equal(WIN32_ENTER_SUBMIT, '\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_');
   assert.equal(WIN32_SHIFT_ENTER, '\x1b[13;28;10;1;16;1_\x1b[13;28;10;0;16;1_');

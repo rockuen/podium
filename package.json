@@ -2,7 +2,7 @@
   "name": "podium",
   "displayName": "Podium — Multi-Agent Stage for Claude Code",
   "description": "Orchestrate multi-agent Claude teams from one stage — leader + worker panes with structured routing, idle detection, team snapshots, and dissolve-with-summary. Or run a solo Claude Code session in a rich Webview tab. No external multiplexer required.",
-  "version": "0.11.2",
+  "version": "0.16.0",
   "keywords": [
     "claude",
     "claude-code",
@@ -704,6 +704,11 @@
           "type": "string",
           "default": "",
           "description": "Override path to the `claude` CLI for orchestration. Empty = auto-detect."
+        },
+        "claudeCodeLauncher.autoSendEnter": {
+          "type": "boolean",
+          "default": false,
+          "description": "When ON, pressing Enter in the input panel writes the text to the terminal AND auto-submits to Claude. When OFF, the text is only inserted into the terminal — you press Enter directly inside the terminal to submit. v0.11.2 default = OFF on every platform because Mac auto-submit is currently unstable (Claude Code v2.1+ readline race); flip ON if your platform delivers Enter reliably."
         }
       }
     },

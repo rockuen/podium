@@ -37,6 +37,22 @@
 //            This helper now uses KEY_EVENT on darwin + win32, and the
 //            v2.6.24-era "non-Podium multi-line" gap is closed by joining
 //            embedded newlines with SHIFT_ENTER on those platforms.
+//
+//            v0.11.2 ALSO splits body + submit across a setTimeout boundary
+//            and routes through writePtyChunked. Field finding 2026-04-25:
+//            even the textarea Send path (single Claude Code session, no
+//            Podium team) intermittently dropped the submit — text arrived
+//            in the input buffer but Enter never fired. Same race
+//            cliInput.ts splitSubmitPayload documents (Windows v2.7.12 +
+//            macOS v0.11.2): when body+submit go out as one pty.write,
+//            ConPTY/PTY layer can flush only part before Claude Ink reads,
+//            so the trailing Enter byte is absorbed by the wrong line of
+//            the readline state machine. Splitting them with writePtyChunked
+//            (per-entry serialization queue) + a small delay gives PTY time
+//            to drain the body before submit arrives.
+
+const vscode = require('vscode');
+const { writePtyChunked } = require('./write');
 
 const ESC = '\x1b';
 // Win32-input-mode KEY_EVENT pairs, mirrored byte-for-byte from
@@ -60,8 +76,40 @@ const WIN32_SHIFT_ENTER =
  * panel, gate on `entry.agent === 'claude'` here.
  */
 function needsWin32KeyEvents() {
-  const plat = process.platform;
-  return plat === 'win32' || plat === 'darwin';
+  // v0.11.2 final — darwin reverted to bare CR. See cliInput.ts comment for
+  // the "broken hypothesis" history. Mac+Claude accepts bare \r as submit
+  // and silently drops KEY_EVENT bytes, so darwin must NOT take the KEY_EVENT
+  // path. The race fix (writePtyChunked + setTimeout submit) below handles
+  // the separate body/submit flush race that was the actual Mac symptom.
+  return process.platform === 'win32';
+}
+
+// v0.11.2 — body→submit split delay. cliInput.ts splitSubmitPayload's macrotask
+// hint generalized to ms because writePtyChunked is itself a 20ms-per-chunk
+// pacer (queue-serialized), and a single setImmediate often returns before
+// the body's last chunk has been drained. 30ms covers up to one chunk of
+// body (256B headroom) before submit is queued. Tuned with cliInput.ts
+// splitSubmitPayload caller in PodiumOrchestrator (which uses setTimeout(0)
+// because that path's body is already chunked through panel.writeToPane).
+const SUBMIT_DELAY_MS = 30;
+
+/**
+ * v0.11.2 — User-toggleable auto-submit setting.
+ * When false (default), this helper writes the body to the terminal but skips
+ * the trailing Enter — the user presses Enter inside the terminal to submit.
+ * When true, the trailing submit byte is appended (race-safe: split + delay).
+ *
+ * Default false because v0.11.2 field testing showed Mac auto-submit is
+ * unstable (Claude Code v2.1+ readline race) — making the user the explicit
+ * trigger is currently more reliable than any in-process workaround.
+ */
+function isAutoSendEnabled() {
+  try {
+    const cfg = vscode.workspace.getConfiguration('claudeCodeLauncher');
+    return cfg.get('autoSendEnter', false) === true;
+  } catch (_) {
+    return false;
+  }
 }
 
 function autoSendToEntry(entry, text) {
@@ -70,14 +118,36 @@ function autoSendToEntry(entry, text) {
   // Strip any trailing CR/LF — this helper is responsible for appending Enter.
   const body = String(text).replace(/[\r\n]+$/, '');
   try {
-    let payload;
-    if (needsWin32KeyEvents()) {
-      const lines = body.split(/\r?\n/);
-      payload = lines.join(WIN32_SHIFT_ENTER) + WIN32_ENTER_SUBMIT;
-    } else {
-      payload = body + '\r';
+    const autoSubmit = isAutoSendEnabled();
+    const submit = needsWin32KeyEvents() ? WIN32_ENTER_SUBMIT : '\r';
+    const bodyPayload = needsWin32KeyEvents()
+      ? body.split(/\r?\n/).join(WIN32_SHIFT_ENTER)
+      : body;
+
+    // autoSendEnter=false: body only, the user submits with Enter inside the
+    // terminal. Empty body + autoSubmit=false is a no-op (nothing to insert,
+    // no Enter to fire) — silently skip.
+    if (!autoSubmit) {
+      if (bodyPayload.length > 0) writePtyChunked(entry, bodyPayload);
+      return;
     }
-    entry.pty.write(payload);
+
+    if (bodyPayload.length > 0) {
+      // Body first via writePtyChunked (per-entry queue + 256B chunks +
+      // 20ms pacing). Submit follows after the queue has had time to drain
+      // at least one chunk, preventing the v0.11.2 "text arrived, Enter
+      // didn't fire" race.
+      writePtyChunked(entry, bodyPayload);
+      setTimeout(() => {
+        if (entry.pty && !entry._disposed) {
+          writePtyChunked(entry, submit);
+        }
+      }, SUBMIT_DELAY_MS);
+    } else {
+      // Empty body (used by webview Enter-intercept callers when they want
+      // a bare submit). Single queued write — no race possible.
+      writePtyChunked(entry, submit);
+    }
   } catch (e) {
     console.warn('[auto-send] pty.write failed:', e && e.message);
   }

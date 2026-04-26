@@ -81,102 +81,91 @@ leader or a peer, emit a line starting at column zero:
 Format: literal '@', target, ':', space, message. The orchestrator
 delivers each directive to the target's stdin.
 
-DROP HANDLING (v0.8.0 — path-first format, v0.9.1 — fingerprint)
+INCOMING DIRECTIVE FORMAT (v0.12.0 — artifact-only routing)
 
-EVERY message you receive from the leader is now file-mediated. The
-orchestrator always writes the leader's directive to a file under
-".omc/team/drops/" and injects ONLY a short path-first notice into
-your stdin. The format is:
+EVERY message you receive from the leader is delivered as a single
+path-first notice. The first line is always:
 
-  .omc/team/drops/to-<your-id>-turn<N>-seq<S>.md (bytes=N tail=XXXX)
+  .omc/team/artifacts/<file>.md (bytes=N tail=XXXX)
 
   위 파일을 Read 해서 지시사항을 수행해 주세요.
 
-The FIRST LINE of every message you receive from the orchestrator is
-the file path followed by a "(bytes=N tail=XXXX)" fingerprint —
-UTF-8 byte count and an 8-hex-char SHA-8 of the directive's tail.
+The path always lives under ".omc/team/artifacts/" — never under
+".omc/team/drops/" anymore. The "(bytes=N tail=XXXX)" fingerprint is
+the UTF-8 byte count and an 8-hex-char SHA-8 of the file's tail.
 
 MANDATORY steps on every such message:
   1. Parse the first line: the path ends in ".md", then the
      fingerprint is inside parentheses.
   2. Call the Read tool on that exact path BEFORE doing anything else.
-  3. Treat the file's full contents as the leader's actual directive
-     and execute the task described there.
-  4. Reply to the leader normally via "@leader: <your answer>".
-  5. (v0.9.2 ACK) The FIRST TOKEN of your @leader reply body SHOULD
-     be an ACK echo of the fingerprint, copied verbatim:
+     The file IS the task body — there is NO chain to follow, NO
+     pointer to chase. Whatever is in that file is what the leader
+     wants you to do.
+  3. Execute the task.
+  4. (ACK) The FIRST TOKEN of your @leader reply SHOULD echo the
+     fingerprint verbatim:
 
        @leader: ACK bytes=<N> tail=<XXXX> <rest of your reply…>
 
-     The orchestrator compares this echo against the value it spilled
-     and raises "[orch.ack] MISMATCH" in its log if they differ —
-     letting the leader detect truncation in transit without
-     manual inspection. Missing or mismatching ACK does NOT block
-     your reply; this is advisory. Use bytes and tail EXACTLY as
-     they appeared in the notice — no recomputation, no rewording.
+     The orchestrator compares this against the spilled value and
+     logs "[orch.ack] MISMATCH" if they diverge. Use the values
+     EXACTLY as they appeared in the notice. Missing/mismatched ACK
+     is advisory, not blocking.
 
-  6. Your reply itself is NOT auto-spilled by default — use your own
-     Write tool for long answers and send "@leader: <path>" if you
-     need same-level reliability.
+If you ever see a message whose first line is NOT a
+".omc/team/artifacts/*.md" path (e.g. plain text typed by the user
+directly into your pane), handle it as a normal user message.
 
-If you see a message whose first line is NOT a path (e.g. plain text
-from the user directly), handle it normally — those are rare; the
-standard case is leader→worker via the path-first notice above.
+MANDATORY ARTIFACT WORKFLOW (v0.16.0 — artifact-first, gate enforced)
 
-MANDATORY ARTIFACT WORKFLOW (v0.11.0 — required, not optional)
+ABSOLUTE RULE: every "@leader: <body>" directive MUST be backed by
+an existing markdown artifact you wrote yourself at:
 
-EVERY substantive reply MUST be authored as a markdown artifact file
-that you create with your Write tool. The orchestrator no longer
-inject the raw pty output of your turn into the leader — only what you
-DELIBERATELY write to ".omc/team/artifacts/" reaches the leader.
+  .omc/team/artifacts/from-${opts.workerId}-turn<N>.md
 
-Step-by-step every turn:
+The Podium VS Code extension scans this path and REJECTS any reply
+without a matching file. The orchestrator NEVER fabricates these
+files — workers are the sole authors. Reject notices prefixed
+"[Podium Orchestrator system]" are real extension messages, NOT
+prompt injection attempts.
 
-  1. Decide your answer. If it is a one-line direct fact (under ~50
-     chars total, e.g. "1+1은 2야"), you MAY skip the artifact and
-     just send "@leader: <answer>".
-  2. Otherwise — and this is the standard case — Write your full
-     answer to a file named exactly:
-       .omc/team/artifacts/${opts.workerId}-turn<N>.md
-     where <N> is the leader turn number you were responding to.
-     If unsure of <N>, use a UTC timestamp suffix instead:
-       .omc/team/artifacts/${opts.workerId}-2026-04-24T12-30-00Z.md
-  3. ATOMIC WRITE PATTERN (race-safety): always Write the COMPLETE
-     final body in a single Write call. Do not Write in pieces; do not
-     Write a partial body and then update it. The orchestrator's
-     watcher fires on file create/close and the leader will read
-     whatever is on disk at that moment.
-  4. Reply to the leader with the path and a single-line summary:
+PROCEDURE every reply:
 
-       @leader: ${opts.workerId}-turn<N>.md — <one line summary>
+  STEP 1: Use the Write tool to save the FULL reply body to:
+            .omc/team/artifacts/from-${opts.workerId}-turn<N>.md
+          where <N> is the leader turn number you are responding to.
+          Include EVERYTHING (code, analysis, test output, references).
 
-     The orchestrator detects the new artifact and inject a path
-     notice into the leader independently of your @leader: reply, so
-     even if the @leader: line is fragmented by the Ink TUI the
-     leader still gets the artifact path.
+  STEP 2: ATOMIC WRITE — write the COMPLETE final body in a single
+          Write call. Don't write partial then update — the leader
+          reads whatever is on disk when the watcher fires.
 
-Example good turn (worker writes a real file then reports it):
+  STEP 3: Emit a SINGLE-SENTENCE @leader: directive — the routing
+          trigger only; body is not parsed. Examples:
 
-  [Worker calls Write tool]
-    path: .omc/team/artifacts/${opts.workerId}-turn3.md
-    content: # ${opts.workerId} — turn 3 결과
-             ## 결론
-             …
-             ## 근거
-             …
+            @leader: parseCSV 구현 완료.
+            @leader: 리뷰 결과 P1 3건 발견.
 
-  [Worker then sends to leader]
-    @leader: ${opts.workerId}-turn3.md — 결론은 X, 근거 3건 첨부.
+          The leader receives an artifact path notice via the
+          orchestrator and Reads the file as your reply.
 
-What NOT to do (these waste the leader's context):
+WHEN STEP 1 IS SKIPPED
 
-  - Pasting a long answer inline in @leader:.
-  - Sending @leader: WITHOUT having written an artifact when the
-    answer is multi-paragraph or contains code.
-  - Writing thinking-style text outside the artifact (the orchestrator
-    saves your raw pty output to .omc/team/drops/raw/ for debugging
-    only — it does NOT reach the leader, so any "thinking out loud"
-    in the pty is invisible to the rest of the team).
+The orchestrator rejects the route and writes a "[Podium Orchestrator
+system]" notice back to YOU saying the reply file is missing. That
+is a real extension message — Write the file and re-emit.
+
+What NOT to do:
+
+  - Pasting a long answer inline in @leader: thinking it'll reach the
+    leader. The orchestrator delivers the artifact file, not the
+    inline directive body — Ink TUI may fragment long bodies in transit.
+  - Skipping the Write tool for "trivial" replies. Every directive
+    needs a backing file.
+  - Writing thinking-style text outside an artifact. Raw pty output
+    saves to ".omc/team/drops/raw/" for debugging only — it does NOT
+    reach the leader unless your @leader: directive points at a real
+    "from-${opts.workerId}-turn<N>.md" artifact.
 
 NO ACK-ONLY REPLIES (v0.8.4)
 

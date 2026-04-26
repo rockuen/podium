@@ -55,22 +55,21 @@ export interface BuildPayloadOptions {
  * Return true when the given agent + platform pair requires Win32 KEY_EVENT
  * encoding rather than bare CR/LF.
  *
- * v0.11.2 — macOS added to the KEY_EVENT path
- * --------------------------------------------
- * The original v2.7.1 design assumed win32-input-mode was Windows-only because
- * Claude CLI activated it on ConPTY detection. Field evidence on 2026-04-25
- * (Antigravity webview + Claude Code v2.1.119 + Mac arm64) shows v2.1+ also
- * activates win32-input-mode on macOS — every `pty.write('\r')` is reinterpreted
- * as Shift+Enter, the directive sits in the input buffer un-submitted, and the
- * leader hangs in `Sautéed for Ns` forever. macOS now takes the same KEY_EVENT
- * path as Windows. Linux retains the bare-CR path until field evidence proves
- * otherwise. Codex / Gemini CLIs are unaffected (they don't enable
- * win32-input-mode on any platform), so the Mac promotion stays Claude-scoped.
+ * History: v0.11.2 mid-cycle promoted darwin to the KEY_EVENT path on a
+ * (broken) hypothesis that Claude Code v2.1+ activated win32-input-mode on
+ * macOS too. Field testing 2026-04-25 falsified that — Mac+Claude actually
+ * accepts bare CR as submit and SILENTLY DROPS the KEY_EVENT byte stream
+ * (treats it as a no-op ANSI escape), which is why textarea-Send showed up
+ * as "text arrived but Enter never fired" while xterm.js direct \r worked
+ * fine. v0.11.2 final reverts darwin to the POSIX bare-CR path. The race
+ * fix that lives in autoSend.js (writePtyChunked + setTimeout submit) stays
+ * — that addresses a separate "single pty.write of body+\r flushes only the
+ * body" race observed even on POSIX.
  */
 export function needsWin32KeyEvents(opts: BuildPayloadOptions): boolean {
   if (opts.agent !== 'claude') return false;
   const plat = opts.platform ?? process.platform;
-  return plat === 'win32' || plat === 'darwin';
+  return plat === 'win32';
 }
 
 /**

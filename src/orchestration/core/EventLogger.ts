@@ -32,6 +32,8 @@ export type EventKind =
   | 'ack.match'
   | 'ack.mismatch'
   | 'redelivery.tagged'
+  // v0.12.0 — artifact-only routing (Option C).
+  | 'reject.missingArtifactPath'
   // v0.9.6 — Council product skeleton. Full set per v6 plan registered up
   // front so later slices (real participant transport, synthesis, close
   // workflow) can emit into the same ledger without bumping the schema.

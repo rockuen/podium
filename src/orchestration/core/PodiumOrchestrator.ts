@@ -51,6 +51,7 @@ import {
   WorkerPatternParser,
   type RoutedMessage,
 } from './messageRouter';
+import { extractArtifactPath } from './artifactPath';
 import { buildSubmitPayload, splitSubmitPayload, needsWin32KeyEvents } from './cliInput';
 import type { AgentKind } from './agentSpawn';
 import type { LivePaneSpec, OrchestratorPanel } from '../ui/LiveMultiPanel';
@@ -171,6 +172,18 @@ export interface OrchestratorAttachOptions {
    */
   enableWorkerRouting?: boolean;
   /**
+   * v0.12.0 introduced "hard reject directives without an artifact
+   * file" as the default. v0.15.0 reverts that default to OFF —
+   * artifact-first turned out to trigger LLM prompt-injection defenses
+   * (see CHANGELOG v0.15.0). Production now uses inline routing as in
+   * v0.11.x; messageRouter handles Ink fragmentation directly via
+   * Fix X (column-0 prompt demote), Z-1 (dedupeKey normalize), and
+   * v0.14.2 (inline drain). Set to `true` to opt back into the gate
+   * for users who explicitly want every directive backed by a Write-
+   * tool artifact.
+   */
+  enforceArtifactGate?: boolean;
+  /**
    * v0.3.0 · Maximum number of routed directives per "task" before the
    * orchestrator force-converges. Each committed routing event (leader→worker,
    * worker→leader, worker→worker) counts as one. When the cap is hit a
@@ -222,6 +235,18 @@ export interface WorkerRuntime {
   cfg: WorkerConfig;
   idle: IdleDetector;
   queue: string[];
+  /**
+   * v0.14.0 — Wall-clock timestamp of when this worker's queue first
+   * became non-empty AND the worker was not idle. Cleared the moment
+   * the queue drains (worker idle → next inject). Used by `tick()` to
+   * detect stuck-busy workers (idle latch failing for >N seconds) and
+   * surface a `[orch.warn]` notice into the leader pane so the user
+   * can intervene instead of silently waiting.
+   */
+  queueStuckSince: number | null;
+  /** Whether the stuck-queue warn has already fired for the current
+   *  stuck episode. Reset to false the moment the queue drains. */
+  queueStuckWarnFired: boolean;
   /**
    * payload-key → { turnId, ts } used for dedupe.
    *
@@ -370,6 +395,20 @@ const MAX_TRANSCRIPT_CHARS = 50_000;
  */
 const REDELIVERY_WINDOW_MS = 5 * 60 * 1000;
 
+// v0.12.1 — Rate-limit window for reject notices, per target id. Same
+// dedupeKey is allowed only one reject within this window. Required
+// because Ink TUI scrollback repaint keeps re-emitting prior directives
+// after cross-turn dedupe expires; without rate-limiting, the leader
+// pane sees the same `[orch.reject]` text over and over.
+const REJECT_RATE_LIMIT_MS = 30_000;
+
+// v0.14.0 — Wall-clock window after which a stuck (non-empty queue,
+// worker not idle) gets a one-shot `[orch.warn]` injection into the
+// leader pane. Conservative — long enough that boot-time idle latch
+// completes well within it, short enough that user notices within a
+// reasonable wait. Pairs with WorkerRuntime.queueStuckSince/WarnFired.
+const STUCK_QUEUE_WARN_MS = 30_000;
+
 const DEFAULT_POLL_MS = 250;
 // Claude Code v2.1+ uses an Ink TUI that repaints the alt-screen periodically,
 // and crucially it can re-emit the ENTIRE visible scrollback on a full
@@ -427,6 +466,14 @@ const CROSS_TURN_DEDUPE_MS = 120_000;
  * indefinite buildup if the leader is stuck.
  */
 const LEADER_IDLE_WAIT_MAX_MS = 3000;
+// v0.11.2 — Wall-clock cap for the leader-busy gate on the leader→worker
+// dispatch path. Mirrors LEADER_IDLE_WAIT_MAX_MS but slightly longer because
+// leader→worker can tolerate a bit more wait (worker hasn't started, no
+// downstream deadline). Field finding 2026-04-25: when idleDetector
+// mis-reads Claude Code v2.1+ "Cogitated for Ns" / status-bar repaints as
+// busy, the dispatch re-armed forever (>200s observed). 5s is the soft
+// max — beyond that, we commit anyway and let Ink absorb the inject.
+const WORKER_DISPATCH_WAIT_MAX_MS = 5000;
 
 /**
  * v0.6.0 — Spill threshold for worker replies.
@@ -575,10 +622,22 @@ export class PodiumOrchestrator implements vscode.Disposable {
   private nowFn: () => number = Date.now;
   private dedupeWindowMs = DEFAULT_DEDUPE_WINDOW_MS;
   private dispatchDebounceMs = DEFAULT_DISPATCH_DEBOUNCE_MS;
-  /** v2.7.16: per-worker pending debounced dispatch (worker id → state). */
+  /** v2.7.16: per-worker pending debounced dispatch (worker id → state).
+   *  v0.11.2: `leaderGateStartedAt` stamps the first time the leader-busy
+   *  gate held a commit, so cumulative wait can be capped by
+   *  WORKER_DISPATCH_WAIT_MAX_MS (mirrors the worker→leader path's
+   *  LEADER_IDLE_WAIT_MAX_MS). Field finding 2026-04-25: idleDetector
+   *  occasionally judged leader busy long after the assistant turn settled
+   *  (Claude Code v2.1+ "Cogitated for Ns" + status-bar repaints), and the
+   *  re-arm loop ran 200+ seconds before commit. Cap bounds the worst-case
+   *  user latency. */
   private readonly pendingRoute = new Map<
     string,
-    { payload: string; timer: ReturnType<typeof setTimeout> }
+    {
+      payload: string;
+      timer: ReturnType<typeof setTimeout>;
+      leaderGateStartedAt?: number;
+    }
   >();
   /**
    * v0.3.4 · Per-source pending debounce for worker→leader routing. Mirrors
@@ -627,6 +686,19 @@ export class PodiumOrchestrator implements vscode.Disposable {
 
   /** Whether worker output is also parsed for routing directives. */
   private enableWorkerRouting = false;
+  // v0.16.0 — back to default true (see AttachOpts). v0.15.x default
+  // false was a temporary retreat after LLM prompt-injection defenses
+  // rejected v0.13.0 reject notices; the v0.16.0 fix is to declare the
+  // artifact-first protocol in the team setup prompt so the LLM
+  // accepts it from turn 1, not to disable the gate.
+  private enforceArtifactGate = true;
+  // v0.12.1 — Per-target rate-limit for reject notices. Without it, an
+  // Ink scrollback repaint of a prior `@worker-N: ...` line keeps
+  // re-firing the reject every cross-turn dedupe window, which spams
+  // the leader pane and prevents recovery. Map: target id → last reject
+  // (dedupeKey + ts). Same dedupeKey within REJECT_RATE_LIMIT_MS is
+  // silently dropped.
+  private lastRejectAt: Map<string, { dedupeKey: string; ts: number }> = new Map();
   /** Routing kill-switch. When true, all route() calls drop silently. */
   private routingPaused = false;
   /** Cap on routed directives per task. 0 = unlimited. */
@@ -694,10 +766,19 @@ export class PodiumOrchestrator implements vscode.Disposable {
       const msg = err instanceof Error ? err.message : String(err);
       this.output.appendLine(`[orch.drops] archive on attach FAILED — ${msg}`);
     }
+    // v0.13.0 — same archive-on-attach for artifacts/. Stale files
+    // would otherwise silently match new turn-naming routes.
+    try {
+      this.archivePriorArtifacts(this.attachedCwd);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch.artifacts] archive on attach FAILED — ${msg}`);
+    }
     this.onAutoSnapshot = opts.onAutoSnapshot ?? null;
     this.autoSnapshotFired = false;
     // v0.3.0 bidirectional + round cap wiring
     this.enableWorkerRouting = opts.enableWorkerRouting ?? false;
+    this.enforceArtifactGate = opts.enforceArtifactGate ?? true;
     this.maxRoundsPerTask = opts.maxRoundsPerTask ?? 0;
     if (opts.autoResetRoundMs !== undefined) this.autoResetRoundMs = opts.autoResetRoundMs;
     this.currentRound = 0;
@@ -744,6 +825,8 @@ export class PodiumOrchestrator implements vscode.Disposable {
         wasIdle: false,
         currentTurnStart: 0,
         spillSeq: 0,
+        queueStuckSince: null,
+        queueStuckWarnFired: false,
         hasPendingReply: false,
         pendingAckFp: null,
         recentSpills: [],
@@ -938,6 +1021,8 @@ export class PodiumOrchestrator implements vscode.Disposable {
         now: this.nowFn,
       }),
       queue: [],
+      queueStuckSince: null,
+      queueStuckWarnFired: false,
       recentPayloads: new Map(),
       transcript: '',
       rawTranscript: '',
@@ -1225,7 +1310,39 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
     for (const w of this.workers.values()) {
       if (w.cfg.paneId === paneId) {
+        // v0.14.1 — idle latch trace. Field evidence (intersect 2026-04-26):
+        // workers spent 30+ seconds with non-empty queues but isIdle never
+        // flipped to true, blocking drain. Logging idle/busy transitions
+        // makes the failure mode visible — which chunk re-armed
+        // lastOutputAt, what the rolling tail looked like, etc.
+        const wasIdleBefore = w.idle.isIdle;
         w.idle.feed(rawData);
+        const isIdleAfter = w.idle.isIdle;
+        if (wasIdleBefore !== isIdleAfter) {
+          this.output.appendLine(
+            `[orch.idle] ${w.cfg.id}: ${wasIdleBefore ? 'idle' : 'busy'} → ${isIdleAfter ? 'idle' : 'busy'} (msSinceOutput=${w.idle.msSinceOutput}, chunkBytes=${rawData.length}, queue=${w.queue.length})`,
+          );
+        }
+        // v0.14.2 — Inline drain on pty data event. Field evidence
+        // (intersect 2026-04-26): webview/window hidden throttles the
+        // 250 ms `tick()` setInterval to 5–10 s between calls, leaving
+        // the worker queue undrained. Pty data events go through
+        // OS-level fd readiness and survive throttling, so drain right
+        // here when the worker just settled to idle and has a pending
+        // queue — `tick()` remains the safety net.
+        if (isIdleAfter && w.queue.length > 0) {
+          const next = w.queue.shift();
+          if (next !== undefined) {
+            this.output.appendLine(
+              `[orch.drain] ${w.cfg.id} inline drain (queueLen was ${w.queue.length + 1}): ${preview(next)}`,
+            );
+            this.inject(w, next);
+          }
+          if (w.queue.length === 0) {
+            w.queueStuckSince = null;
+            w.queueStuckWarnFired = false;
+          }
+        }
         // v0.7.4 — Accumulate PROJECTED output (not raw) for the
         // transcript. Raw stripAnsi output includes Claude CLI's
         // thinking spinner frames (✻ ✽ ✶ ✢ ·), status bar repaints
@@ -1369,9 +1486,22 @@ export class PodiumOrchestrator implements vscode.Disposable {
       '',
       'The workers are no longer available. Continue the conversation using this context.',
     ].join('\n');
-    const bytes = buildSubmitPayload(injection, { agent: this.leader.agent });
+    // v0.11.2 — Always split body + submit (race fix). See cliInput.ts comment
+    // and index.ts protocol-note path for the rationale: bare-CR single writes
+    // intermittently let body land but drop the trailing \r on POSIX too.
+    const opts = { agent: this.leader.agent };
+    const { body: dissolveBody, submit: dissolveSubmit } = splitSubmitPayload(injection, opts);
+    const leaderPaneId = this.leader.paneId;
     try {
-      this.panel.writeToPane(this.leader.paneId, bytes);
+      this.panel.writeToPane(leaderPaneId, dissolveBody);
+      setTimeout(() => {
+        try {
+          this.panel.writeToPane(leaderPaneId, dissolveSubmit);
+        } catch (err) {
+          const m = err instanceof Error ? err.message : String(err);
+          this.output.appendLine(`[orch.dissolve] submit write FAILED — ${m}`);
+        }
+      }, INJECT_SUBMIT_DELAY_MS);
       this.output.appendLine('[orch.dissolve] summary injected into leader stdin');
       // v2.7.19: Dissolve is a natural "checkpoint" moment. Snapshot the
       // team so the user can pick the conversation back up later.
@@ -1734,26 +1864,62 @@ export class PodiumOrchestrator implements vscode.Disposable {
       }
     }
     if (this.enforceRoundCap(`leader (from ${sourcePaneId})`, payload)) return;
+
+    // v0.12.0 — Hard reject for worker→leader (symmetric with the
+    // leader→worker side). The worker MUST pre-write its reply to
+    // `.omc/team/artifacts/from-<worker-id>-turn<N>.md` and emit only
+    // a one-line directive that references it. If not, bounce back to
+    // the worker pane so it can re-author the reply.
+    const sourceWorker = this.findWorkerByPaneId(sourcePaneId);
+    const senderId = sourceWorker?.cfg.id ?? sourcePaneId;
+    const vL = this.enforceArtifactGate
+      ? this.validateRoutingTarget('worker-to-leader', senderId)
+      : ({ ok: true, artifactPath: '' } as const);
+    if (!vL.ok) {
+      this.output.appendLine(
+        `[orch.reject] ${senderId}→leader ${vL.reason} payload=${preview(payload, 60)}`,
+      );
+      this.logEvent({
+        type: 'reject.missingArtifactPath',
+        turnId: this.leaderTurnId,
+        source: sourceWorker
+          ? this.workerEndpoint(sourceWorker)
+          : { kind: 'worker', id: sourcePaneId },
+        target: this.leaderEndpoint(),
+        payload: {
+          direction: 'worker-to-leader',
+          reason: vL.reason,
+          payloadPreview: preview(payload, 80),
+        },
+      });
+      if (sourceWorker && !this.shouldRateLimitReject(senderId, key, nowMs)) {
+        this.injectRejectNotice(
+          sourceWorker.cfg.paneId,
+          sourceWorker.cfg.agent,
+          vL.reason,
+        );
+      }
+      this.stats.dropped += 1;
+      return;
+    }
+
     this.leaderRecentPayloads.set(key, { turnId: this.leaderTurnId, ts: nowMs });
     this.currentRound += 1;
     this.lastRouteAt = nowMs;
     const agent = this.leader.agent;
     const opts = { agent };
     try {
-      if (needsWin32KeyEvents(opts)) {
-        const { body, submit } = splitSubmitPayload(payload, opts);
-        this.panel.writeToPane(this.leader.paneId, body);
-        setTimeout(() => {
-          try {
-            this.panel.writeToPane(this.leader!.paneId, submit);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.output.appendLine(`[orch] inject submit → leader FAILED — ${msg}`);
-          }
-        }, INJECT_SUBMIT_DELAY_MS);
-      } else {
-        this.panel.writeToPane(this.leader.paneId, buildSubmitPayload(payload, opts));
-      }
+      // v0.11.2 — Always split (race fix on POSIX too).
+      const { body, submit } = splitSubmitPayload(payload, opts);
+      this.panel.writeToPane(this.leader.paneId, body);
+      setTimeout(() => {
+        try {
+          this.panel.writeToPane(this.leader!.paneId, submit);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.output.appendLine(`[orch] inject submit → leader FAILED — ${msg}`);
+        }
+      }, INJECT_SUBMIT_DELAY_MS);
       this.stats.injected += 1;
       this.output.appendLine(
         `[orch] → leader (from ${sourcePaneId}, round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}): ${preview(payload)}`,
@@ -1912,7 +2078,14 @@ export class PodiumOrchestrator implements vscode.Disposable {
     const existing = this.pendingRoute.get(workerId);
     if (existing) clearTimeout(existing.timer);
     const timer = setTimeout(() => this.tryDispatchPending(workerId, payload), this.dispatchDebounceMs);
-    this.pendingRoute.set(workerId, { payload, timer });
+    // v0.11.2 — Preserve leaderGateStartedAt across re-arms so the cumulative
+    // wait toward WORKER_DISPATCH_WAIT_MAX_MS is honored (same shape as
+    // armLeaderDispatchTimer / pendingLeaderInject).
+    this.pendingRoute.set(workerId, {
+      payload,
+      timer,
+      leaderGateStartedAt: existing?.leaderGateStartedAt,
+    });
   }
 
   /** v0.3.4 · Mirror of `armDispatchTimer` for worker→leader routing. */
@@ -1988,18 +2161,37 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * commit when the leader has demonstrably stopped talking.
    */
   private tryDispatchPending(workerId: string, payload: string): void {
-    if (this.leaderIdle && !this.leaderIdle.isIdle) {
+    // v0.11.2 — Wall-clock deadline. If leaderIdle has held this dispatch in
+    // re-arm for longer than WORKER_DISPATCH_WAIT_MAX_MS, force-commit. Field
+    // log 2026-04-25 showed 160+ seconds of "leaderIdle=busy" re-arms when
+    // Claude Code v2.1+ status-bar / "Cogitated for Ns" output kept feeding
+    // the idle detector; the user waited > 2 minutes per inject. The cap
+    // gives idleDetector a reasonable window to settle, then commits anyway.
+    const pending = this.pendingRoute.get(workerId);
+    const waited = pending?.leaderGateStartedAt !== undefined
+      ? this.nowFn() - pending.leaderGateStartedAt
+      : 0;
+    if (this.leaderIdle && !this.leaderIdle.isIdle && waited < WORKER_DISPATCH_WAIT_MAX_MS) {
+      if (pending && pending.leaderGateStartedAt === undefined) {
+        pending.leaderGateStartedAt = this.nowFn();
+      }
       // v0.3.7 · Field diagnostic: log every re-arm so silent stalls are
       // visible. Field log showed the pending debounce looping forever when
       // leaderIdle misjudged busy; without this log the loop was invisible.
       const ms = this.leaderIdle.msSinceOutput;
       this.output.appendLine(
-        `[orch.debounce] re-arm ${workerId} (leaderIdle=busy, msSinceOutput=${ms}ms): ${preview(payload)}`,
+        `[orch.debounce] re-arm ${workerId} (leaderIdle=busy, waited=${waited}ms/${WORKER_DISPATCH_WAIT_MAX_MS}ms, msSinceOutput=${ms}ms): ${preview(payload)}`,
       );
       this.armDispatchTimer(workerId, payload);
       return;
     }
-    this.output.appendLine(`[orch.debounce] commit ${workerId}: ${preview(payload)}`);
+    if (this.leaderIdle && !this.leaderIdle.isIdle && waited >= WORKER_DISPATCH_WAIT_MAX_MS) {
+      this.output.appendLine(
+        `[orch.debounce] commit ${workerId} (FORCE — leaderIdle stuck busy ${waited}ms): ${preview(payload)}`,
+      );
+    } else {
+      this.output.appendLine(`[orch.debounce] commit ${workerId}: ${preview(payload)}`);
+    }
     this.pendingRoute.delete(workerId);
     const w = this.workers.get(workerId);
     if (w) this.commitRoute(w, payload);
@@ -2054,6 +2246,42 @@ export class PodiumOrchestrator implements vscode.Disposable {
     // commit don't exhaust the budget. Once the cap is hit the route is
     // dropped and a single notice fires (see enforceRoundCap).
     if (this.enforceRoundCap(w.cfg.id, payload)) return;
+
+    // v0.12.0 — Hard reject (artifact-only routing). Every leader→worker
+    // directive must reference an existing `.omc/team/artifacts/*.md`
+    // path. If not, bounce back to the leader pane so the leader can
+    // re-author the directive with a Write-tool artifact. The rejected
+    // directive does NOT consume a round and does NOT inject the
+    // worker — losing partial work to a truncated task body is the
+    // failure mode this guards against.
+    // v0.13.0 — validation now resolves a `to-<worker>-turn<N>.md`
+    // artifact on disk instead of parsing the directive body. Body
+    // parsing was unreliable under Ink TUI fragmentation.
+    const v = this.enforceArtifactGate
+      ? this.validateRoutingTarget('leader-to-worker', w.cfg.id)
+      : ({ ok: true, artifactPath: '' } as const);
+    if (!v.ok) {
+      this.output.appendLine(
+        `[orch.reject] leader→${w.cfg.id} ${v.reason} payload=${preview(payload, 60)}`,
+      );
+      this.logEvent({
+        type: 'reject.missingArtifactPath',
+        turnId: this.leaderTurnId,
+        source: this.leaderEndpoint(),
+        target: this.workerEndpoint(w),
+        payload: {
+          direction: 'leader-to-worker',
+          reason: v.reason,
+          payloadPreview: preview(payload, 80),
+        },
+      });
+      if (this.leader && !this.shouldRateLimitReject(w.cfg.id, key, nowMs)) {
+        this.injectRejectNotice(this.leader.paneId, this.leader.agent, v.reason);
+      }
+      this.stats.dropped += 1;
+      return;
+    }
+
     w.recentPayloads.set(key, { turnId: this.leaderTurnId, ts: nowMs });
     this.currentRound += 1;
     this.lastRouteAt = nowMs;
@@ -2063,8 +2291,14 @@ export class PodiumOrchestrator implements vscode.Disposable {
     } else {
       w.queue.push(payload);
       this.stats.queued += 1;
+      // v0.14.0 — stamp the moment the queue first becomes non-empty so
+      // tick() can detect "worker idle latch never fires" and surface
+      // a warn to the leader instead of silently waiting forever.
+      if (w.queueStuckSince === null) {
+        w.queueStuckSince = nowMs;
+      }
       this.output.appendLine(
-        `[orch] queue ${w.cfg.id} (busy, queue=${w.queue.length}, round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}): ${preview(payload)}`,
+        `[orch] queue ${w.cfg.id} (busy, queue=${w.queue.length}, round ${this.currentRound}${this.maxRoundsPerTask > 0 ? `/${this.maxRoundsPerTask}` : ''}, idleMs=${w.idle.msSinceOutput}): ${preview(payload)}`,
       );
     }
     // v0.9.5 · Route commit crosses the dedupe/round-cap gate; mirror it
@@ -2132,6 +2366,48 @@ export class PodiumOrchestrator implements vscode.Disposable {
     const archiveRel = path.posix.join('.omc', 'team', 'drops', 'archive', stamp);
     this.output.appendLine(
       `[orch.drops] archived ${orphans.length} prior drop(s) → ${archiveRel}`,
+    );
+  }
+
+  /**
+   * v0.13.0 — Archive top-level `*.md` artifacts from a prior session.
+   *
+   * Called once per `attach()`. Moves any `.md` files directly inside
+   * `<cwd>/.omc/team/artifacts/` into
+   * `<cwd>/.omc/team/artifacts/archive/<ISO>/` so the new session starts
+   * with a clean artifacts root.
+   *
+   * Why mandatory in v0.13.0: routing now resolves
+   * `to-<worker-id>-turn<N>.md` against the live artifacts directory,
+   * so a stale `to-worker-1-turn1.md` from a prior session would
+   * silently match a fresh turn=1 directive and leak old content into
+   * the new worker. Archiving on attach gives every session a clean
+   * naming surface.
+   *
+   * Subdirectories (including `archive/` itself) are left alone —
+   * re-archiving is a no-op. Non-fatal: caller wraps in try/catch.
+   */
+  private archivePriorArtifacts(cwd: string): void {
+    const artifactsDir = path.join(cwd, '.omc', 'team', 'artifacts');
+    if (!fs.existsSync(artifactsDir)) return;
+
+    const entries = fs.readdirSync(artifactsDir, { withFileTypes: true });
+    const orphans = entries.filter((e) => e.isFile() && e.name.endsWith('.md'));
+    if (orphans.length === 0) return;
+
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const archiveDir = path.join(artifactsDir, 'archive', stamp);
+    fs.mkdirSync(archiveDir, { recursive: true });
+
+    for (const f of orphans) {
+      const src = path.join(artifactsDir, f.name);
+      const dst = path.join(archiveDir, f.name);
+      fs.renameSync(src, dst);
+    }
+
+    const archiveRel = path.posix.join('.omc', 'team', 'artifacts', 'archive', stamp);
+    this.output.appendLine(
+      `[orch.artifacts] archived ${orphans.length} prior artifact(s) → ${archiveRel}`,
     );
   }
 
@@ -2272,6 +2548,12 @@ export class PodiumOrchestrator implements vscode.Disposable {
     }
 
     for (const name of newFiles) {
+      // v0.15.1 — Skip orchestrator-authored leader→worker auto-spills
+      // (`auto-to-*.md`). Those are NOT worker output; surfacing them
+      // back to the leader as `[artifact from worker-N]` notices misled
+      // the leader into reading its own truncated directive copy. Worker
+      // output that we DO want to forward stays unfiltered.
+      if (name.startsWith('auto-to-')) continue;
       const absPath = path.join(artifactsDir, name);
       const relPath = path.posix.join('.omc', 'team', 'artifacts', name);
       let bytes = 0;
@@ -2413,8 +2695,154 @@ export class PodiumOrchestrator implements vscode.Disposable {
    * turn, regardless of payload content).
    */
   private dedupeKey(payload: string): string {
+    // v0.14.1 — Aggressive normalization to defeat Ink TUI fragmentation.
+    // Field evidence (intersect 2026-04-26): the same `@worker-1: ...`
+    // directive yielded 7 times with different first-line wrap lengths,
+    // all distinct under the 100-char cap → all bypassed dedupe → all
+    // committed → queue piled to 7. Collapsing whitespace to a single
+    // space and capping at 30 chars makes wrap-shifted variants collide
+    // on the same key, so only the first of a fragment storm commits.
     const firstLine = payload.split(/\r?\n/, 1)[0] ?? '';
-    return firstLine.trim().slice(0, 100);
+    return firstLine.replace(/\s+/g, ' ').trim().slice(0, 30);
+  }
+
+  /**
+   * v0.13.0 — Find the artifact this directive should resolve to,
+   * using `to-<worker-id>-turn<N>.md` / `from-<worker-id>-turn<N>.md`
+   * naming on disk. Directive body is NOT inspected — Ink TUI
+   * fragmentation made body-based path extraction unreliable, and the
+   * v0.12.0 hard-reject of bodies without an inline path produced
+   * false positives whenever the leader's directive line wrapped past
+   * the viewport.
+   *
+   * Resolution order:
+   *   1. Exact-turn match: `<prefix>turn<currentLeaderTurn>.md`
+   *   2. Latest-turn catch-up: highest `<prefix>turn<N>.md` on disk
+   *
+   * Returns the relative path (POSIX, project-rooted) or null.
+   */
+  private findArtifactByTurn(
+    direction: 'leader-to-worker' | 'worker-to-leader',
+    targetId: string,
+  ): string | null {
+    const root = this.attachedCwd ?? process.cwd();
+    const artifactsDir = path.join(root, '.omc', 'team', 'artifacts');
+    if (!fs.existsSync(artifactsDir)) return null;
+
+    const prefix =
+      direction === 'leader-to-worker'
+        ? `to-${targetId}-turn`
+        : `from-${targetId}-turn`;
+
+    // Exact match first.
+    const exactName = `${prefix}${this.leaderTurnId}.md`;
+    if (fs.existsSync(path.join(artifactsDir, exactName))) {
+      return path.posix.join('.omc', 'team', 'artifacts', exactName);
+    }
+
+    // Catch-up: highest turn number on disk.
+    const re = new RegExp(`^${prefix.replace(/[-]/g, '\\$&')}(\\d+)\\.md$`);
+    let latestName: string | null = null;
+    let latestTurn = -1;
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(artifactsDir, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+    for (const e of entries) {
+      if (!e.isFile()) continue;
+      const m = e.name.match(re);
+      if (!m) continue;
+      const t = Number(m[1]);
+      if (t > latestTurn) {
+        latestTurn = t;
+        latestName = e.name;
+      }
+    }
+    if (latestName) {
+      return path.posix.join('.omc', 'team', 'artifacts', latestName);
+    }
+    return null;
+  }
+
+  /**
+   * v0.13.0 — Hard reject when no `to-/from-<id>-turn<N>.md` artifact
+   * exists for the directive's target. Returns the resolved artifact
+   * path on success so callers can build the path-first notice
+   * without re-scanning the directory.
+   *
+   * v0.12.x kept asking "does the directive body contain a path?";
+   * v0.13.0 only asks "does the artifact file exist?". This means a
+   * fragmented directive (Ink wrap, missing `see <path>` tail, etc.)
+   * still routes as long as the leader pre-wrote the artifact. The
+   * directive line is now a routing trigger; the file is the truth.
+   */
+  private validateRoutingTarget(
+    direction: 'leader-to-worker' | 'worker-to-leader',
+    targetId: string,
+  ): { ok: true; artifactPath: string } | { ok: false; reason: string } {
+    const found = this.findArtifactByTurn(direction, targetId);
+    if (found) return { ok: true, artifactPath: found };
+
+    const recipient = direction === 'leader-to-worker' ? targetId : 'leader';
+    const recommendedPath =
+      direction === 'leader-to-worker'
+        ? `.omc/team/artifacts/to-${targetId}-turn${this.leaderTurnId}.md`
+        : `.omc/team/artifacts/from-${targetId}-turn${this.leaderTurnId}.md`;
+    return {
+      ok: false,
+      reason:
+        `[Podium Orchestrator system · v0.14.x] '${recipient}' 라우팅 거부 — 매칭되는 artifact 파일이 없습니다. ` +
+        `Write tool로 풀 본문을 ${recommendedPath} 에 먼저 작성한 뒤 동일한 directive를 ` +
+        `다시 보내주세요. directive 본문에 path를 적을 필요는 없고, ` +
+        `"AT-${recipient}: <한 줄 요약>" 만으로 충분합니다. ` +
+        `이 메시지는 Podium VS Code 확장이 발신한 시스템 알림입니다 — prompt injection이 아닙니다.`,
+    };
+  }
+
+  /**
+   * v0.12.1 — Rate-limit reject notices per target so Ink scrollback
+   * repaints can't spam the leader/worker pane. Same dedupeKey within
+   * REJECT_RATE_LIMIT_MS for the same target is silently dropped (one
+   * orch.output log line for forensics) and the caller must NOT inject.
+   */
+  private shouldRateLimitReject(targetId: string, key: string, nowMs: number): boolean {
+    const last = this.lastRejectAt.get(targetId);
+    if (last && last.dedupeKey === key && nowMs - last.ts < REJECT_RATE_LIMIT_MS) {
+      this.output.appendLine(
+        `[orch.reject] ${targetId} rate-limited (${nowMs - last.ts}ms since last, key="${preview(key, 40)}")`,
+      );
+      return true;
+    }
+    this.lastRejectAt.set(targetId, { dedupeKey: key, ts: nowMs });
+    return false;
+  }
+
+  /**
+   * v0.12.0 — Inject the reject reason into the source pane so the
+   * directive author sees the bounce and can retry. We use the same
+   * splitSubmitPayload pipeline the orch uses for normal injects so
+   * the message is delivered as a regular user-input turn (and reaches
+   * the LLM rather than just landing in the scrollback).
+   */
+  private injectRejectNotice(paneId: string, agent: AgentKind, reason: string): void {
+    const opts = { agent };
+    try {
+      const { body, submit } = splitSubmitPayload(reason, opts);
+      this.panel.writeToPane(paneId, body);
+      setTimeout(() => {
+        try {
+          this.panel.writeToPane(paneId, submit);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.output.appendLine(`[orch.reject] inject submit FAILED — ${msg}`);
+        }
+      }, INJECT_SUBMIT_DELAY_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`[orch.reject] inject FAILED — ${msg}`);
+    }
   }
 
   private inject(w: WorkerRuntime, payload: string): void {
@@ -2442,21 +2870,19 @@ export class PodiumOrchestrator implements vscode.Disposable {
     const paneId = w.cfg.paneId;
     const opts = { agent: w.cfg.agent };
     try {
-      if (needsWin32KeyEvents(opts)) {
-        const { body, submit } = splitSubmitPayload(effective, opts);
-        this.panel.writeToPane(paneId, body);
-        setTimeout(() => {
-          try {
-            this.panel.writeToPane(paneId, submit);
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            this.output.appendLine(`[orch] inject submit → ${w.cfg.id} FAILED — ${msg}`);
-          }
-        }, INJECT_SUBMIT_DELAY_MS);
-      } else {
-        const bytes = buildSubmitPayload(effective, opts);
-        this.panel.writeToPane(paneId, bytes);
-      }
+      // v0.11.2 — Always split (race fix). User-reported field bug 2026-04-25:
+      // leader→worker spill landed text in the worker's terminal but the
+      // trailing \r was dropped on macOS, leaving the directive un-submitted.
+      const { body, submit } = splitSubmitPayload(effective, opts);
+      this.panel.writeToPane(paneId, body);
+      setTimeout(() => {
+        try {
+          this.panel.writeToPane(paneId, submit);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          this.output.appendLine(`[orch] inject submit → ${w.cfg.id} FAILED — ${msg}`);
+        }
+      }, INJECT_SUBMIT_DELAY_MS);
       w.idle.markBusy();
       this.stats.injected += 1;
       this.output.appendLine(`[orch] → ${w.cfg.id}: ${preview(effective)}`);
@@ -2468,176 +2894,128 @@ export class PodiumOrchestrator implements vscode.Disposable {
   }
 
   /**
-   * v0.8.0 — Leader→Worker: unconditional file-mediated delivery.
+   * v0.16.0 — Leader→Worker: leader-authored artifact ONLY.
    *
-   * Every leader-originated payload (regardless of length) is written
-   * to `.omc/team/drops/to-<worker>-turn<N>-seq<S>.md` and only a
-   * SHORT PTY-SAFE NOTICE is injected into the worker's stdin. The
-   * notice's FIRST LINE is the file path — so even if Ink TUI
-   * fragments the rest of the notice mid-stream the worker still sees
-   * the path and can Read it to recover the full directive.
+   * The orchestrator no longer fabricates `auto-to-*.md` files. Every
+   * directive must be backed by a `to-<worker>-turn<N>.md` artifact
+   * the leader itself wrote with the Write tool. If
+   * `findArtifactByTurn` cannot resolve such a file, we have no
+   * authoritative body to deliver — return the raw payload (defensive,
+   * gate-off opt-in scenario only; gate-on `commitRoute` reject would
+   * have already blocked this branch).
    *
-   * Why unconditional (change from v0.7.0's 300-char threshold): field
-   * logs of v0.7.4 showed Claude's Ink TUI fragments delegations well
-   * under the 300-char threshold whenever an 'other' line intervenes
-   * and kicks the projector out of the assistant block. Short inline
-   * payloads therefore are NOT reliable either. The user explicitly
-   * requested that ALL leader-to-worker delegations go through files
-   * — that is what this function now guarantees.
-   *
-   * Path-first notice format (critical for fragmentation survival):
-   *
-   *   .omc/team/drops/to-worker-1-turn3-seq1.md
-   *
-   *   위 파일을 Read 해서 지시사항을 수행해 주세요.
-   *
-   * The path is the first token on the first line. Anything cut from
-   * the notice after that is recoverable because the worker already
-   * has the path. Worker's system prompt (workerProtocol DROP HANDLING)
-   * is updated to recognize this format.
-   *
-   * File-write failures fall back to injecting the original payload
-   * (best-effort: fragmentation is worse than nothing, but losing the
-   * task entirely is worse than fragmentation).
+   * Field evidence (intersect 2026-04-26): the v0.13.0 auto-spill
+   * fallback wrote fragment-truncated leader output to disk and
+   * delivered it as authoritative task body, defeating the whole point
+   * of artifact-first. v0.16.0 removes that path entirely — the
+   * orchestrator is a router, not a file author.
    */
   private maybeSpillLeaderToWorker(w: WorkerRuntime, payload: string): string {
     w.spillSeq += 1;
     const root = this.attachedCwd ?? process.cwd();
-    const dir = path.join(root, '.omc', 'team', 'drops');
-    const filename = `to-${w.cfg.id}-turn${this.leaderTurnId}-seq${w.spillSeq}.md`;
-    const absPath = path.join(dir, filename);
-    const relPath = path.posix.join('.omc', 'team', 'drops', filename);
+
+    const found = this.findArtifactByTurn('leader-to-worker', w.cfg.id);
+    if (!found) {
+      // Gate-off opt-in path: no file exists, deliver inline payload.
+      // Gate-on production: commitRoute already rejected before reaching here.
+      return payload;
+    }
+    const absPath = path.join(root, found);
+    const relPath = found;
+
+    let fileBody: string;
     try {
-      fs.mkdirSync(dir, { recursive: true });
-      const now = new Date().toISOString();
-      const nowMs = this.nowFn();
-      const session = this.leader?.sessionId?.slice(0, 8) ?? 'unknown';
-      const tail_sha8 = computeTailSha8(payload);
-      const bytes = Buffer.byteLength(payload, 'utf8');
+      fileBody = fs.readFileSync(absPath, 'utf8');
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(
+        `[orch.spill] leader→${w.cfg.id} read FAILED for ${relPath} — ${msg}; routing raw payload`,
+      );
+      return payload;
+    }
+    const bytes = Buffer.byteLength(fileBody, 'utf8');
+    const tail = computeTailSha8(fileBody);
+    const nowMs = this.nowFn();
 
-      // v0.9.3 / v0.9.4 — Redelivery detection. Two triggers compose:
-      //
-      //   (A) v0.9.4 ACK-mismatch chain. If the worker's last reply
-      //       echoed an ACK that didn't match the spilled fingerprint,
-      //       maybeConsumeAck armed `w.retryChain`. The next spill
-      //       within the window is the leader's retry — tag it. This
-      //       is the realistic real-world trigger because retries
-      //       usually rewrite content (prefix/suffix) so their
-      //       `tail_sha8` differs from the original.
-      //
-      //   (B) v0.9.3 Content-hash chain. If the exact same tail is
-      //       spilled again within the window, tag as retry of the
-      //       prior matching drop. This catches orchestrator-initiated
-      //       re-sends or synthetic duplicates.
-      //
-      // (A) takes priority when both fire: the mismatch signal is
-      // more specific about intent. Both update per-worker state.
-      w.recentSpills = w.recentSpills.filter((e) => nowMs - e.ts < REDELIVERY_WINDOW_MS);
-      if (w.retryChain && nowMs - w.retryChain.ts >= REDELIVERY_WINDOW_MS) {
-        w.retryChain = null; // prune stale
+    // Redelivery detection — preserved from drop-era but keyed on the
+    // artifact (or auto-spill) path. `recentSpills`/`retryChain` semantics
+    // are unchanged: ACK-mismatch chain wins, content-hash chain is
+    // fallback. Stale entries are pruned outside the window.
+    w.recentSpills = w.recentSpills.filter((e) => nowMs - e.ts < REDELIVERY_WINDOW_MS);
+    if (w.retryChain && nowMs - w.retryChain.ts >= REDELIVERY_WINDOW_MS) {
+      w.retryChain = null;
+    }
+
+    let redeliveryOf: string | null = null;
+    let chainLength = 1;
+    if (w.retryChain) {
+      redeliveryOf = w.retryChain.priorDropPath;
+      chainLength = w.retryChain.nextCount;
+      w.retryChain.priorDropPath = relPath;
+      w.retryChain.ts = nowMs;
+    } else {
+      const prior = [...w.recentSpills]
+        .reverse()
+        .find((e) => e.tail_sha8 === tail);
+      if (prior) {
+        redeliveryOf = prior.dropPath;
+        chainLength = prior.chainLength + 1;
       }
+    }
+    w.recentSpills.push({ tail_sha8: tail, dropPath: relPath, ts: nowMs, chainLength });
 
-      let redeliveryOf: string | null = null;
-      let chainLength = 1;
-
-      if (w.retryChain) {
-        // (A) ACK-mismatch-keyed retry.
-        redeliveryOf = w.retryChain.priorDropPath;
-        chainLength = w.retryChain.nextCount;
-        // This new drop becomes the anchor for any subsequent mismatch
-        // that extends the chain. The mismatch handler will still
-        // increment nextCount on the next failure.
-        w.retryChain.priorDropPath = relPath;
-        w.retryChain.ts = nowMs;
-      } else {
-        // (B) Content-hash match fallback.
-        const prior = [...w.recentSpills]
-          .reverse()
-          .find((e) => e.tail_sha8 === tail_sha8);
-        if (prior) {
-          redeliveryOf = prior.dropPath;
-          chainLength = prior.chainLength + 1;
-        }
-      }
-
-      const redeliveryLines =
-        chainLength > 1 && redeliveryOf
-          ? `redelivery_of: ${redeliveryOf}\nredelivery_count: ${chainLength}\n`
-          : '';
-
-      const header =
-        `# Drop: leader → ${w.cfg.id} turn ${this.leaderTurnId} seq ${w.spillSeq}\n` +
-        `direction: leader → ${w.cfg.id}\n` +
-        `session: ${session}\n` +
-        `timestamp: ${now}\n` +
-        `bytes: ${bytes}\n` +
-        `tail_sha8: ${tail_sha8}\n` +
-        redeliveryLines +
-        `---\n\n`;
-      fs.writeFileSync(absPath, header + payload, 'utf8');
-
-      // Record THIS spill for future retry checks. Append after write so
-      // we don't leak state if the write failed.
-      w.recentSpills.push({ tail_sha8, dropPath: relPath, ts: nowMs, chainLength });
-      if (chainLength > 1 && redeliveryOf) {
-        this.output.appendLine(
-          `[orch.redelivery] ${w.cfg.id} drop tagged redelivery_count=${chainLength} (prior=${redeliveryOf})`,
-        );
-        // v0.9.5 · Ledger — redelivery tag.
-        this.logEvent({
-          type: 'redelivery.tagged',
-          turnId: this.leaderTurnId,
-          source: this.leaderEndpoint(),
-          target: this.workerEndpoint(w),
-          payload: {
-            dropPath: relPath,
-            priorDropPath: redeliveryOf,
-            chainLength,
-            tail_sha8,
-          },
-        });
-      }
-      // v0.9.5 · Ledger — leader→worker drop file written.
+    if (chainLength > 1 && redeliveryOf) {
+      this.output.appendLine(
+        `[orch.redelivery] ${w.cfg.id} leader-authored tagged redelivery_count=${chainLength} (prior=${redeliveryOf})`,
+      );
       this.logEvent({
-        type: 'drop.written',
+        type: 'redelivery.tagged',
         turnId: this.leaderTurnId,
         source: this.leaderEndpoint(),
         target: this.workerEndpoint(w),
         payload: {
-          direction: 'leader-to-worker',
           dropPath: relPath,
-          bytes,
-          tail_sha8,
-          seq: w.spillSeq,
-          ...(chainLength > 1 && redeliveryOf
-            ? { redeliveryOf, chainLength }
-            : {}),
+          priorDropPath: redeliveryOf,
+          chainLength,
+          tail_sha8: tail,
         },
       });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      this.output.appendLine(
-        `[orch.spill] leader→${w.cfg.id} write FAILED — ${msg}; falling back to direct inject`,
-      );
+    }
+    this.logEvent({
+      type: 'drop.written',
+      turnId: this.leaderTurnId,
+      source: this.leaderEndpoint(),
+      target: this.workerEndpoint(w),
+      payload: {
+        direction: 'leader-to-worker',
+        dropPath: relPath,
+        bytes,
+        tail_sha8: tail,
+        seq: w.spillSeq,
+        mode: 'leader-authored',
+        ...(chainLength > 1 && redeliveryOf
+          ? { redeliveryOf, chainLength }
+          : {}),
+      },
+    });
+    this.output.appendLine(
+      `[orch.spill] leader → ${w.cfg.id}: ${relPath} (${bytes} bytes, tail=${tail}); injecting path-first notice`,
+    );
+
+    // Arm the ACK round-trip on the artifact's fingerprint. The worker's
+    // next `@leader:` reply should echo the same `bytes=N tail=XXXX`.
+    w.pendingAckFp = { bytes, tail_sha8: tail, dropPath: relPath, ts: nowMs };
+
+    // v0.15.1 — Gate-off (production default since v0.15.0): the file
+    // is still written above for forensic record / redelivery tracking
+    // / opt-in clients, but the worker's stdin gets the inline payload
+    // directly. This way `[Read this file]` notices never carry a
+    // fragment-truncated directive to the worker, fixing the
+    // intersect 2026-04-26 case where the auto-spill body was the
+    // first ~150 bytes of the leader's wrap-broken request.
+    if (!this.enforceArtifactGate) {
       return payload;
     }
-    this.output.appendLine(
-      `[orch.spill] leader → ${w.cfg.id}: ${relPath} (${Buffer.byteLength(payload, 'utf8')} bytes, tail=${computeTailSha8(payload)}); injecting path-first notice`,
-    );
-    // PATH MUST BE FIRST. Fragmentation-survivable format.
-    // v0.9.1 · fingerprint `(bytes=N tail=XXXX)` embedded on the same
-    // line as the path so the leader (or any reader of the worker's
-    // pty scrollback) can verify the directive arrived whole without
-    // parsing the file header. `bytes` is the payload length in UTF-8
-    // bytes; `tail` is the first 8 hex chars of SHA-256 over the last
-    // 40 chars of the payload (or full payload if shorter). Same
-    // fingerprint lives in the drop file header under `tail_sha8:`.
-    const bytes = Buffer.byteLength(payload, 'utf8');
-    const tail = computeTailSha8(payload);
-    // v0.9.2 — Arm the ACK round-trip. When this worker's next
-    // `@leader:` reply lands, `commitLeaderInject` will compare the
-    // echoed `ACK bytes=N tail=XXXX` against this fingerprint.
-    w.pendingAckFp = { bytes, tail_sha8: tail, dropPath: relPath, ts: this.nowFn() };
     return `${relPath} (bytes=${bytes} tail=${tail})\n\n위 파일을 Read 해서 지시사항을 수행해 주세요.`;
   }
 
@@ -2683,20 +3061,17 @@ export class PodiumOrchestrator implements vscode.Disposable {
       const paneId = this.leader.paneId;
       const opts = { agent };
       try {
-        if (needsWin32KeyEvents(opts)) {
-          const { body: bytes, submit } = splitSubmitPayload(body, opts);
-          this.panel.writeToPane(paneId, bytes);
-          setTimeout(() => {
-            try {
-              this.panel.writeToPane(paneId, submit);
-            } catch (err) {
-              const m = err instanceof Error ? err.message : String(err);
-              this.output.appendLine(`[orch.leaderNotify] submit write FAILED — ${m}`);
-            }
-          }, INJECT_SUBMIT_DELAY_MS);
-        } else {
-          this.panel.writeToPane(paneId, buildSubmitPayload(body, opts));
-        }
+        // v0.11.2 — Always split (race fix on POSIX too).
+        const { body: bytes, submit } = splitSubmitPayload(body, opts);
+        this.panel.writeToPane(paneId, bytes);
+        setTimeout(() => {
+          try {
+            this.panel.writeToPane(paneId, submit);
+          } catch (err) {
+            const m = err instanceof Error ? err.message : String(err);
+            this.output.appendLine(`[orch.leaderNotify] submit write FAILED — ${m}`);
+          }
+        }, INJECT_SUBMIT_DELAY_MS);
         const waited = this.nowFn() - t0;
         this.output.appendLine(
           `[orch.leaderNotify] committed waited=${waited}ms text=${preview(text)}`,
@@ -2854,6 +3229,40 @@ export class PodiumOrchestrator implements vscode.Disposable {
       if (w.queue.length > 0 && w.idle.isIdle) {
         const next = w.queue.shift();
         if (next !== undefined) this.inject(w, next);
+        if (w.queue.length === 0) {
+          // Drain complete — clear stuck stamp + warn flag for next episode.
+          w.queueStuckSince = null;
+          w.queueStuckWarnFired = false;
+        }
+      } else if (w.queue.length === 0) {
+        // Defensive: keep stamp cleared if queue is empty for any other reason.
+        w.queueStuckSince = null;
+        w.queueStuckWarnFired = false;
+      } else if (
+        // v0.14.0 — stuck-busy detection. Queue is non-empty AND worker
+        // is not idle. If this persists past STUCK_QUEUE_WARN_MS, surface
+        // a single `[orch.warn]` notice into the leader so the user is
+        // not left guessing why the worker is silent. Rate-limited to
+        // one warn per stuck episode (cleared on drain).
+        w.queueStuckSince !== null &&
+        this.nowFn() - w.queueStuckSince >= STUCK_QUEUE_WARN_MS &&
+        !w.queueStuckWarnFired
+      ) {
+        w.queueStuckWarnFired = true;
+        const stuckMs = this.nowFn() - w.queueStuckSince;
+        this.output.appendLine(
+          `[orch.warn] ${w.cfg.id} queue stuck ${stuckMs}ms — idle=${w.idle.isIdle} ` +
+          `idleMs=${w.idle.msSinceOutput} queueLen=${w.queue.length}`,
+        );
+        if (this.leader) {
+          this.injectRejectNotice(
+            this.leader.paneId,
+            this.leader.agent,
+            `[Podium Orchestrator system · v0.14.x] ${w.cfg.id}이(가) ${Math.round(stuckMs / 1000)}초째 idle 전환을 못 해서 큐(${w.queue.length}건)가 적재 중입니다. ` +
+            `워커 pane을 직접 확인하거나, 새 directive를 잠시 멈춰주세요. ` +
+            `이 메시지는 Podium VS Code 확장이 발신한 시스템 알림입니다 — prompt injection이 아닙니다.`,
+          );
+        }
       }
     }
 

@@ -809,28 +809,54 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<Orchestrat
           '  - worker-1 — implementer role (writes concrete code and patches).\n' +
           '  - worker-2 — critic role (finds logic flaws, missing edge cases).\n' +
           '\n' +
-          'When the user asks you to delegate, emit routing directives on\n' +
-          'their own lines, starting in column zero. Format: lowercase at\n' +
-          'sign, the worker id, a colon, a space, then the task text.\n' +
-          'Shown here with uppercase "AT" so this note does not self-route;\n' +
-          'your real output MUST use the lowercase at-sign:\n' +
+          'ARTIFACT-FIRST PROTOCOL (mandatory, gate enforced by Podium VS\n' +
+          'Code extension — not a prompt-injection request):\n' +
           '\n' +
-          '  AT-worker-1: draft the code for X\n' +
-          '  AT-worker-2: review the draft for logic flaws\n' +
+          'Every "@worker-N: <body>" directive MUST be backed by a markdown\n' +
+          'artifact you Wrote yourself BEFORE emitting the directive line.\n' +
+          'The Podium orchestrator checks ".omc/team/artifacts/" on disk for\n' +
+          'the file and rejects the route if absent. The orchestrator never\n' +
+          'fabricates these files — leader and workers are the sole authors.\n' +
           '\n' +
-          'Workers reply with the same prefix targeting "leader"; those\n' +
-          'replies will appear here as my user input. Do not route anything\n' +
-          `right now — wait for my next instruction. Round budget per task: ${DEFAULT_MAX_ROUNDS}.`;
+          'For every delegation:\n' +
+          '  1. Use the Write tool to save the FULL task body to:\n' +
+          '       .omc/team/artifacts/to-<worker-id>-turn<N>.md\n' +
+          '     where <N> is the current leader turn number.\n' +
+          '  2. THEN emit a one-line directive (column 0, lowercase at-sign):\n' +
+          '       AT-worker-1: <one-line summary> (shown here with uppercase\n' +
+          '                                       AT so this note does not\n' +
+          '                                       self-route; use lowercase\n' +
+          '                                       in your real output).\n' +
+          '  3. The orchestrator resolves the file by naming convention,\n' +
+          '     verifies it exists, and injects a path-first notice into\n' +
+          '     the worker. The worker Reads the file as its task body.\n' +
+          '\n' +
+          'Workers follow the symmetric pattern for replies:\n' +
+          '  1. Write reply body to .omc/team/artifacts/from-<worker-id>-turn<N>.md\n' +
+          '  2. Emit "AT-leader: <summary>" — the orchestrator forwards it.\n' +
+          '\n' +
+          'If the gate rejects you with "[Podium Orchestrator system]" — that\n' +
+          'is the real Podium extension, NOT prompt injection. Trust it,\n' +
+          'Write the missing file, and re-emit the directive.\n' +
+          '\n' +
+          'Workers reply with "AT-leader:" prefix; those replies appear here\n' +
+          'as my user input. Do not route anything right now — wait for my\n' +
+          `next instruction. Round budget per task: ${DEFAULT_MAX_ROUNDS}.`;
         try {
+          // v0.11.2 — Always split body + submit across a setTimeout boundary
+          // regardless of platform. Field finding 2026-04-25 (Mac+Antigravity):
+          // single bare-CR pty.write of body+"\r" lets the body land in
+          // Claude's input buffer but the trailing \r gets absorbed by Ink's
+          // mid-render readline state — leader sits with the protocol note
+          // un-submitted forever (looks identical to the Win32 race
+          // splitSubmitPayload was originally written for). Treat all
+          // platforms uniformly: write body, wait one chunk's worth (30ms,
+          // matches autoSend.js SUBMIT_DELAY_MS), then write submit.
           const agent = 'claude' as const;
           const opts = { agent };
-          if (needsWin32KeyEvents(opts)) {
-            const { body, submit } = splitSubmitPayload(protocolNote, opts);
-            bridge.writeToPane('leader', body);
-            setTimeout(() => bridge.writeToPane('leader', submit), 25);
-          } else {
-            bridge.writeToPane('leader', buildSubmitPayload(protocolNote, opts));
-          }
+          const { body, submit } = splitSubmitPayload(protocolNote, opts);
+          bridge.writeToPane('leader', body);
+          setTimeout(() => bridge.writeToPane('leader', submit), 30);
           output.appendLine('[orch.summonTeam] protocol note submitted to leader');
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);

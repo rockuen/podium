@@ -126,6 +126,10 @@ function getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUr
         <label title="${T.autoEffortMaxTip}">${T.autoEffortMaxLabel}</label>
         <div class="settings-toggle ${settings.autoEffortMax === true ? 'on' : ''}" id="set-autoeffortmax"></div>
       </div>
+      <div class="settings-row">
+        <label title="${T.autoSendEnterTip}">${T.autoSendEnterLabel}</label>
+        <div class="settings-toggle ${settings.autoSendEnter === true ? 'on' : ''}" id="set-autosendenter"></div>
+      </div>
       <div style="border-top:1px solid ${border};margin:12px 0 8px;"></div>
       <details>
         <summary style="font-size:12px;cursor:pointer;margin-bottom:8px;">Custom Buttons</summary>

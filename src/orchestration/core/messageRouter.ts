@@ -212,21 +212,31 @@ export class ClaudeLeaderRoutingProjector {
 
   private processLine(line: string, newline: string): string {
     let kind = classifyClaudeLine(line);
-    // v0.7.2 — Prompt-echo continuation guard. A bare directive that was
-    // only matched because of the v0.7.2-relaxed indent allowance must be
-    // re-demoted to `prompt` when we're in a pure-echo context: previous
-    // non-blank line was a prompt AND no assistant block is currently
-    // open. Inside an already-open assistant block (e.g. v2.7.30 repaint
-    // scenario where `●` opened the block, narration continues, then Ink
-    // sneaks a `> @worker-1:` repaint of the input box between narration
-    // and a legitimate `  @worker-1:` directive), the indented directive
-    // IS the assistant's real output and must re-assert as assistant-start
-    // so the token reaches the parser.
+    // v0.7.2 / v0.14.0 — Prompt-echo continuation guard.
+    //
+    // v0.7.2 demoted INDENTED `@worker-N: ...` directives that landed
+    // right after a prompt line back to `prompt` kind, treating them as
+    // echo continuation of the user's multi-line input box.
+    //
+    // v0.14.0 — Field evidence (parseCSV, 2026-04-26): Ink TUI also
+    // fragments multi-line input echoes such that the second line
+    // arrives at column 0 (the leading `│ `/spaces are split into a
+    // separate chunk that the projector classifies as chrome and drops,
+    // leaving a bare `@worker-N:` line). The original indent gate
+    // therefore failed to demote those echoes and the parser yielded
+    // the user's own message text as a fresh directive — which the
+    // v0.13.0 file-system gate then rejected, producing the false
+    // "재촉" reject loop the user reported. Drop the indent restriction
+    // so prompt-context column-0 directives are also demoted.
+    //
+    // Safe against legitimate column-0 routing: a real LLM delegation
+    // begins with `●` (assistant-start) which opens the block FIRST,
+    // so by the time its directive line is processed `inAssistantBlock`
+    // is already true and this guard does not fire.
     if (
       kind === 'assistant-start' &&
       this.lastKind === 'prompt' &&
-      !this.inAssistantBlock &&
-      /^[ \t]+@(?:worker-\d+|leader):/.test(line)
+      !this.inAssistantBlock
     ) {
       kind = 'prompt';
     }
@@ -287,13 +297,51 @@ export class WorkerPatternParser {
    * Return any dangling routed message whose terminator hasn't arrived yet.
    * Call when the leader goes idle so a pending `@worker-1:…` (no trailing
    * `\n`, no next token) doesn't get stuck in the buffer forever.
+   *
+   * v0.11.2 — wrap-suspect hold on flush
+   * ------------------------------------
+   * Field finding 2026-04-25 (parseCSV directive, 52B truncation): leader
+   * emitted `@worker-1: JavaScript 함수 parseCSV(csv, options)를 RFC 4180\n`
+   * as the first chunk. The buffer-last newline + no terminal punct + 50+
+   * chars puts the parser in v0.8.7 hold from drainComplete. But idleDetector
+   * read a brief inter-chunk silence as "leader idle", PodiumOrchestrator
+   * called flush(), and flush() unconditionally yielded the partial — which
+   * then committed to dedupe map under its first-line key, blocking ALL
+   * subsequent longer-payload yields as same-key duplicates. The 52B drop
+   * was the result.
+   *
+   * Fix: when the dangling partial is wrap-suspect (newline buffer-last + no
+   * terminal punctuation + ≥30 chars) AND has no continuation chunk yet,
+   * keep holding instead of flushing. The pending payload stays in the
+   * buffer; the next chunk has a chance to complete it. If the leader
+   * genuinely never produces a continuation, the wall-clock force-commit in
+   * tryDispatchPending eventually surfaces it via the dispatch path (which
+   * uses the LATEST yield, not the truncated one).
    */
   flush(): RoutedMessage[] {
     const drained = this.drainComplete();
     const remaining = this.scanPendingToken();
     if (!remaining) return drained;
     const { workerId, payloadStart } = remaining;
-    const payload = this.normalize(this.buffer.slice(payloadStart));
+    const rawPayload = this.buffer.slice(payloadStart);
+    const trimmedTail = rawPayload.replace(/\s+$/, '');
+    const endsWithTerminalPunct =
+      /[.!?。！？](?:["'"'')）\]]+)?$/.test(trimmedTail);
+    const endsWithNewline = /\r?\n\s*$/.test(rawPayload);
+    const WRAP_SUSPECT_THRESHOLD = 30;
+    if (
+      endsWithNewline &&
+      !endsWithTerminalPunct &&
+      trimmedTail.length >= WRAP_SUSPECT_THRESHOLD
+    ) {
+      // Hold: don't flush a wrap-suspect partial. Buffer keeps the pending
+      // token + payload; the next feed() drains the completed payload, or
+      // the dispatch wall-clock cap surfaces the held partial through the
+      // normal path. Either way we avoid poisoning dedupe map with a
+      // truncated first-line key.
+      return drained;
+    }
+    const payload = this.normalize(rawPayload);
     this.buffer = '';
     if (payload.length === 0 || isProtocolNoise(payload)) return drained;
     return [...drained, { workerId, payload }];
@@ -489,12 +537,107 @@ export class WorkerPatternParser {
       const WRAP_SUSPECT_THRESHOLD = 30;
       const isWrapSuspect =
         !endsWithTerminalPunctuation && payloadSoFar.length >= WRAP_SUSPECT_THRESHOLD;
+      // v0.11.2 · list-intro blank fold
+      // -------------------------------
+      // Field finding 2026-04-25 (`to-worker-1-turn2-seq1.md`, 93B): leader
+      // emitted a single-line directive ending in a colon ("...요구사항:")
+      // followed by a blank line and a bullet list. The v0.4.2 blank-line
+      // guard treated the blank as paragraph terminator, so the parser
+      // yielded only the truncated first line and the spill drop file
+      // held only that header. When the payload ends with a colon, the
+      // blank line is almost always a list intro ("Requirements:\n\n- a"),
+      // not a paragraph break. Peek past the blank: if a bullet/number/
+      // indented content follows (and it is not a new `@target:` / `@end`),
+      // accept the blank as a fold point. One-shot — only this blank folds.
+      // The next blank line still terminates as before, so legitimate
+      // multi-paragraph narrative after the list is not over-folded.
+      const endsWithColon = /:\s*$/.test(payloadSoFar);
+      // v0.11.2 — list-marker patterns the parser recognizes as "fold-able
+      // continuation". Field finding 2026-04-25 (parseCSV directive, 93B
+      // truncation): leader emitted `요구사항: (1) options로... (2) RFC 4180
+      // ...` — parenthesized digit numbering, common in Korean-language
+      // technical specs. The original `\d+[.)]\s` pattern only matched
+      // `1.` / `1)` and missed `(1)`, so the blank line after `요구사항:`
+      // didn't qualify for the list-intro fold and the directive truncated.
+      // Patterns now covered:
+      //   bullet:        `-` `*` `•` (followed by space)
+      //   numbered:      `1.` `1)` `(1)` `[1]`
+      //   alphabetic:    `(a)` `(가)`         (parenthesized letters / Hangul)
+      //   bold:          `**foo`              (markdown bold start)
+      //   header:        `#` `##` ... `######`
+      //   indented:      any 1+ space + non-space (Ink wrap continuation)
+      const LIST_MARKER_RE =
+        /^\s*(?:[-*•]\s|\d+[.)]\s|\(\d+\)\s|\([A-Za-z가-힣]\)\s|\[\d+\]\s)/;
+      let isListIntroBlank = false;
+      if (isBlank && endsWithColon) {
+        const blankMatch = peek.match(/^[ \t]*(?:\r\n|\r|\n|$)/);
+        const blankLen = blankMatch ? blankMatch[0].length : 0;
+        const followAfter = this.buffer.slice(afterNl + blankLen, afterNl + blankLen + 80);
+        const followLooksLikeListItem =
+          LIST_MARKER_RE.test(followAfter) || /^\s+\S/.test(followAfter);
+        const followIsRouting =
+          /^\s*@(?:worker-\d+|leader):/.test(followAfter) ||
+          /^\s*@end\b/.test(followAfter);
+        if (followLooksLikeListItem && !followIsRouting) {
+          isListIntroBlank = true;
+        }
+      }
+      // v0.11.2 — Same as isListIntroBlank but the trigger is the colon
+      // appearing INLINE in the payload (no blank line in between). Field
+      // finding 2026-04-25: `@worker-1: ...구현해줘. 요구사항: (1) options
+      // 로...` arrives as a SINGLE chunk in one Ink visual row (Korean
+      // collapses to fewer columns; no Ink wrap, no blank line). The parser
+      // hits the newline at end of "요구사항:" with the next line starting
+      // `(1) options로...` directly — followAfter starts with the list
+      // marker, no blank between them. Treat that the same way: if payload
+      // ends with a colon AND next line is a list marker, fold without
+      // requiring the blank.
+      let isInlineListAfterColon = false;
+      if (!isBlank && endsWithColon) {
+        const followAfter = this.buffer.slice(afterNl, afterNl + 80);
+        const followLooksLikeListItem = LIST_MARKER_RE.test(followAfter);
+        const followIsRouting =
+          /^\s*@(?:worker-\d+|leader):/.test(followAfter) ||
+          /^\s*@end\b/.test(followAfter);
+        if (followLooksLikeListItem && !followIsRouting) {
+          isInlineListAfterColon = true;
+        }
+      }
+      // v0.11.2 — strong-marker continuation across terminal punct + blank.
+      // Field finding 2026-04-25 (long parseCSV directive): leader emitted
+      // `@worker-1: ...구현해주세요.\n\n**요구사항**\n- 시그니처: ...` —
+      // multiple paragraphs of bold / bullet / numbered list / markdown
+      // headers. The v0.4.2 terminal-punct guard terminated at "구현해
+      // 주세요." and the spill drop held only the single-sentence header.
+      // When `.`/`?`/`!` is followed by a blank line AND a STRONG markdown
+      // marker (bullet `- * •`, numbered `1.` `1)`, bold `**foo**`,
+      // markdown header `# Title`), treat the blank as intro-to-list/
+      // section, not a paragraph break. Plain narrative continuations
+      // ("I'll wait for your reply.") don't match the strong-marker check,
+      // so the terminal-punct guard still fires for those.
+      let isStrongMarkerBlank = false;
+      if (isBlank && endsWithTerminalPunctuation) {
+        const blankMatch = peek.match(/^[ \t]*(?:\r\n|\r|\n|$)/);
+        const blankLen = blankMatch ? blankMatch[0].length : 0;
+        const followAfter = this.buffer.slice(afterNl + blankLen, afterNl + blankLen + 80);
+        // Strong marker = list marker (LIST_MARKER_RE) OR markdown bold start
+        // (`**foo`) OR markdown header (`#`..`######`). All require strong
+        // visual signal, never folds across narrative paragraphs.
+        const followIsStrongMarker =
+          LIST_MARKER_RE.test(followAfter) || /^\s*(?:\*\*\S|#{1,6}\s)/.test(followAfter);
+        const followIsRouting =
+          /^\s*@(?:worker-\d+|leader):/.test(followAfter) ||
+          /^\s*@end\b/.test(followAfter);
+        if (followIsStrongMarker && !followIsRouting) {
+          isStrongMarkerBlank = true;
+        }
+      }
       const isContinuation =
-        (isIndented || isWrapSuspect) &&
+        (isIndented || isWrapSuspect || isListIntroBlank || isStrongMarkerBlank || isInlineListAfterColon) &&
         !startsWithTarget &&
         !startsWithEnd &&
-        !isBlank &&
-        !endsWithTerminalPunctuation;
+        (!isBlank || isListIntroBlank || isStrongMarkerBlank) &&
+        (!endsWithTerminalPunctuation || isStrongMarkerBlank);
 
       if (!isContinuation) {
         return { payloadEndPos: chosen.payloadEnd, advanceTo: chosen.advance };

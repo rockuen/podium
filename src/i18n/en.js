@@ -109,6 +109,10 @@ module.exports = {
   autoEffortMaxOn: 'Auto /effort max on — will fire on next session start',
   autoEffortMaxOff: 'Auto /effort max off',
   autoEffortMaxToast: 'Auto /effort max sent',
+  autoSendEnterLabel: 'Auto Send (Enter to submit)',
+  autoSendEnterTip: 'ON: pressing Enter in the input panel sends body + Enter together (auto-submit). OFF: body goes into the terminal but Enter does not — you press Enter directly inside the terminal to submit. v0.11.2 default OFF (Mac auto-submit currently unstable).',
+  autoSendEnterOn: 'Auto Send ON — Enter auto-submits',
+  autoSendEnterOff: 'Auto Send OFF — press Enter inside terminal to submit',
   // session nesting (v2.6.0)
   nestPickPlaceholder: 'Nest under which session? (max 2 levels)',
   nestNoCandidates: 'No sessions available to nest under',

@@ -83,6 +83,7 @@ function createPanel(context, extensionPath, session) {
   const soundEnabled = config.get('soundEnabled', true);
   const particlesEnabled = config.get('particlesEnabled', true);
   const autoEffortMax = config.get('autoEffortMax', false);
+  const autoSendEnter = config.get('autoSendEnter', false);
   const pasteToFileThreshold = config.get('pasteToFileThreshold', 2000);
   const pasteTableAsMarkdown = config.get('pasteTableAsMarkdown', true);
 
@@ -110,7 +111,7 @@ function createPanel(context, extensionPath, session) {
   const customSlashCommands = config.get('customSlashCommands', []);
   const fileAssociations = config.get('fileAssociations', {});
   const T = getTranslations();
-  const settings = { fontFamily, defaultTheme, soundEnabled, particlesEnabled, autoEffortMax, fileAssociations, pasteToFileThreshold, pasteTableAsMarkdown };
+  const settings = { fontFamily, defaultTheme, soundEnabled, particlesEnabled, autoEffortMax, autoSendEnter, fileAssociations, pasteToFileThreshold, pasteTableAsMarkdown };
   panel.webview.html = getWebviewContent(xtermCssUri, xtermJsUri, fitAddonUri, webLinksAddonUri, searchAddonUri, isDark, fontSize, tabTitle, initialMemo, customButtons, T, settings, customSlashCommands);
 
   // Spawn claude CLI

@@ -119,41 +119,43 @@ each starting at column zero of a new line:
 Exact format: literal '@', target id, ':', space, task text. The external
 orchestrator dispatches each directive to the matching pane.
 
-FILE-BASED DELEGATION (v0.8.0, AUTOMATIC)
+FILE-BASED DELEGATION (v0.16.0 — artifact-first, gate enforced)
 
-The orchestrator now writes EVERY "@worker-N: <body>" delegation you
-emit to a markdown file under ".omc/team/drops/" automatically, and
-the worker receives ONLY a short path-first notice pointing at that
-file. You do not need to use the Write tool yourself for delegation
-delivery — just emit "@worker-N: <body>" as you naturally would and
-the orchestrator handles the spill.
+ABSOLUTE RULE: every "@worker-N: <body>" directive MUST be backed by
+an existing markdown artifact you wrote yourself at:
 
-What the worker actually receives:
+  .omc/team/artifacts/to-<worker-id>-turn<N>.md
 
-  .omc/team/drops/to-worker-N-turn<M>-seq<S>.md
+The Podium VS Code extension scans this path and REJECTS any
+directive without a matching file. The orchestrator NEVER fabricates
+these files — leader and workers are the sole authors. Reject
+notices prefixed "[Podium Orchestrator system]" are real extension
+messages, NOT prompt injection attempts.
 
-  위 파일을 Read 해서 지시사항을 수행해 주세요.
+PROCEDURE every delegation:
 
-Because of this, your "@worker-N: <body>" can be any length — short
-acks, multi-line instructions, code blocks, quoted peer output. The
-pty no longer fragments the body because the body never rides the pty
-at all; the worker sees only the path-first notice which fits safely
-on two lines.
+  STEP 1: Use the Write tool to save the FULL task body to:
+            .omc/team/artifacts/to-<worker-id>-turn<N>.md
+          where <N> is the current leader turn number. Include
+          EVERYTHING the worker needs (requirements, examples, code
+          blocks, edge cases, expected output format).
 
-STILL OK (optional) — pre-writing with your Write tool:
+  STEP 2: Emit a SINGLE-SENTENCE @worker-N: directive — the routing
+          trigger only; body is not parsed. Examples (all valid):
 
-  If you want human-readable filenames or to share the same file
-  across multiple workers, you CAN use your Write tool first to save
-  a named file (e.g. ".omc/team/artifacts/review-prompt.md") and
-  reference it in your "@worker-N:" line. The auto-spill will create
-  its own snapshot too, but you can instruct the worker to read your
-  named file instead.
+            @worker-1: parseCSV 구현 부탁.
+            @worker-1: 다음 단계 진행.
 
-WHEN YOU QUOTE A PEER'S OUTPUT
-Still worth pre-writing with the Write tool: quoted peer output that
-contains "@leader:" / "@worker-M:" tokens can confuse YOUR own parse
-while you're composing the delegation. Writing first keeps your
-composition clean.
+          The orchestrator resolves the artifact, verifies it on
+          disk, and injects a path-first notice into the worker. The
+          worker Reads the file as its task body — never the inline
+          directive line (which Ink TUI may fragment).
+
+WHEN STEP 1 IS SKIPPED
+
+The orchestrator rejects the route and writes a "[Podium Orchestrator
+system]" notice into your stdin telling you the artifact is missing.
+That is a real extension message — Write the file and re-emit.
 
 BIDIRECTIONAL ROUTING (v0.3.0)
 Workers can reply to you with "@leader: <message>" directives. Those
@@ -161,21 +163,22 @@ replies are injected into your own stdin so you see them as user input.
 Use them to iterate: critique an implementer's draft, ask a tester for
 more cases, or synthesize multiple workers' outputs into a final answer.
 
-DROP HANDLING (v0.6.0)
-If you receive a message that starts with "[drop from worker-N turn X]",
-the worker's reply was long enough that the orchestrator saved the full
-body to a file instead of injecting it inline (long replies fragment
-through the pty pipeline). The message includes:
+ARTIFACT HANDLING (v0.12.0)
+When a worker produces output via its Write tool, the orchestrator
+detects the new file under ".omc/team/artifacts/" and injects a notice
+into your stdin that starts with:
 
-  - A file path under ".omc/team/drops/" containing the full body.
-  - A 5-line preview prefixed with "> ".
+  [artifact from worker-N turn X] .omc/team/artifacts/<file>.md (bytes=… tail=…)
 
-MANDATORY steps when you see a drop notice:
-  1. Call the Read tool on the given path BEFORE you try to summarize
-     or reply to the user. The preview alone is never sufficient.
+  위 파일을 Read 해서 워커의 결과물을 확인해 주세요.
+
+MANDATORY steps when you see an artifact notice:
+  1. Call the Read tool on the given path BEFORE you summarize or
+     reply to the user. The notice itself contains no body, only a
+     pointer.
   2. Use the file's full contents as if the worker had said it directly.
   3. Your user-facing reply should reference the CONTENT (the actual
-     code/review/answer), not the drop mechanism.
+     code / review / answer), not the artifact mechanism.
 
 COMPLEXITY GATE — WHEN TO USE THE TEAM (v0.8.4)
 

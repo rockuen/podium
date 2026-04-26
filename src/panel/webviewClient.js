@@ -446,6 +446,7 @@ function getClientScript(ctx) {
     const setSound = document.getElementById('set-sound');
     const setParticles = document.getElementById('set-particles');
     const setAutoEffortMax = document.getElementById('set-autoeffortmax');
+    const setAutoSendEnter = document.getElementById('set-autosendenter');
 
     function toggleSettings() {
       const visible = settingsModal.style.display === 'block';
@@ -691,6 +692,18 @@ function getClientScript(ctx) {
       setAutoEffortMax.classList.toggle('on', autoEffortMaxEnabled);
       vscode.postMessage({ type: 'save-setting', key: 'autoEffortMax', value: autoEffortMaxEnabled });
       showToast(autoEffortMaxEnabled ? T.autoEffortMaxOn : T.autoEffortMaxOff);
+    });
+
+    // v0.11.2 — Auto Send (Enter to submit) toggle. Mirrors the
+    // claudeCodeLauncher.autoSendEnter VSCode setting that autoSend.js reads
+    // server-side. When OFF, textarea Send only inserts the body into the
+    // terminal — the user presses Enter inside the terminal to submit.
+    let autoSendEnterEnabled = SETTINGS.autoSendEnter === true;
+    setAutoSendEnter.addEventListener('click', () => {
+      autoSendEnterEnabled = !autoSendEnterEnabled;
+      setAutoSendEnter.classList.toggle('on', autoSendEnterEnabled);
+      vscode.postMessage({ type: 'save-setting', key: 'autoSendEnter', value: autoSendEnterEnabled });
+      showToast(autoSendEnterEnabled ? T.autoSendEnterOn : T.autoSendEnterOff);
     });
 
     // Tab memo
@@ -1337,45 +1350,11 @@ function getClientScript(ctx) {
         toggleEditor();
         return false;
       }
-
-      // v0.11.2 — Plain Enter intercept (Mac+Claude Code v2.1+ submit fix)
-      // ------------------------------------------------------------------
-      // xterm.js's default Enter behavior writes a bare \\r to the PTY. On
-      // macOS that breaks Claude Code v2.1+ because Claude activates
-      // win32-input-mode (CSI ?9001h) even on darwin and reinterprets bare \\r
-      // as Shift+Enter — the directive sits in the input buffer un-submitted
-      // and the leader hangs in "Sautéed for Ns" forever. Field-confirmed
-      // 2026-04-25 with Antigravity webview + Claude Code v2.1.119.
-      //
-      // Intercept here, mirror lineBuffer history bookkeeping that the
-      // term.onData('\\r') branch would have done, then route through
-      // 'auto-send' so the extension's autoSendToEntry can emit the proper
-      // KEY_EVENT submit (or bare \\r on Linux). Modifier-laden Enters
-      // (Ctrl/Cmd, Alt, Shift, IME composing) bypass this and fall through
-      // to xterm so existing shortcuts and IME behavior stay intact.
-      if (
-        event.key === 'Enter' &&
-        !mod &&
-        !event.shiftKey &&
-        !event.altKey &&
-        !event.isComposing
-      ) {
-        event.preventDefault();
-        if (lineBuffer.trim().length > 0) {
-          if (
-            inputHistory.length === 0 ||
-            inputHistory[inputHistory.length - 1] !== lineBuffer.trim()
-          ) {
-            inputHistory.push(lineBuffer.trim());
-            if (inputHistory.length > 100) inputHistory.shift();
-          }
-        }
-        lineBuffer = '';
-        historyIndex = -1;
-        currentLine = '';
-        vscode.postMessage({ type: 'auto-send', text: '' });
-        return false;
-      }
+      // v0.11.2 — plain Enter intercept reverted (KEY_EVENT submit hypothesis
+      // was broken on macOS; the intercept stopped xterm's default \\r write
+      // without a working substitute, leaving Enter completely dead in the
+      // leader pane). xterm default behavior restored. autoSend.js + cliInput
+      // KEY_EVENT promotion stays in place for programmatic sends only.
 
       // Ctrl+C: document-level capture does the copy, but keep a belt-and-
       // suspenders guard here: if a selection exists, tell xterm NOT to
